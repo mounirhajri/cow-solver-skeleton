@@ -1,6 +1,6 @@
 import logging
 import sys
-from typing import IO
+from typing import IO, TextIO, cast
 
 import structlog
 
@@ -8,7 +8,7 @@ import structlog
 def configure_logging(level: str = "INFO", stream: IO[str] | None = None) -> None:
     """Configure structlog to emit JSON to stdout (or supplied stream)."""
 
-    out_stream = stream or sys.stdout
+    out_stream: TextIO = cast(TextIO, stream) if stream is not None else sys.stdout
 
     structlog.configure(
         processors=[
@@ -26,4 +26,4 @@ def configure_logging(level: str = "INFO", stream: IO[str] | None = None) -> Non
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
-    return structlog.get_logger(name)
+    return structlog.get_logger(name)  # type: ignore[no-any-return]

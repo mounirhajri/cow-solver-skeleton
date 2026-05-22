@@ -21,6 +21,6 @@ class Auction(BaseModel):
     id: str
     tokens: dict[str, Token]
     orders: list[Order]
-    liquidity: list[dict] = Field(default_factory=list)
+    liquidity: list[dict[str, object]] = Field(default_factory=list)
     effective_gas_price: int = Field(alias="effectiveGasPrice", default=0)
     deadline: str | None = None

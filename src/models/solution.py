@@ -25,7 +25,7 @@ class Solution(BaseModel):
     id: int
     prices: dict[str, int]
     trades: list[Trade]
-    interactions: list[dict]
+    interactions: list[dict[str, object]]
 
     @field_serializer("prices")
     def serialize_prices(self, v: dict[str, int]) -> dict[str, str]:

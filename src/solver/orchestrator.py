@@ -56,8 +56,8 @@ def load_default_strategies(oneinch_api_key: str) -> list[SolverStrategy]:
 
     # Try to load edge submodule
     try:
-        from edge.matching import CoWMatchingSolver  # type: ignore[import-not-found]
-        from edge.pool_indexer import LongTailRouter  # type: ignore[import-not-found]
+        from edge.matching import CoWMatchingSolver  # type: ignore[import-untyped]
+        from edge.pool_indexer import LongTailRouter  # type: ignore[import-untyped]
 
         strategies.append(CoWMatchingSolver())
         strategies.append(LongTailRouter())
