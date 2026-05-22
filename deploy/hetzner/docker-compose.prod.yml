@@ -20,6 +20,7 @@ services:
       SHADOW_LOG_PATH: /data/shadow.jsonl
       LOG_LEVEL: INFO
       PROMETHEUS_PORT: 8001
+      DATABASE_URL: postgresql+asyncpg://solver:${SOLVER_DB_PASSWORD}@postgres:5432/solver
     volumes:
       - ./data:/data
     networks: [stack]
@@ -41,6 +42,7 @@ services:
     environment:
       LOG_LEVEL: INFO
       SHADOW_LOG_PATH: /data/shadow.jsonl
+      DATABASE_URL: postgresql+asyncpg://solver:${SOLVER_DB_PASSWORD}@postgres:5432/solver
     volumes:
       - ./data:/data
     networks: [stack]
@@ -64,6 +66,7 @@ services:
       SOLVER_INTERNAL_URL: http://cow-solver:8000
       SHADOW_LOG_PATH: /data/shadow.jsonl
       LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+asyncpg://solver:${SOLVER_DB_PASSWORD}@postgres:5432/solver
     volumes:
       - ./data:/data
     depends_on:

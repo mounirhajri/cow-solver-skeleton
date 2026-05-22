@@ -16,6 +16,10 @@ dependencies = [
     "tenacity>=9.0",
     "rustworkx>=0.15",
     "scipy>=1.14",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "greenlet>=3.1",
 ]
 
 [dependency-groups]
@@ -54,3 +58,4 @@ known-first-party = ["src", "edge", "scripts"]
 python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
+exclude = ["src/persistence/migrations/versions/"]

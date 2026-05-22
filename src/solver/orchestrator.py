@@ -56,8 +56,8 @@ def load_default_strategies() -> list[SolverStrategy]:
     strategies: list[SolverStrategy] = []
 
     try:
-        from edge.matching import CoWMatchingSolver  # type: ignore[import-untyped]
-        from edge.pool_indexer import LongTailRouter  # type: ignore[import-untyped]
+        from edge.matching import CoWMatchingSolver
+        from edge.pool_indexer import LongTailRouter
 
         strategies.append(CoWMatchingSolver())
         strategies.append(LongTailRouter())

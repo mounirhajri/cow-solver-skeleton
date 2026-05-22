@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     amm_state_lazy: bool = True
     solve_timeout_seconds: float = 13.0  # slightly below CoW's 15s deadline
 
+    # Postgres
+    database_url: str = "postgresql+asyncpg://solver:solver@localhost:5432/solver"
+
     # Shadow logging
     shadow_log_path: Path = Path("./shadow_data/log.jsonl")
 
