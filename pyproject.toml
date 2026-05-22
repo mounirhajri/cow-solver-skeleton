@@ -20,6 +20,7 @@ dependencies = [
     "asyncpg>=0.30",
     "alembic>=1.14",
     "greenlet>=3.1",
+    "eth-abi>=5.1",
 ]
 
 [dependency-groups]
@@ -63,4 +64,8 @@ exclude = ["src/persistence/migrations/versions/"]
 
 [[tool.mypy.overrides]]
 module = ["edge.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["eth_abi", "eth_abi.*"]
 ignore_missing_imports = true

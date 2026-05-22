@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +16,15 @@ class Settings(BaseSettings):
     # External APIs
     oneinch_api_key: str = ""
     rpc_arbitrum: str = "https://arb1.arbitrum.io/rpc"
+
+    # AMM router
+    intermediate_tokens: list[str] = Field(
+        default_factory=lambda: [
+            "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",  # WETH
+            "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",  # USDC native
+            "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",  # USDT
+        ]
+    )
 
     # Cache
     redis_url: str = "redis://localhost:6379/3"

@@ -107,9 +107,14 @@ class SolverOrchestrator:
 def load_default_strategies() -> list[SolverStrategy]:
     """Build the strategy chain. Loads edge strategies if private submodule present.
 
-    Order: edge strategies first (more specialized), naive last (fallback).
+    Order: edge strategies first (more specialized), router-v2 as workhorse,
+    naive last (fallback).
     """
+    from src.config import settings
+    from src.routing.multicall import Multicall3
+    from src.routing.rpc import RpcClient
     from src.solver.naive import NaiveSolver
+    from src.solver.router import RouterSolver
 
     strategies: list[SolverStrategy] = []
 
@@ -122,6 +127,11 @@ def load_default_strategies() -> list[SolverStrategy]:
         log.info("edge_strategies_loaded")
     except ImportError:
         log.info("edge_strategies_not_present", reason="public_clone_or_phase0")
+
+    # Router-v2: primary workhorse
+    rpc = RpcClient(settings.rpc_arbitrum)
+    multicall = Multicall3(rpc)
+    strategies.append(RouterSolver(multicall=multicall, intermediates=settings.intermediate_tokens))
 
     strategies.append(NaiveSolver())
     return strategies
