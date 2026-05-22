@@ -22,7 +22,7 @@ services:
       PROMETHEUS_PORT: 8001
     volumes:
       - ./data:/data
-    networks: [stack_default]
+    networks: [stack]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
@@ -43,24 +43,24 @@ services:
       SHADOW_LOG_PATH: /data/shadow.jsonl
     volumes:
       - ./data:/data
-    networks: [stack_default]
+    networks: [stack]
 
-  cow-shadow-driver:
-    image: ghcr.io/cowprotocol/services:latest
-    container_name: cow-shadow-driver
+  shadow-poller:
+    image: ghcr.io/mounirhajri/cow-solver:${SOLVER_TAG:-latest}
+    container_name: cow-shadow-poller
     restart: unless-stopped
-    command: ["driver", "--config", "/etc/driver.shadow.toml", "--shadow"]
+    command: ["python", "-m", "scripts.shadow_poller"]
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 256M
+    environment:
+      SOLVER_INTERNAL_URL: http://cow-solver:8000
+      SHADOW_LOG_PATH: /data/shadow.jsonl
+      LOG_LEVEL: INFO
     volumes:
-      - ./config/driver.shadow.toml:/etc/driver.shadow.toml:ro
+      - ./data:/data
     depends_on:
       cow-solver:
         condition: service_healthy
-    networks: [stack_default]
-
-networks:
-  stack_default:
-    external: true
+    networks: [stack]
