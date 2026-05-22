@@ -19,7 +19,7 @@ async def test_poll_once_skips_large_auctions():
     # Mock _cow_get to return a competition with too many orders
     mock_comp = {
         "auctionId": "99999",
-        "auction": {"orders": [f"uid{i}" for i in range(60)], "prices": {}},
+        "auction": {"orders": [f"uid{i}" for i in range(200)], "prices": {}},
         "solutions": [],
     }
     with patch("scripts.shadow_poller._cow_get", AsyncMock(return_value=mock_comp)):
