@@ -16,7 +16,7 @@ import httpx
 
 BASE_URL = "https://api.cow.fi/arbitrum_one/api/v1"
 MAX_ORDERS = 40
-POLL_INTERVAL = 30  # seconds
+POLL_INTERVAL = 60  # seconds — stays well within CoW API rate limits
 
 SOLVER_URL = os.environ.get("SOLVER_INTERNAL_URL", "http://cow-solver:8000")
 SHADOW_LOG_PATH = Path(os.environ.get("SHADOW_LOG_PATH", "/data/shadow.jsonl"))
@@ -37,6 +37,9 @@ async def poll_once(
     seen: set[int],
 ) -> None:
     r = await client.get(f"{BASE_URL}/solver_competition/latest", timeout=10.0)
+    if r.status_code == 429:
+        log.warning("rate_limited_skipping_poll")
+        return
     r.raise_for_status()
     comp = r.json()
 
