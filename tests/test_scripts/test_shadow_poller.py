@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from scripts.shadow_poller import RateLimitedError, poll_once
+from scripts.shadow_poller import RateLimitedError, _fetch_order, poll_once
 
 
 @pytest.mark.asyncio
@@ -35,3 +35,20 @@ async def test_poll_once_returns_ok_on_already_seen():
         result = await poll_once(AsyncMock(), seen={12345})
         # Already seen returns early — exact return value is implementation choice; "ok" is fine
         assert result in ("ok", "skipped", None)
+
+
+@pytest.mark.asyncio
+async def test_fetch_order_propagates_rate_limit():
+    side_effect = RateLimitedError("test")
+    with (
+        patch("scripts.shadow_poller._cow_get", side_effect=side_effect),
+        pytest.raises(RateLimitedError),
+    ):
+        await _fetch_order("uid1")
+
+
+@pytest.mark.asyncio
+async def test_fetch_order_swallows_other_errors():
+    with patch("scripts.shadow_poller._cow_get", side_effect=ValueError("nope")):
+        result = await _fetch_order("uid1")
+        assert result is None

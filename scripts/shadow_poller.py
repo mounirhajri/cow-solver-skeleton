@@ -27,7 +27,6 @@ from scripts.liveness import touch_liveness
 
 BASE_URL = "https://api.cow.fi/arbitrum_one/api/v1"
 MAX_ORDERS = 40
-POLL_INTERVAL = 60  # seconds
 
 SOLVER_URL = os.environ.get("SOLVER_INTERNAL_URL", "http://cow-solver:8000")
 SHADOW_LOG_PATH = Path(os.environ.get("SHADOW_LOG_PATH", "/data/shadow.jsonl"))
@@ -54,7 +53,7 @@ class Backoff:
     base: float = 60.0
     cap: float = 600.0
     jitter: bool = True
-    _level: int = field(default=0)
+    _level: int = field(default=0, init=False)
 
     def current(self) -> float:
         delay = self.base * (2**self._level)
@@ -88,11 +87,13 @@ async def _cow_get(url: str) -> "dict[str, Any] | None":
 async def _fetch_order(uid: str) -> "dict[str, Any] | None":
     try:
         return await _cow_get(f"{BASE_URL}/orders/{uid}")
+    except RateLimitedError:
+        raise
     except Exception:
         return None
 
 
-async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> "str | None":
+async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
     try:
         comp = await _cow_get(f"{BASE_URL}/solver_competition/latest")
     except RateLimitedError as exc:
@@ -114,13 +115,12 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> "str | None":
         log.info("skip_large_auction", extra={"auction_id": auction_id, "n_orders": len(all_uids)})
         return "skipped"
 
-    uids = all_uids
     prices: dict[str, str] = {str(k): str(v) for k, v in (auction_data.get("prices") or {}).items()}
 
     try:
         orders = [
             o
-            for o in await asyncio.gather(*[_fetch_order(uid) for uid in uids])
+            for o in await asyncio.gather(*[_fetch_order(uid) for uid in all_uids])
             if o is not None
         ]
     except RateLimitedError as exc:
@@ -198,17 +198,27 @@ async def main() -> None:
                 result = await poll_once(solver, seen)
                 if result == "rate_limited":
                     backoff.on_rate_limit()
-                    log.warning("backoff_extended", extra={"current": round(backoff.current(), 1)})
+                    delay = backoff.current()
+                    log.warning(
+                        "backoff_extended",
+                        extra={"current": round(delay, 1), "reason": "rate_limited"},
+                    )
                 else:
                     backoff.on_success()
-            except Exception as exc:
-                log.exception("poll_error: %s", exc)
+                    delay = backoff.current()
+            except Exception:
+                log.exception("poll_error")
                 backoff.on_rate_limit()
+                delay = backoff.current()
+                log.warning(
+                    "backoff_extended",
+                    extra={"current": round(delay, 1), "reason": "exception"},
+                )
             # Touch liveness AFTER the cycle — proves we got through poll_once
             # without infinite-hanging. This fixes the code-review concern from
             # Task 0.1 where the touch was at the top of the loop.
             touch_liveness(LIVENESS_PATH)
-            await asyncio.sleep(backoff.current())
+            await asyncio.sleep(delay)
 
 
 if __name__ == "__main__":
