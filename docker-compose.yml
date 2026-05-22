@@ -1,0 +1,55 @@
+services:
+  cow-solver:
+    build: .
+    image: cow-solver:dev
+    container_name: cow-solver
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      ONEINCH_API_KEY: ${ONEINCH_API_KEY:-dummy}
+      RPC_ARBITRUM: ${RPC_ARBITRUM:-https://arb1.arbitrum.io/rpc}
+      REDIS_URL: redis://redis:6379/3
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SHADOW_LOG_PATH: /data/shadow.jsonl
+    volumes:
+      - ./shadow_data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  reconciler:
+    build: .
+    image: cow-solver:dev
+    container_name: cow-reconciler
+    restart: unless-stopped
+    command: ["python", "-m", "scripts.reconcile_loop"]
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SHADOW_LOG_PATH: /data/shadow.jsonl
+    volumes:
+      - ./shadow_data:/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: cow-solver-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Shadow driver: only enabled when explicitly started.
+  # Use: docker compose --profile shadow up
+  shadow-driver:
+    image: ghcr.io/cowprotocol/services:latest
+    container_name: cow-shadow-driver
+    profiles: ["shadow"]
+    command: ["driver", "--config", "/etc/driver.shadow.toml", "--shadow"]
+    volumes:
+      - ./config/driver.shadow.toml:/etc/driver.shadow.toml:ro
+    depends_on:
+      cow-solver:
+        condition: service_healthy
