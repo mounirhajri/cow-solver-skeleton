@@ -1,8 +1,5 @@
 import os
 import time
-from pathlib import Path
-
-import pytest
 
 from scripts.liveness import is_alive, touch_liveness
 
