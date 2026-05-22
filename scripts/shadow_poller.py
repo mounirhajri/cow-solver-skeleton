@@ -12,9 +12,11 @@ import asyncio
 import json
 import logging
 import os
+import random
 import ssl
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -37,6 +39,36 @@ _SSL_CTX = ssl.create_default_context()
 log = logging.getLogger(__name__)
 
 
+class RateLimitedError(Exception):
+    """Raised when CoW API returns HTTP 429."""
+
+
+@dataclass
+class Backoff:
+    """Exponential backoff with optional jitter.
+
+    current() returns the current delay. on_rate_limit() doubles it (up to cap).
+    on_success() resets to base.
+    """
+
+    base: float = 60.0
+    cap: float = 600.0
+    jitter: bool = True
+    _level: int = field(default=0)
+
+    def current(self) -> float:
+        delay = self.base * (2**self._level)
+        if self.jitter:
+            delay = delay * random.uniform(0.8, 1.2)
+        return min(delay, self.cap)
+
+    def on_rate_limit(self) -> None:
+        self._level += 1
+
+    def on_success(self) -> None:
+        self._level = 0
+
+
 def _urllib_get(url: str) -> "dict[str, Any] | None":
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     try:
@@ -45,8 +77,7 @@ def _urllib_get(url: str) -> "dict[str, Any] | None":
             return result
     except urllib.error.HTTPError as e:
         if e.code == 429:
-            log.warning("rate_limited_skipping_poll")
-            return None
+            raise RateLimitedError(url) from e
         raise
 
 
@@ -61,25 +92,40 @@ async def _fetch_order(uid: str) -> "dict[str, Any] | None":
         return None
 
 
-async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> None:
-    comp = await _cow_get(f"{BASE_URL}/solver_competition/latest")
+async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> "str | None":
+    try:
+        comp = await _cow_get(f"{BASE_URL}/solver_competition/latest")
+    except RateLimitedError as exc:
+        log.warning("rate_limited", extra={"url": str(exc)})
+        return "rate_limited"
+
     if comp is None:
-        return
+        return "ok"
 
     auction_id = int(str(comp["auctionId"]))
     if auction_id in seen:
-        return
+        return "ok"
     seen.add(auction_id)
 
     auction_data: dict[str, Any] = comp.get("auction") or {}
-    uids: list[str] = [str(u) for u in (auction_data.get("orders") or [])][:MAX_ORDERS]
+    all_uids: list[str] = [str(u) for u in (auction_data.get("orders") or [])]
+
+    if len(all_uids) > MAX_ORDERS:
+        log.info("skip_large_auction", extra={"auction_id": auction_id, "n_orders": len(all_uids)})
+        return "skipped"
+
+    uids = all_uids
     prices: dict[str, str] = {str(k): str(v) for k, v in (auction_data.get("prices") or {}).items()}
 
-    orders = [
-        o
-        for o in await asyncio.gather(*[_fetch_order(uid) for uid in uids])
-        if o is not None
-    ]
+    try:
+        orders = [
+            o
+            for o in await asyncio.gather(*[_fetch_order(uid) for uid in uids])
+            if o is not None
+        ]
+    except RateLimitedError as exc:
+        log.warning("rate_limited", extra={"url": str(exc)})
+        return "rate_limited"
 
     tokens = {
         addr: {
@@ -140,19 +186,29 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> None:
             "winner": winner["solver"] if winner else None,
         },
     )
-    touch_liveness(LIVENESS_PATH)
+    return "ok"
 
 
 async def main() -> None:
     seen: set[int] = set()
+    backoff = Backoff(base=60.0, cap=600.0)
     async with httpx.AsyncClient() as solver:
         while True:
-            touch_liveness(LIVENESS_PATH)
             try:
-                await poll_once(solver, seen)
+                result = await poll_once(solver, seen)
+                if result == "rate_limited":
+                    backoff.on_rate_limit()
+                    log.warning("backoff_extended", extra={"current": round(backoff.current(), 1)})
+                else:
+                    backoff.on_success()
             except Exception as exc:
                 log.exception("poll_error: %s", exc)
-            await asyncio.sleep(POLL_INTERVAL)
+                backoff.on_rate_limit()
+            # Touch liveness AFTER the cycle — proves we got through poll_once
+            # without infinite-hanging. This fixes the code-review concern from
+            # Task 0.1 where the touch was at the top of the loop.
+            touch_liveness(LIVENESS_PATH)
+            await asyncio.sleep(backoff.current())
 
 
 if __name__ == "__main__":
