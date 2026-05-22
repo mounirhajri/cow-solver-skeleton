@@ -24,13 +24,13 @@ from typing import Any
 import httpx
 
 from scripts.liveness import touch_liveness
-from src.shadow.persist import persist_winner_and_outcomes_safe
+from src.shadow.persist import persist_skipped_auction_safe, persist_winner_and_outcomes_safe
 
 BASE_URL = "https://api.cow.fi/arbitrum_one/api/v1"
-# Arbitrum batches typically have 50-150 orders; 40 was too tight and caused
-# skip_large_auction on every poll. With backoff in place, larger fetches
-# are tolerable.
-MAX_ORDERS = 150
+# Only auctions this small are /solve-able within rate-limit safety.
+# Arbitrum auctions are typically 500-1500 orders; only small batches
+# go through the full per-order fetch path. Larger ones get metadata-only.
+MAX_ORDERS = 50
 
 SOLVER_URL = os.environ.get("SOLVER_INTERNAL_URL", "http://cow-solver:8000")
 SHADOW_LOG_PATH = Path(os.environ.get("SHADOW_LOG_PATH", "/data/shadow.jsonl"))
@@ -98,6 +98,18 @@ async def _fetch_order(uid: str) -> "dict[str, Any] | None":
 
 
 async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
+    """Poll for the latest auction, persist metadata, and optionally call /solve.
+
+    Always persists: shadow_auction row + winner + per-token outcomes derived from
+    the competition response (no per-order fetches needed for this path).
+
+    Conditionally calls /solve: only when ``len(orders) <= MAX_ORDERS``.  For
+    larger auctions a ``poller-skipped`` row is written to ``shadow_solutions`` so
+    the analyzer knows we saw the auction but did not attempt a solution.
+
+    Returns ``"ok"`` for every successfully processed auction (whether or not
+    /solve was called) and ``"rate_limited"`` if CoW API returned HTTP 429.
+    """
     try:
         comp = await _cow_get(f"{BASE_URL}/solver_competition/latest")
     except RateLimitedError as exc:
@@ -113,24 +125,13 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
     seen.add(auction_id)
 
     auction_data: dict[str, Any] = comp.get("auction") or {}
-    all_uids: list[str] = [str(u) for u in (auction_data.get("orders") or [])]
+    uids: list[str] = [str(u) for u in (auction_data.get("orders") or [])]
+    token_prices: dict[str, str] = {
+        str(k): str(v) for k, v in (auction_data.get("prices") or {}).items()
+    }
 
-    if len(all_uids) > MAX_ORDERS:
-        log.info("skip_large_auction", extra={"auction_id": auction_id, "n_orders": len(all_uids)})
-        return "skipped"
-
-    prices: dict[str, str] = {str(k): str(v) for k, v in (auction_data.get("prices") or {}).items()}
-
-    try:
-        orders = [
-            o
-            for o in await asyncio.gather(*[_fetch_order(uid) for uid in all_uids])
-            if o is not None
-        ]
-    except RateLimitedError as exc:
-        log.warning("rate_limited", extra={"url": str(exc)})
-        return "rate_limited"
-
+    # Build a skeleton auction payload from competition metadata alone.
+    # orders[] will be populated below only if len(uids) <= MAX_ORDERS.
     tokens = {
         addr: {
             "decimals": 18,
@@ -138,50 +139,48 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
             "availableBalance": "0",
             "trusted": True,
         }
-        for addr, price in prices.items()
+        for addr, price in token_prices.items()
     }
-
-    auction_payload = {
+    auction_payload: dict[str, Any] = {
         "id": str(auction_id),
         "tokens": tokens,
-        "orders": orders,
+        "orders": [],
         "liquidity": [],
         "effectiveGasPrice": "0",
         "deadline": None,
     }
 
     our_solution = None
-    try:
-        resp = await solver.post(
-            f"{SOLVER_URL}/solve", json=auction_payload, timeout=14.0
+
+    if len(uids) <= MAX_ORDERS:
+        # Small enough — fetch each order and call /solve
+        try:
+            orders = [
+                o
+                for o in await asyncio.gather(*[_fetch_order(uid) for uid in uids])
+                if o is not None
+            ]
+        except RateLimitedError as exc:
+            log.warning("rate_limited", extra={"url": str(exc)})
+            return "rate_limited"
+
+        auction_payload["orders"] = orders
+
+        try:
+            resp = await solver.post(
+                f"{SOLVER_URL}/solve", json=auction_payload, timeout=14.0
+            )
+            if resp.status_code == 200:
+                our_solution = resp.json()
+        except Exception as exc:
+            log.warning("solver_call_failed", extra={"auction_id": auction_id, "error": str(exc)})
+    else:
+        log.info(
+            "auction_too_large_to_solve",
+            extra={"auction_id": auction_id, "n_orders": len(uids)},
         )
-        if resp.status_code == 200:
-            our_solution = resp.json()
-    except Exception as exc:
-        log.warning("solver_call_failed", extra={"auction_id": auction_id, "error": str(exc)})
 
-    solutions: list[dict[str, Any]] = [s for s in (comp.get("solutions") or [])]
-    winner = next(
-        (s for s in solutions if s.get("isWinner") or s.get("ranking") == 1), None
-    )
-
-    entry = {
-        "auction_id": str(auction_id),
-        "timestamp": datetime.now(UTC).isoformat(),
-        "orders_sampled": len(orders),
-        "our_solution": our_solution,
-        "winner_solution": (
-            {"solver": winner["solver"], "score": winner.get("score")}
-            if winner
-            else None
-        ),
-    }
-
-    SHADOW_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with SHADOW_LOG_PATH.open("a") as f:
-        f.write(json.dumps(entry) + "\n")
-
-    # Persist winner + token outcomes to Postgres (best-effort, never raises)
+    # Always: persist winner + token outcomes from the competition response
     await persist_winner_and_outcomes_safe(
         auction_id=auction_id,
         raw_competition=comp,
@@ -189,15 +188,46 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
         our_solution=our_solution,
     )
 
+    # For large auctions: also write a poller-skipped solution row
+    if len(uids) > MAX_ORDERS:
+        await persist_skipped_auction_safe(
+            auction_id=auction_id,
+            auction_payload=auction_payload,
+            raw_competition=comp,
+            n_orders=len(uids),
+        )
+
+    # JSONL backup
+    solutions: list[dict[str, Any]] = list(comp.get("solutions") or [])
+    winner = next(
+        (s for s in solutions if s.get("isWinner") or s.get("ranking") == 1), None
+    )
+    entry = {
+        "auction_id": str(auction_id),
+        "timestamp": datetime.now(UTC).isoformat(),
+        "orders_sampled": len(auction_payload["orders"]),
+        "our_solution": our_solution,
+        "winner_solution": (
+            {"solver": winner["solver"], "score": winner.get("score")}
+            if winner
+            else None
+        ),
+    }
+    SHADOW_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with SHADOW_LOG_PATH.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+
     log.info(
         "auction_processed",
         extra={
             "auction_id": auction_id,
-            "orders_sampled": len(orders),
+            "orders_sampled": len(auction_payload["orders"]),
             "solved": our_solution is not None,
             "winner": winner["solver"] if winner else None,
         },
     )
+
+    touch_liveness(LIVENESS_PATH)
     return "ok"
 
 

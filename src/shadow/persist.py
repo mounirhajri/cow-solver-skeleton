@@ -169,3 +169,58 @@ async def persist_winner_and_outcomes_safe(
         )
     except Exception as e:  # noqa: BLE001
         log.error("winner_persist_failed", auction_id=auction_id, error=str(e))
+
+
+async def persist_skipped_auction(
+    auction_id: int,
+    auction_payload: dict[str, Any],
+    raw_competition: dict[str, Any],
+    n_orders: int,
+) -> None:
+    """Record an auction we didn't /solve because it had too many orders.
+
+    Ensures a ``shadow_auctions`` row exists (idempotent), then inserts a
+    ``shadow_solutions`` row with ``strategy="poller-skipped"`` and
+    ``status="skipped"`` so the analyzer knows we saw the auction.
+    """
+    Session = get_session_factory()
+    async with Session() as session:
+        existing = await session.execute(
+            select(ShadowAuction).where(ShadowAuction.auction_id == auction_id)
+        )
+        if existing.scalar_one_or_none() is None:
+            session.add(
+                ShadowAuction(
+                    auction_id=auction_id,
+                    polled_at=datetime.now(UTC),
+                    n_orders=n_orders,
+                    raw_competition=raw_competition,
+                    raw_auction=auction_payload,
+                )
+            )
+            await session.flush()  # ensure FK target exists before child insert
+
+        session.add(
+            ShadowSolution(
+                auction_id=auction_id,
+                strategy="poller-skipped",
+                status="skipped",
+                latency_ms=None,
+                solution=None,
+                error=f"auction_too_large_to_solve: {n_orders} orders",
+            )
+        )
+        await session.commit()
+
+
+async def persist_skipped_auction_safe(
+    auction_id: int,
+    auction_payload: dict[str, Any],
+    raw_competition: dict[str, Any],
+    n_orders: int,
+) -> None:
+    """Never-raise wrapper around persist_skipped_auction."""
+    try:
+        await persist_skipped_auction(auction_id, auction_payload, raw_competition, n_orders)
+    except Exception as e:  # noqa: BLE001
+        log.error("skipped_persist_failed", auction_id=auction_id, error=str(e))

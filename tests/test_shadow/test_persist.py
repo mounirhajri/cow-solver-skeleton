@@ -297,3 +297,76 @@ async def test_persist_winner_outcomes_safe_swallows_errors(monkeypatch) -> None
     monkeypatch.setattr("src.shadow.persist.persist_winner_and_outcomes", broken)
     # Must NOT raise
     await persist_winner_and_outcomes_safe(42, {}, {}, None)
+
+
+# ─── persist_skipped_auction tests ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_persist_skipped_auction_inserts_rows(session_factory) -> None:
+    """persist_skipped_auction must create auction row + skipped solution row."""
+    from src.shadow.persist import persist_skipped_auction
+
+    await persist_skipped_auction(
+        auction_id=11111,
+        auction_payload={"id": "11111", "tokens": {}, "orders": [], "liquidity": []},
+        raw_competition={"auctionId": "11111", "solutions": []},
+        n_orders=750,
+    )
+
+    async with session_factory() as s:
+        auctions = (await s.execute(select(ShadowAuction))).scalars().all()
+        assert len(auctions) == 1
+        assert auctions[0].auction_id == 11111
+        assert auctions[0].n_orders == 750
+
+        solutions = (await s.execute(select(ShadowSolution))).scalars().all()
+        assert len(solutions) == 1
+        assert solutions[0].strategy == "poller-skipped"
+        assert solutions[0].status == "skipped"
+        assert "750" in solutions[0].error
+
+
+@pytest.mark.asyncio
+async def test_persist_skipped_auction_idempotent_on_auction_row(session_factory) -> None:
+    """If the shadow_auction row already exists, persist_skipped_auction must not duplicate it."""
+    from src.shadow.persist import persist_skipped_auction
+
+    # Pre-insert the auction row (e.g., from persist_winner_and_outcomes running first)
+    async with session_factory() as s:
+        s.add(ShadowAuction(
+            auction_id=22222,
+            polled_at=datetime.now(UTC),
+            n_orders=0,
+            raw_competition={},
+            raw_auction={},
+        ))
+        await s.commit()
+
+    await persist_skipped_auction(
+        auction_id=22222,
+        auction_payload={},
+        raw_competition={},
+        n_orders=900,
+    )
+
+    async with session_factory() as s:
+        auctions = (await s.execute(select(ShadowAuction))).scalars().all()
+        assert len(auctions) == 1  # still only one — not duplicated
+
+        solutions = (await s.execute(select(ShadowSolution))).scalars().all()
+        assert len(solutions) == 1
+        assert solutions[0].strategy == "poller-skipped"
+
+
+@pytest.mark.asyncio
+async def test_persist_skipped_auction_safe_swallows_errors(monkeypatch) -> None:
+    """persist_skipped_auction_safe must never raise."""
+    from src.shadow.persist import persist_skipped_auction_safe
+
+    async def broken(*args, **kwargs) -> None:
+        raise RuntimeError("DB down")
+
+    monkeypatch.setattr("src.shadow.persist.persist_skipped_auction", broken)
+    # Must NOT raise
+    await persist_skipped_auction_safe(99, {}, {}, 500)

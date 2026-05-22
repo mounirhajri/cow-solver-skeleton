@@ -15,17 +15,29 @@ async def test_poll_once_returns_rate_limited_on_429():
 
 
 @pytest.mark.asyncio
-async def test_poll_once_skips_large_auctions():
-    # Mock _cow_get to return a competition with too many orders
+async def test_poll_once_persists_large_auctions_without_solve(tmp_path):
+    """Large auctions: metadata persisted, /solve NOT called, returns 'ok'."""
+    from pathlib import Path
+
     mock_comp = {
         "auctionId": "99999",
         "auction": {"orders": [f"uid{i}" for i in range(200)], "prices": {}},
         "solutions": [],
     }
-    with patch("scripts.shadow_poller._cow_get", AsyncMock(return_value=mock_comp)):
+    with (
+        patch("scripts.shadow_poller._cow_get", AsyncMock(return_value=mock_comp)),
+        patch("scripts.shadow_poller.SHADOW_LOG_PATH", Path(tmp_path / "shadow.jsonl")),
+        patch("scripts.shadow_poller.touch_liveness"),
+        patch("scripts.shadow_poller.persist_winner_and_outcomes_safe", AsyncMock()) as p1,
+        patch("scripts.shadow_poller.persist_skipped_auction_safe", AsyncMock()) as p2,
+    ):
         solver = AsyncMock()
         result = await poll_once(solver, set())
-        assert result == "skipped"
+        assert result == "ok"
+        p1.assert_awaited_once()
+        p2.assert_awaited_once()
+        # /solve should NOT be called for large auctions
+        solver.post.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -75,6 +87,7 @@ async def test_poll_once_calls_persist_winner_and_outcomes(tmp_path):
     with (
         patch("scripts.shadow_poller._cow_get", AsyncMock(return_value=mock_comp)),
         patch("scripts.shadow_poller.SHADOW_LOG_PATH", Path(tmp_path / "shadow.jsonl")),
+        patch("scripts.shadow_poller.touch_liveness"),
         patch("scripts.shadow_poller.persist_winner_and_outcomes_safe", persist_mock),
     ):
         result = await poll_once(solver, set())
@@ -109,6 +122,7 @@ async def test_poll_once_persist_failure_does_not_break_ok(tmp_path):
     with (
         patch("scripts.shadow_poller._cow_get", AsyncMock(return_value=mock_comp)),
         patch("scripts.shadow_poller.SHADOW_LOG_PATH", Path(tmp_path / "shadow.jsonl")),
+        patch("scripts.shadow_poller.touch_liveness"),
         patch("scripts.shadow_poller.persist_winner_and_outcomes_safe", exploding),
     ):
         # The safe wrapper should swallow — poll_once must NOT propagate.
