@@ -1,0 +1,38 @@
+{
+  "id": "12345",
+  "tokens": {
+    "0x82af49447d8a07e3bd95bd0d56f35241523fbab1": {
+      "decimals": 18,
+      "symbol": "WETH",
+      "referencePrice": "3500000000000000000000",
+      "availableBalance": "10000000000000000000",
+      "trusted": true
+    },
+    "0xaf88d065e77c8cc2239327c5edb3a432268e5831": {
+      "decimals": 6,
+      "symbol": "USDC",
+      "referencePrice": "1000000000000000000",
+      "availableBalance": "100000000000",
+      "trusted": true
+    }
+  },
+  "orders": [
+    {
+      "uid": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sellToken": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+      "buyToken": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+      "sellAmount": "1000000000000000000",
+      "buyAmount": "3450000000",
+      "feePolicies": [],
+      "validTo": 9999999999,
+      "kind": "sell",
+      "owner": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "partiallyFillable": false,
+      "class": "market"
+    }
+  ],
+  "liquidity": [],
+  "effectiveGasPrice": "100000000",
+  "deadline": "2026-05-22T12:00:00Z",
+  "surplusCapturingJitOrderOwners": []
+}
