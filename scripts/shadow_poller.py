@@ -21,12 +21,15 @@ from typing import Any
 
 import httpx
 
+from scripts.liveness import touch_liveness
+
 BASE_URL = "https://api.cow.fi/arbitrum_one/api/v1"
 MAX_ORDERS = 40
 POLL_INTERVAL = 60  # seconds
 
 SOLVER_URL = os.environ.get("SOLVER_INTERNAL_URL", "http://cow-solver:8000")
 SHADOW_LOG_PATH = Path(os.environ.get("SHADOW_LOG_PATH", "/data/shadow.jsonl"))
+LIVENESS_PATH = Path("/data/shadow_poller.alive")
 
 _UA = "curl/8.5.0"
 _SSL_CTX = ssl.create_default_context()
@@ -137,12 +140,14 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> None:
             "winner": winner["solver"] if winner else None,
         },
     )
+    touch_liveness(LIVENESS_PATH)
 
 
 async def main() -> None:
     seen: set[int] = set()
     async with httpx.AsyncClient() as solver:
         while True:
+            touch_liveness(LIVENESS_PATH)
             try:
                 await poll_once(solver, seen)
             except Exception as exc:

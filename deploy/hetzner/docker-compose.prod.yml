@@ -44,6 +44,12 @@ services:
     volumes:
       - ./data:/data
     networks: [stack]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; from pathlib import Path; from scripts.liveness import is_alive; sys.exit(0 if is_alive(Path('/data/reconciler.alive'), 120) else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
   shadow-poller:
     image: ghcr.io/mounirhajri/cow-solver:${SOLVER_TAG:-latest}
@@ -64,3 +70,9 @@ services:
       cow-solver:
         condition: service_healthy
     networks: [stack]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; from pathlib import Path; from scripts.liveness import is_alive; sys.exit(0 if is_alive(Path('/data/shadow_poller.alive'), 300) else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
