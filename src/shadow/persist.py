@@ -6,6 +6,7 @@ Called from /solve via BackgroundTasks — must never raise; logs and swallows.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import select
 
@@ -74,3 +75,97 @@ async def persist_shadow_attempt_safe(
         await persist_shadow_attempt(auction, attempts, raw_competition)
     except Exception as e:  # noqa: BLE001
         log.error("shadow_persist_failed", auction_id=str(auction.id), error=str(e))
+
+
+async def persist_winner_and_outcomes(
+    auction_id: int,
+    raw_competition: dict[str, Any],
+    auction_payload: dict[str, Any],
+    our_solution: dict[str, Any] | None,
+) -> None:
+    """Extract winner + per-token outcomes from a competition response and persist.
+
+    Idempotent on ``auction_id`` for the winner; token outcomes append a row per
+    (token, auction) pair.
+
+    Also ensures the ``shadow_auctions`` FK target exists before inserting
+    children — handles the race with the /solve BackgroundTask path from Task 1.2.
+    """
+    from src.persistence.models import ShadowWinner, TokenOutcome
+    from src.shadow.token_outcomes import extract_token_outcomes
+
+    solutions = raw_competition.get("solutions") or []
+    winner_sol = next(
+        (s for s in solutions if s.get("isWinner") or s.get("ranking") == 1),
+        None,
+    )
+
+    Session = get_session_factory()
+
+    # ── Ensure the shadow_auctions row exists (FK target) ─────────────────────
+    async with Session() as session:
+        existing_auction = await session.execute(
+            select(ShadowAuction).where(ShadowAuction.auction_id == auction_id)
+        )
+        if existing_auction.scalar_one_or_none() is None:
+            session.add(
+                ShadowAuction(
+                    auction_id=auction_id,
+                    polled_at=datetime.now(UTC),
+                    n_orders=len(auction_payload.get("orders", [])),
+                    raw_competition=raw_competition,
+                    raw_auction=auction_payload,
+                )
+            )
+            await session.flush()  # ensure FK target exists before children
+        await session.commit()
+
+    # ── Winner + token outcomes ───────────────────────────────────────────────
+    async with Session() as session:
+        if winner_sol is not None:
+            existing = await session.execute(
+                select(ShadowWinner).where(ShadowWinner.auction_id == auction_id)
+            )
+            if existing.scalar_one_or_none() is None:
+                score_raw = winner_sol.get("score")
+                try:
+                    score = int(score_raw) if score_raw is not None else None
+                except (ValueError, TypeError):
+                    score = None
+                session.add(
+                    ShadowWinner(
+                        auction_id=auction_id,
+                        winner_solver=str(winner_sol.get("solver", "unknown")),
+                        score=score,
+                        raw_solution=winner_sol,
+                    )
+                )
+
+        outcomes = extract_token_outcomes(auction_payload, winner_sol, our_solution)
+        for o in outcomes:
+            session.add(
+                TokenOutcome(
+                    auction_id=auction_id,
+                    token_address=o["token_address"],
+                    appeared_in_winner=o["appeared_in_winner"],
+                    appeared_in_ours=o["appeared_in_ours"],
+                    caused_revert=o["caused_revert"],
+                )
+            )
+
+        await session.commit()
+
+
+async def persist_winner_and_outcomes_safe(
+    auction_id: int,
+    raw_competition: dict[str, Any],
+    auction_payload: dict[str, Any],
+    our_solution: dict[str, Any] | None,
+) -> None:
+    """Never-raise wrapper for use in shadow_poller (no FastAPI BackgroundTasks)."""
+    try:
+        await persist_winner_and_outcomes(
+            auction_id, raw_competition, auction_payload, our_solution
+        )
+    except Exception as e:  # noqa: BLE001
+        log.error("winner_persist_failed", auction_id=auction_id, error=str(e))

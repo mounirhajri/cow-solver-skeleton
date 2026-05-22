@@ -5,6 +5,8 @@ the persist function constructs correct SQL and runs without error.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -48,6 +50,25 @@ async def session_factory(monkeypatch):
                 solution TEXT,
                 error TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        await conn.execute(text("""
+            CREATE TABLE shadow_winners (
+                auction_id INTEGER PRIMARY KEY REFERENCES shadow_auctions(auction_id),
+                winner_solver TEXT NOT NULL,
+                score NUMERIC,
+                raw_solution TEXT NOT NULL
+            )
+        """))
+        await conn.execute(text("""
+            CREATE TABLE token_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_address TEXT NOT NULL,
+                auction_id INTEGER NOT NULL REFERENCES shadow_auctions(auction_id),
+                appeared_in_winner INTEGER NOT NULL,
+                appeared_in_ours INTEGER NOT NULL,
+                caused_revert INTEGER NOT NULL DEFAULT 0,
+                observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """))
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -154,3 +175,125 @@ async def test_persist_safe_swallows_errors(monkeypatch) -> None:
     auction = _auction("1")
     # Must NOT raise
     await persist_shadow_attempt_safe(auction, [], None)
+
+
+# ─── Winner + token outcome tests ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_persist_winner_inserts_row(session_factory) -> None:
+    from src.persistence.models import ShadowAuction, ShadowWinner
+    from src.shadow.persist import persist_winner_and_outcomes
+
+    # Prerequisite: shadow_auction row exists (FK constraint)
+    async with session_factory() as s:
+        s.add(ShadowAuction(
+            auction_id=999, polled_at=datetime.now(UTC),
+            n_orders=0, raw_competition={}, raw_auction={},
+        ))
+        await s.commit()
+
+    comp = {
+        "auctionId": "999",
+        "solutions": [
+            {"solver": "0xabc", "score": "1000000000000000000", "isWinner": True,
+             "ranking": 1, "prices": {"0xa": "1"}, "trades": []}
+        ],
+    }
+    auction = {"orders": [{"sellToken": "0xA", "buyToken": "0xB"}]}
+    ours = {"prices": {"0xA": "1"}}
+
+    await persist_winner_and_outcomes(999, comp, auction, ours)
+
+    async with session_factory() as s:
+        winners = (await s.execute(select(ShadowWinner))).scalars().all()
+        assert len(winners) == 1
+        assert winners[0].winner_solver == "0xabc"
+        assert int(winners[0].score) == 1000000000000000000
+
+
+@pytest.mark.asyncio
+async def test_persist_winner_handles_no_winner(session_factory) -> None:
+    from src.persistence.models import ShadowAuction, ShadowWinner, TokenOutcome
+    from src.shadow.persist import persist_winner_and_outcomes
+
+    async with session_factory() as s:
+        s.add(ShadowAuction(
+            auction_id=888, polled_at=datetime.now(UTC),
+            n_orders=0, raw_competition={}, raw_auction={},
+        ))
+        await s.commit()
+
+    comp = {"auctionId": "888", "solutions": []}
+    auction = {"orders": [{"sellToken": "0xA", "buyToken": "0xB"}]}
+
+    await persist_winner_and_outcomes(888, comp, auction, None)
+
+    async with session_factory() as s:
+        winners = (await s.execute(select(ShadowWinner))).scalars().all()
+        assert len(winners) == 0
+        # But outcomes still derived
+        outcomes = (await s.execute(select(TokenOutcome))).scalars().all()
+        assert len(outcomes) == 2  # 0xa, 0xb
+
+
+@pytest.mark.asyncio
+async def test_persist_winner_handles_invalid_score(session_factory) -> None:
+    from src.persistence.models import ShadowAuction, ShadowWinner
+    from src.shadow.persist import persist_winner_and_outcomes
+
+    async with session_factory() as s:
+        s.add(ShadowAuction(
+            auction_id=777, polled_at=datetime.now(UTC),
+            n_orders=0, raw_competition={}, raw_auction={},
+        ))
+        await s.commit()
+
+    comp = {
+        "auctionId": "777",
+        "solutions": [{"solver": "0xabc", "score": "not_a_number", "isWinner": True,
+                       "prices": {}, "trades": []}],
+    }
+    await persist_winner_and_outcomes(777, comp, {"orders": []}, None)
+
+    async with session_factory() as s:
+        winners = (await s.execute(select(ShadowWinner))).scalars().all()
+        assert len(winners) == 1
+        assert winners[0].score is None  # gracefully parsed as None
+
+
+@pytest.mark.asyncio
+async def test_persist_winner_creates_auction_row_when_missing(session_factory) -> None:
+    """Ensure FK target (shadow_auctions) is created when missing — handles race."""
+    from src.persistence.models import ShadowAuction, ShadowWinner
+    from src.shadow.persist import persist_winner_and_outcomes
+
+    # Deliberately do NOT pre-insert the ShadowAuction row
+    comp = {
+        "auctionId": "666",
+        "solutions": [{"solver": "0xdef", "score": "500", "isWinner": True,
+                       "prices": {}, "trades": []}],
+    }
+    auction = {"orders": [{"sellToken": "0xA", "buyToken": "0xB"}]}
+
+    await persist_winner_and_outcomes(666, comp, auction, None)
+
+    async with session_factory() as s:
+        auctions = (await s.execute(select(ShadowAuction))).scalars().all()
+        assert len(auctions) == 1  # created as side-effect
+        winners = (await s.execute(select(ShadowWinner))).scalars().all()
+        assert len(winners) == 1
+        assert winners[0].winner_solver == "0xdef"
+
+
+@pytest.mark.asyncio
+async def test_persist_winner_outcomes_safe_swallows_errors(monkeypatch) -> None:
+    """persist_winner_and_outcomes_safe must never raise."""
+    from src.shadow.persist import persist_winner_and_outcomes_safe
+
+    async def broken(*args, **kwargs) -> None:
+        raise RuntimeError("DB down")
+
+    monkeypatch.setattr("src.shadow.persist.persist_winner_and_outcomes", broken)
+    # Must NOT raise
+    await persist_winner_and_outcomes_safe(42, {}, {}, None)

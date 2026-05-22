@@ -24,6 +24,7 @@ from typing import Any
 import httpx
 
 from scripts.liveness import touch_liveness
+from src.shadow.persist import persist_winner_and_outcomes_safe
 
 BASE_URL = "https://api.cow.fi/arbitrum_one/api/v1"
 MAX_ORDERS = 40
@@ -176,6 +177,14 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
     SHADOW_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with SHADOW_LOG_PATH.open("a") as f:
         f.write(json.dumps(entry) + "\n")
+
+    # Persist winner + token outcomes to Postgres (best-effort, never raises)
+    await persist_winner_and_outcomes_safe(
+        auction_id=auction_id,
+        raw_competition=comp,
+        auction_payload=auction_payload,
+        our_solution=our_solution,
+    )
 
     log.info(
         "auction_processed",
