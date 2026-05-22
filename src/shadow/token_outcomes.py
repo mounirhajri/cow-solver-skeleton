@@ -21,6 +21,7 @@ def extract_token_outcomes(
     in Phase 4).
     """
     tokens: set[str] = set()
+    # Primary source: per-order tokens (when orders were fetched)
     for order in auction.get("orders", []):
         sell = order.get("sellToken") or order.get("sell_token")
         buy = order.get("buyToken") or order.get("buy_token")
@@ -28,6 +29,11 @@ def extract_token_outcomes(
             tokens.add(sell.lower())
         if buy:
             tokens.add(buy.lower())
+    # Fallback source: auction.tokens dict (present when poller built a skeleton
+    # payload for a large auction without fetching individual orders).
+    for token_addr in auction.get("tokens", {}):
+        if isinstance(token_addr, str):
+            tokens.add(token_addr.lower())
 
     winner_tokens = {
         k.lower() for k in (winner_solution or {}).get("prices", {})
