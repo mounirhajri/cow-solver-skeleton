@@ -14,3 +14,5 @@ htmlcov/
 shadow_data/
 *.jsonl
 .DS_Store
+.vscode/
+.idea/
