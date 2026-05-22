@@ -108,11 +108,18 @@ async def persist_winner_and_outcomes(
             select(ShadowAuction).where(ShadowAuction.auction_id == auction_id)
         )
         if existing_auction.scalar_one_or_none() is None:
+            # n_orders: prefer the full count from raw_competition.auction.orders
+            # (which has uids even when we didn't fetch them); fall back to
+            # auction_payload.orders length.
+            comp_auction = raw_competition.get("auction") or {}
+            n_orders = len(comp_auction.get("orders") or []) or len(
+                auction_payload.get("orders", [])
+            )
             session.add(
                 ShadowAuction(
                     auction_id=auction_id,
                     polled_at=datetime.now(UTC),
-                    n_orders=len(auction_payload.get("orders", [])),
+                    n_orders=n_orders,
                     raw_competition=raw_competition,
                     raw_auction=auction_payload,
                 )
