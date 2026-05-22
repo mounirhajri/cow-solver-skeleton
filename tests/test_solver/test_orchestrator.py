@@ -10,6 +10,8 @@ from src.models.solution import Solution, Trade
 from src.solver.base import NoSolution
 from src.solver.orchestrator import SolverOrchestrator
 
+UID = "0x" + "a" * 112
+
 
 @pytest.fixture
 def auction() -> Auction:
@@ -17,8 +19,17 @@ def auction() -> Auction:
     return Auction.model_validate(json.loads(path.read_text()))
 
 
+def _solution() -> Solution:
+    return Solution(
+        id=1,
+        prices={},
+        trades=[Trade(kind="fulfillment", order_uid=UID, executed_amount=10**18)],
+        interactions=[],
+    )
+
+
 async def test_orchestrator_returns_first_solution(auction: Auction) -> None:
-    sol = Solution(id=1, prices={}, trades=[Trade(kind="fulfillment", order_uid="0x" + "a"*112, executed_amount=10**18)], interactions=[])
+    sol = _solution()
     s1 = AsyncMock(name="s1")
     s1.name = "s1"
     s1.solve.return_value = sol
@@ -36,7 +47,7 @@ async def test_orchestrator_falls_through_on_nosolution(auction: Auction) -> Non
     s1 = AsyncMock(name="s1")
     s1.name = "s1"
     s1.solve.return_value = NoSolution()
-    sol = Solution(id=1, prices={}, trades=[Trade(kind="fulfillment", order_uid="0x" + "a"*112, executed_amount=10**18)], interactions=[])
+    sol = _solution()
     s2 = AsyncMock(name="s2")
     s2.name = "s2"
     s2.solve.return_value = sol
@@ -55,7 +66,7 @@ async def test_orchestrator_times_out_slow_strategy(auction: Auction) -> None:
     s1.name = "slow"
     s1.solve.side_effect = slow_solve
 
-    sol = Solution(id=1, prices={}, trades=[Trade(kind="fulfillment", order_uid="0x" + "a"*112, executed_amount=10**18)], interactions=[])
+    sol = _solution()
     s2 = AsyncMock(name="s2")
     s2.name = "fast"
     s2.solve.return_value = sol

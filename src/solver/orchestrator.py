@@ -30,11 +30,13 @@ class SolverOrchestrator:
         for strat in self._strategies:
             try:
                 result = await asyncio.wait_for(strat.solve(auction), timeout=self._timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 log.warning("strategy_timeout", strategy=strat.name, auction_id=auction.id)
                 continue
             except Exception as e:  # noqa: BLE001
-                log.error("strategy_error", strategy=strat.name, error=str(e), auction_id=auction.id)
+                log.error(
+                    "strategy_error", strategy=strat.name, error=str(e), auction_id=auction.id
+                )
                 continue
 
             if isinstance(result, Solution):

@@ -1,7 +1,7 @@
 import httpx
 import respx
 
-from src.shadow.cow_api import CowApiClient, CompetitionResult
+from src.shadow.cow_api import CompetitionResult, CowApiClient
 
 
 @respx.mock

@@ -1,15 +1,20 @@
 import json
 from pathlib import Path
 
-import pytest
-
 from src.models.solution import Solution, Trade
 from src.shadow.logger import SolutionLogger
+
+UID = "0x" + "a" * 112
 
 
 def test_logger_appends_jsonl(tmp_path: Path) -> None:
     logger = SolutionLogger(path=tmp_path / "shadow.jsonl")
-    sol = Solution(id=1, prices={}, trades=[Trade(kind="fulfillment", order_uid="0x" + "a"*112, executed_amount=10**18)], interactions=[])
+    sol = Solution(
+        id=1,
+        prices={},
+        trades=[Trade(kind="fulfillment", order_uid=UID, executed_amount=10**18)],
+        interactions=[],
+    )
     logger.record(auction_id="123", our_solution=sol)
     logger.record(auction_id="124", our_solution=None)
 

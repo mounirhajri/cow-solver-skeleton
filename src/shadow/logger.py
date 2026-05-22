@@ -20,7 +20,9 @@ class SolutionLogger:
         record = {
             "auction_id": auction_id,
             "timestamp": datetime.now(UTC).isoformat(),
-            "our_solution": our_solution.model_dump(by_alias=True, mode="json") if our_solution else None,
+            "our_solution": (
+                our_solution.model_dump(by_alias=True, mode="json") if our_solution else None
+            ),
             "winner_solution": None,  # filled later
         }
         with self._path.open("a") as f:
