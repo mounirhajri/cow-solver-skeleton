@@ -27,7 +27,10 @@ from scripts.liveness import touch_liveness
 from src.shadow.persist import persist_winner_and_outcomes_safe
 
 BASE_URL = "https://api.cow.fi/arbitrum_one/api/v1"
-MAX_ORDERS = 40
+# Arbitrum batches typically have 50-150 orders; 40 was too tight and caused
+# skip_large_auction on every poll. With backoff in place, larger fetches
+# are tolerable.
+MAX_ORDERS = 150
 
 SOLVER_URL = os.environ.get("SOLVER_INTERNAL_URL", "http://cow-solver:8000")
 SHADOW_LOG_PATH = Path(os.environ.get("SHADOW_LOG_PATH", "/data/shadow.jsonl"))
