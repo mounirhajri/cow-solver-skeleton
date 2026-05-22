@@ -57,8 +57,10 @@ jobs:
           script: |
             set -e
             cd /opt/mhagentic/stack
-            docker compose pull cow-solver reconciler
-            docker compose up -d cow-solver reconciler
-            sleep 5
-            docker compose ps cow-solver
+            docker compose pull cow-solver reconciler shadow-poller
+            docker compose up -d cow-solver reconciler shadow-poller
+            sleep 8
+            # Run alembic migrations (idempotent — `upgrade head` is a no-op when up to date)
+            docker compose exec -T cow-solver uv run alembic upgrade head
+            docker compose ps cow-solver reconciler shadow-poller
             curl -fsS http://localhost:8000/health

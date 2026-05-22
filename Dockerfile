@@ -19,6 +19,7 @@ RUN uv sync --frozen --no-install-project --no-dev || uv sync --no-install-proje
 COPY src ./src
 COPY scripts ./scripts
 COPY edge ./edge
+COPY alembic.ini ./
 RUN uv sync --frozen --no-dev || uv sync --no-dev
 
 
