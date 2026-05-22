@@ -121,7 +121,8 @@ async def poll_once(
 
 async def main() -> None:
     seen: set[int] = set()
-    async with httpx.AsyncClient() as client:
+    headers = {"User-Agent": "cow-solver-shadow-poller/0.1 (github.com/mounirhajri/cow-solver-skeleton)"}
+    async with httpx.AsyncClient(headers=headers) as client:
         while True:
             try:
                 await poll_once(client, seen)
