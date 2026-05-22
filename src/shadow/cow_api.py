@@ -1,6 +1,13 @@
+import asyncio
+import json
+import ssl
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from typing import Any
 
-import httpx
+_UA = "curl/8.5.0"
+_SSL_CTX = ssl.create_default_context()
 
 
 @dataclass(frozen=True)
@@ -13,8 +20,7 @@ class CompetitionResult:
 class CowApiClient:
     """Client for the public CoW Orderbook API.
 
-    Used in shadow phase to fetch the actual winning solver and score per auction,
-    so we can compute our surplus delta.
+    Uses urllib (not httpx) — the CoW API blocks httpx's TLS fingerprint.
     """
 
     BASE_BY_NETWORK = {
@@ -24,16 +30,26 @@ class CowApiClient:
         "gnosis": "https://api.cow.fi/xdai/api/v1",
     }
 
-    def __init__(self, network: str = "arbitrum_one", timeout: float = 5.0) -> None:
-        base = self.BASE_BY_NETWORK[network]
-        self._client = httpx.AsyncClient(base_url=base, timeout=timeout)
+    def __init__(self, network: str = "arbitrum_one") -> None:
+        self._base = self.BASE_BY_NETWORK[network]
+
+    def _get(self, path: str) -> "dict[str, Any] | None":
+        req = urllib.request.Request(
+            f"{self._base}{path}", headers={"User-Agent": _UA}
+        )
+        try:
+            with urllib.request.urlopen(req, context=_SSL_CTX, timeout=10) as resp:
+                result: dict[str, Any] = json.loads(resp.read())
+                return result
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            raise
 
     async def fetch_competition(self, auction_id: int) -> CompetitionResult | None:
-        resp = await self._client.get(f"/solver_competition/{auction_id}")
-        if resp.status_code == 404:
+        data = await asyncio.to_thread(self._get, f"/solver_competition/{auction_id}")
+        if data is None:
             return None
-        resp.raise_for_status()
-        data = resp.json()
         solutions = data.get("solutions", [])
         winner = next((s for s in solutions if s.get("ranking") == 1), None)
         if not winner:
@@ -45,4 +61,4 @@ class CowApiClient:
         )
 
     async def close(self) -> None:
-        await self._client.aclose()
+        pass  # no persistent connection to close

@@ -4,57 +4,77 @@ Replaces the cow-shadow-driver binary (which removed --shadow mode in recent ver
 Polls solver_competition/latest from the public CoW Orderbook API, reconstructs a
 minimal auction payload from order UIDs, calls our solver, and logs results with
 winner comparison — no solver registration required.
+
+Uses urllib (not httpx) for CoW API calls — the CoW API blocks httpx's TLS fingerprint
+but accepts curl/urllib connections.
 """
 import asyncio
 import json
 import logging
 import os
+import ssl
+import urllib.error
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 
 BASE_URL = "https://api.cow.fi/arbitrum_one/api/v1"
 MAX_ORDERS = 40
-POLL_INTERVAL = 60  # seconds — stays well within CoW API rate limits
+POLL_INTERVAL = 60  # seconds
 
 SOLVER_URL = os.environ.get("SOLVER_INTERNAL_URL", "http://cow-solver:8000")
 SHADOW_LOG_PATH = Path(os.environ.get("SHADOW_LOG_PATH", "/data/shadow.jsonl"))
 
+_UA = "curl/8.5.0"
+_SSL_CTX = ssl.create_default_context()
+
 log = logging.getLogger(__name__)
 
 
-async def _fetch_order(client: httpx.AsyncClient, uid: str) -> dict | None:
+def _urllib_get(url: str) -> "dict[str, Any] | None":
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
     try:
-        r = await client.get(f"{BASE_URL}/orders/{uid}", timeout=5.0)
-        return r.json() if r.status_code == 200 else None
+        with urllib.request.urlopen(req, context=_SSL_CTX, timeout=10) as resp:
+            result: dict[str, Any] = json.loads(resp.read())
+            return result
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            log.warning("rate_limited_skipping_poll")
+            return None
+        raise
+
+
+async def _cow_get(url: str) -> "dict[str, Any] | None":
+    return await asyncio.to_thread(_urllib_get, url)
+
+
+async def _fetch_order(uid: str) -> "dict[str, Any] | None":
+    try:
+        return await _cow_get(f"{BASE_URL}/orders/{uid}")
     except Exception:
         return None
 
 
-async def poll_once(
-    client: httpx.AsyncClient,
-    seen: set[int],
-) -> None:
-    r = await client.get(f"{BASE_URL}/solver_competition/latest", timeout=10.0)
-    if r.status_code == 429:
-        log.warning("rate_limited_skipping_poll")
+async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> None:
+    comp = await _cow_get(f"{BASE_URL}/solver_competition/latest")
+    if comp is None:
         return
-    r.raise_for_status()
-    comp = r.json()
 
-    auction_id = int(comp["auctionId"])
+    auction_id = int(str(comp["auctionId"]))
     if auction_id in seen:
         return
     seen.add(auction_id)
 
-    auction_data = comp.get("auction", {})
-    uids: list[str] = auction_data.get("orders", [])[:MAX_ORDERS]
-    prices: dict[str, str] = auction_data.get("prices", {})
+    auction_data: dict[str, Any] = comp.get("auction") or {}
+    uids: list[str] = [str(u) for u in (auction_data.get("orders") or [])][:MAX_ORDERS]
+    prices: dict[str, str] = {str(k): str(v) for k, v in (auction_data.get("prices") or {}).items()}
 
     orders = [
         o
-        for o in await asyncio.gather(*[_fetch_order(client, uid) for uid in uids])
+        for o in await asyncio.gather(*[_fetch_order(uid) for uid in uids])
         if o is not None
     ]
 
@@ -79,7 +99,7 @@ async def poll_once(
 
     our_solution = None
     try:
-        resp = await client.post(
+        resp = await solver.post(
             f"{SOLVER_URL}/solve", json=auction_payload, timeout=14.0
         )
         if resp.status_code == 200:
@@ -87,7 +107,7 @@ async def poll_once(
     except Exception as exc:
         log.warning("solver_call_failed", extra={"auction_id": auction_id, "error": str(exc)})
 
-    solutions: list[dict] = comp.get("solutions", [])
+    solutions: list[dict[str, Any]] = [s for s in (comp.get("solutions") or [])]
     winner = next(
         (s for s in solutions if s.get("isWinner") or s.get("ranking") == 1), None
     )
@@ -121,11 +141,10 @@ async def poll_once(
 
 async def main() -> None:
     seen: set[int] = set()
-    headers = {"User-Agent": "cow-solver-shadow-poller/0.1 (github.com/mounirhajri/cow-solver-skeleton)"}
-    async with httpx.AsyncClient(headers=headers) as client:
+    async with httpx.AsyncClient() as solver:
         while True:
             try:
-                await poll_once(client, seen)
+                await poll_once(solver, seen)
             except Exception as exc:
                 log.exception("poll_error: %s", exc)
             await asyncio.sleep(POLL_INTERVAL)
