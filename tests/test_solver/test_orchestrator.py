@@ -35,12 +35,18 @@ async def test_orchestrator_returns_first_solution(auction: Auction) -> None:
     s1.solve.return_value = sol
     s2 = AsyncMock(name="s2")
     s2.name = "s2"
+    s2.solve.return_value = NoSolution()
 
-    orch = SolverOrchestrator(strategies=[s1, s2], per_strategy_timeout=1.0)
-    result = await orch.solve(auction)
+    # run_all_strategies=False: stops at first winner
+    orch = SolverOrchestrator(
+        strategies=[s1, s2], per_strategy_timeout=1.0, run_all_strategies=False
+    )
+    result, attempts = await orch.solve(auction)
 
     assert result is sol
-    s2.solve.assert_not_called()  # s1 already returned solution
+    s2.solve.assert_not_called()  # s1 already returned solution, stopped early
+    assert len(attempts) == 1
+    assert attempts[0].status == "solved"
 
 
 async def test_orchestrator_falls_through_on_nosolution(auction: Auction) -> None:
@@ -53,8 +59,11 @@ async def test_orchestrator_falls_through_on_nosolution(auction: Auction) -> Non
     s2.solve.return_value = sol
 
     orch = SolverOrchestrator(strategies=[s1, s2], per_strategy_timeout=1.0)
-    result = await orch.solve(auction)
+    result, attempts = await orch.solve(auction)
     assert result is sol
+    assert len(attempts) == 2
+    assert attempts[0].status == "no_solution"
+    assert attempts[1].status == "solved"
 
 
 async def test_orchestrator_times_out_slow_strategy(auction: Auction) -> None:
@@ -72,8 +81,10 @@ async def test_orchestrator_times_out_slow_strategy(auction: Auction) -> None:
     s2.solve.return_value = sol
 
     orch = SolverOrchestrator(strategies=[s1, s2], per_strategy_timeout=0.1)
-    result = await orch.solve(auction)
+    result, attempts = await orch.solve(auction)
     assert result is sol
+    assert attempts[0].status == "timeout"
+    assert attempts[1].status == "solved"
 
 
 async def test_orchestrator_returns_nosolution_if_all_fail(auction: Auction) -> None:
@@ -81,5 +92,29 @@ async def test_orchestrator_returns_nosolution_if_all_fail(auction: Auction) -> 
     s1.name = "s1"
     s1.solve.return_value = NoSolution()
     orch = SolverOrchestrator(strategies=[s1], per_strategy_timeout=1.0)
-    result = await orch.solve(auction)
+    result, attempts = await orch.solve(auction)
     assert isinstance(result, NoSolution)
+    assert len(attempts) == 1
+    assert attempts[0].status == "no_solution"
+
+
+async def test_orchestrator_run_all_strategies_collects_all_attempts(auction: Auction) -> None:
+    """With run_all_strategies=True, all strategies run even after a winner is found."""
+    sol = _solution()
+    s1 = AsyncMock(name="s1")
+    s1.name = "s1"
+    s1.solve.return_value = sol
+    s2 = AsyncMock(name="s2")
+    s2.name = "s2"
+    s2.solve.return_value = NoSolution()
+
+    orch = SolverOrchestrator(
+        strategies=[s1, s2], per_strategy_timeout=1.0, run_all_strategies=True
+    )
+    result, attempts = await orch.solve(auction)
+
+    assert result is sol
+    s2.solve.assert_called_once()  # s2 was still called despite s1 winning
+    assert len(attempts) == 2
+    assert attempts[0].status == "solved"
+    assert attempts[1].status == "no_solution"

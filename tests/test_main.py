@@ -34,11 +34,14 @@ def test_metrics_endpoint_serves_prometheus(auction_payload: dict) -> None:
 
 def test_solve_with_solution(auction_payload: dict) -> None:
     orch = AsyncMock()
-    orch.solve.return_value = Solution(
-        id=12345,
-        prices={"0x82af49447d8a07e3bd95bd0d56f35241523fbab1": 3500 * 10**18},
-        trades=[Trade(kind="fulfillment", order_uid="0x" + "a"*112, executed_amount=10**18)],
-        interactions=[],
+    orch.solve.return_value = (
+        Solution(
+            id=12345,
+            prices={"0x82af49447d8a07e3bd95bd0d56f35241523fbab1": 3500 * 10**18},
+            trades=[Trade(kind="fulfillment", order_uid="0x" + "a"*112, executed_amount=10**18)],
+            interactions=[],
+        ),
+        [],  # empty attempts list
     )
     app = create_app(orchestrator=orch)
     client = TestClient(app)
@@ -51,7 +54,7 @@ def test_solve_with_solution(auction_payload: dict) -> None:
 
 def test_solve_with_no_solution(auction_payload: dict) -> None:
     orch = AsyncMock()
-    orch.solve.return_value = NoSolution()
+    orch.solve.return_value = (NoSolution(), [])  # tuple with empty attempts
     app = create_app(orchestrator=orch)
     client = TestClient(app)
     resp = client.post("/solve", json=auction_payload)

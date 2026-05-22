@@ -2,7 +2,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Request, Response
+from fastapi import BackgroundTasks, FastAPI, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from src.config import settings
@@ -11,6 +11,7 @@ from src.metrics import SOLVE_DURATION, SOLVE_TOTAL
 from src.models.auction import Auction
 from src.models.solution import Solution
 from src.shadow.logger import SolutionLogger
+from src.shadow.persist import persist_shadow_attempt_safe
 from src.solver.base import NoSolution
 from src.solver.orchestrator import SolverOrchestrator, load_default_strategies
 
@@ -34,17 +35,20 @@ def create_app(
         return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.post("/solve")
-    async def solve(request: Request) -> dict[str, Any]:
+    async def solve(request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
         start = time.perf_counter()
         body = await request.json()
         auction = Auction.model_validate(body)
 
         try:
-            result = await orchestrator.solve(auction)
+            result, attempts = await orchestrator.solve(auction)
         except Exception as e:  # noqa: BLE001
             log.error("solve_error", auction_id=auction.id, error=str(e))
             SOLVE_TOTAL.labels(outcome="error").inc()
             return _empty_solution(auction.id)
+
+        # Persist shadow data in the background — never blocks the hot path
+        background_tasks.add_task(persist_shadow_attempt_safe, auction, attempts, None)
 
         if isinstance(result, NoSolution):
             SOLVE_TOTAL.labels(outcome="no_solution").inc()
