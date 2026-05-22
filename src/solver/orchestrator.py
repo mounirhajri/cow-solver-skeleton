@@ -119,10 +119,11 @@ def load_default_strategies() -> list[SolverStrategy]:
     strategies: list[SolverStrategy] = []
 
     try:
-        from edge.matching import CoWMatchingSolver
+        from edge.matching import BipartiteMatcher, CoWMatchingSolver
         from edge.pool_indexer import LongTailRouter
 
-        strategies.append(CoWMatchingSolver())
+        strategies.append(BipartiteMatcher())  # cheap, selective
+        strategies.append(CoWMatchingSolver())  # multi-party rings
         strategies.append(LongTailRouter())
         log.info("edge_strategies_loaded")
     except ImportError:
