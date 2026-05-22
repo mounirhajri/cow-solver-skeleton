@@ -1,0 +1,26 @@
+# Shadow-mode driver config for cow-solver-skeleton.
+# Driver receives real Arbitrum batches from CoW autopilot but does NOT
+# submit settlements on-chain.
+
+[shadow]
+# Run as observer
+solvers = ["http://cow-solver:8000"]
+
+[liquidity]
+# Driver will index AMM state and provide it to our solver via the auction payload.
+[liquidity.uniswap-v2]
+router = "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24"  # Uniswap V2 router on Arbitrum
+
+[liquidity.uniswap-v3]
+router = "0xE592427A0AEce92De3Edee1F18E0157C05861564"  # Uniswap V3 SwapRouter on Arbitrum
+
+[submission]
+# Shadow mode: no submission keys needed
+gas-price-cap = "1000000000"  # 1 gwei cap (informational)
+
+[contracts]
+# Arbitrum addresses
+gp-v2-settlement = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
+
+[ethereum]
+node-url = "${RPC_ARBITRUM}"
