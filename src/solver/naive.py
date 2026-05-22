@@ -1,24 +1,19 @@
 from src.log import get_logger
 from src.models.auction import Auction
 from src.models.solution import Solution, Trade
-from src.routing.oneinch import OneInchClient
 from src.solver.base import NoSolution
 
 log = get_logger(__name__)
 
 
 class NaiveSolver:
-    """Wraps 1inch to quote each sell order independently.
+    """Uses CoW Protocol reference prices to find fillable sell orders.
 
-    This is a baseline only. It does NO CoW-matching and treats each order
-    as if it's the only one in the batch. Its purpose is to give us a working
-    fallback while we develop the real edge in the private submodule.
+    No external API needed — reference prices come from the auction payload
+    itself (Chainlink/oracle-based). This is a valid Phase 1 baseline.
     """
 
     name = "naive"
-
-    def __init__(self, oneinch: OneInchClient) -> None:
-        self._oneinch = oneinch
 
     async def solve(self, auction: Auction) -> Solution | NoSolution:
         trades: list[Trade] = []
@@ -29,21 +24,24 @@ class NaiveSolver:
                 log.debug("skip_non_sell_order", uid=order.uid, kind=order.kind)
                 continue
 
-            try:
-                quote = await self._oneinch.quote(
-                    src=order.sell_token,
-                    dst=order.buy_token,
-                    amount=order.sell_amount,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning("oneinch_quote_failed", uid=order.uid, error=str(e))
+            sell_info = auction.tokens.get(order.sell_token)
+            buy_info = auction.tokens.get(order.buy_token)
+
+            if not sell_info or not sell_info.reference_price:
+                log.debug("no_reference_price", uid=order.uid, token=order.sell_token)
+                continue
+            if not buy_info or not buy_info.reference_price:
+                log.debug("no_reference_price", uid=order.uid, token=order.buy_token)
                 continue
 
-            if quote.dst_amount < order.buy_amount:
+            # At reference prices: how much buy_token does sell_amount yield?
+            buy_at_ref = order.sell_amount * sell_info.reference_price // buy_info.reference_price
+
+            if buy_at_ref < order.buy_amount:
                 log.debug(
                     "below_limit",
                     uid=order.uid,
-                    quoted=quote.dst_amount,
+                    buy_at_ref=buy_at_ref,
                     required=order.buy_amount,
                 )
                 continue
@@ -51,9 +49,8 @@ class NaiveSolver:
             trades.append(
                 Trade(kind="fulfillment", order_uid=order.uid, executed_amount=order.sell_amount)
             )
-            # Uniform clearing price per directed pair (sell/buy ratio)
-            prices[order.sell_token] = quote.dst_amount
-            prices[order.buy_token] = order.sell_amount
+            prices[order.sell_token] = sell_info.reference_price
+            prices[order.buy_token] = buy_info.reference_price
 
         if not trades:
             return NoSolution()

@@ -82,7 +82,7 @@ def build_default_app() -> FastAPI:
     does not trigger filesystem and network side-effects.
     """
     configure_logging(level=settings.log_level)
-    strategies = load_default_strategies(settings.oneinch_api_key)
+    strategies = load_default_strategies()
     orchestrator = SolverOrchestrator(
         strategies=strategies,
         per_strategy_timeout=settings.solve_timeout_seconds / max(1, len(strategies)),

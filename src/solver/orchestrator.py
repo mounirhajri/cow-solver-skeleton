@@ -46,20 +46,18 @@ class SolverOrchestrator:
         return NoSolution()
 
 
-def load_default_strategies(oneinch_api_key: str) -> list[SolverStrategy]:
+def load_default_strategies() -> list[SolverStrategy]:
     """Build the strategy chain. Loads edge strategies if private submodule present.
 
     Order: edge strategies first (more specialized), naive last (fallback).
     """
-    from src.routing.oneinch import OneInchClient
     from src.solver.naive import NaiveSolver
 
     strategies: list[SolverStrategy] = []
 
-    # Try to load edge submodule
     try:
-        from edge.matching import CoWMatchingSolver  # type: ignore[import-untyped]
-        from edge.pool_indexer import LongTailRouter  # type: ignore[import-untyped]
+        from edge.matching import CoWMatchingSolver  # type: ignore[attr-defined]
+        from edge.pool_indexer import LongTailRouter  # type: ignore[attr-defined]
 
         strategies.append(CoWMatchingSolver())
         strategies.append(LongTailRouter())
@@ -67,8 +65,5 @@ def load_default_strategies(oneinch_api_key: str) -> list[SolverStrategy]:
     except ImportError:
         log.info("edge_strategies_not_present", reason="public_clone_or_phase0")
 
-    # Always include naive as last resort
-    oneinch = OneInchClient(api_key=oneinch_api_key, chain_id=42161)
-    strategies.append(NaiveSolver(oneinch=oneinch))
-
+    strategies.append(NaiveSolver())
     return strategies
