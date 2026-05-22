@@ -1,0 +1,12 @@
+.venv/
+.git/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+shadow_data/
+*.jsonl
+tests/
+docs/
+.github/
+.env
+.env.local
