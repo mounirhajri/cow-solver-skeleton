@@ -48,7 +48,7 @@ def _make_auction(
 @pytest.mark.asyncio
 async def test_router_no_orders_returns_no_solution() -> None:
     multicall = AsyncMock()
-    router = RouterSolver(multicall=multicall, intermediates=[])
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=False)
     auction = _make_auction([])
     result = await router.solve(auction)
     assert isinstance(result, NoSolution)
@@ -61,7 +61,7 @@ async def test_router_returns_no_solution_when_no_path(monkeypatch: pytest.Monke
 
     monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
     multicall = AsyncMock()
-    router = RouterSolver(multicall=multicall, intermediates=[])
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=False)
     auction = _make_auction([_make_order()])
     result = await router.solve(auction)
     assert isinstance(result, NoSolution)
@@ -88,7 +88,7 @@ async def test_router_emits_trade_when_path_beats_limit(
     monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
 
     multicall = AsyncMock()
-    router = RouterSolver(multicall=multicall, intermediates=[])
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=False)
     auction = _make_auction([_make_order()], auction_id="42")
     result = await router.solve(auction)
     assert isinstance(result, Solution)
@@ -115,7 +115,7 @@ async def test_router_skips_order_below_limit(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
 
     multicall = AsyncMock()
-    router = RouterSolver(multicall=multicall, intermediates=[])
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=False)
     auction = _make_auction([_make_order()])
     result = await router.solve(auction)
     assert isinstance(result, NoSolution)
@@ -133,7 +133,7 @@ async def test_router_skips_buy_orders(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
 
     multicall = AsyncMock()
-    router = RouterSolver(multicall=multicall, intermediates=[])
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=False)
     auction = _make_auction([_make_order(kind="buy")])
     result = await router.solve(auction)
     assert isinstance(result, NoSolution)
@@ -160,7 +160,9 @@ async def test_order_cap_limits_quotes_to_top_n(monkeypatch: pytest.MonkeyPatch)
         for i in range(1, 8)  # sell amounts: 100, 200, ..., 700
     ]
     multicall = AsyncMock()
-    router = RouterSolver(multicall=multicall, intermediates=[], max_orders=3)
+    router = RouterSolver(
+        multicall=multicall, intermediates=[], max_orders=3, v3_only_batched=False
+    )
     await router.solve(_make_auction(orders))
 
     assert sorted(quoted_amounts, reverse=True) == [700, 600, 500], (
@@ -185,7 +187,7 @@ async def test_order_cap_default_is_50(monkeypatch: pytest.MonkeyPatch) -> None:
         for i in range(1, 151)  # 150 orders
     ]
     multicall = AsyncMock()
-    router = RouterSolver(multicall=multicall, intermediates=[])
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=False)
     await router.solve(_make_auction(orders))
 
     assert call_count == 50
@@ -225,7 +227,9 @@ async def test_order_cap_sorts_by_eth_value(monkeypatch: pytest.MonkeyPatch) -> 
         _make_order(uid="usdc", sellToken=usdc, buyToken=dai, sellAmount=1000 * 10**6, buyAmount=1),
     ]
     multicall = AsyncMock()
-    router = RouterSolver(multicall=multicall, intermediates=[], max_orders=1)
+    router = RouterSolver(
+        multicall=multicall, intermediates=[], max_orders=1, v3_only_batched=False
+    )
     await router.solve(_make_auction(orders, tokens=tokens))
 
     assert quoted_amounts == [10**18], (
@@ -260,7 +264,9 @@ async def test_order_cap_falls_back_to_sell_amount_when_no_reference_price(
         _make_order(uid="usdc", sellToken=usdc, sellAmount=10**9, buyAmount=1),
     ]
     multicall = AsyncMock()
-    router = RouterSolver(multicall=multicall, intermediates=[], max_orders=1)
+    router = RouterSolver(
+        multicall=multicall, intermediates=[], max_orders=1, v3_only_batched=False
+    )
     await router.solve(_make_auction(orders, tokens=tokens))
 
     assert quoted_amounts == [10**18], (
@@ -289,7 +295,9 @@ async def test_quotes_run_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
 
     orders = [_make_order(uid=f"o{i}", sellAmount=i * 10) for i in range(1, 11)]
     multicall = AsyncMock()
-    router = RouterSolver(multicall=multicall, intermediates=[], max_concurrent=10)
+    router = RouterSolver(
+        multicall=multicall, intermediates=[], max_concurrent=10, v3_only_batched=False
+    )
 
     solve_task = asyncio.create_task(router.solve(_make_auction(orders)))
 
@@ -326,7 +334,9 @@ async def test_semaphore_limits_concurrent_quotes(monkeypatch: pytest.MonkeyPatc
 
     orders = [_make_order(uid=f"o{i}", sellAmount=i * 10) for i in range(1, 11)]
     multicall = AsyncMock()
-    router = RouterSolver(multicall=multicall, intermediates=[], max_concurrent=3)
+    router = RouterSolver(
+        multicall=multicall, intermediates=[], max_concurrent=3, v3_only_batched=False
+    )
 
     solve_task = asyncio.create_task(router.solve(_make_auction(orders)))
 
@@ -359,7 +369,7 @@ def test_router_exposes_timeout_attribute() -> None:
     """RouterSolver must declare .timeout so the orchestrator can use it."""
     from unittest.mock import MagicMock
     multicall = MagicMock()
-    router = RouterSolver(multicall=multicall, intermediates=[])
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=False)
     assert hasattr(router, "timeout")
     assert router.timeout == 11.0
 
@@ -370,3 +380,96 @@ def test_router_timeout_overridable() -> None:
     multicall = MagicMock()
     router = RouterSolver(multicall=multicall, intermediates=[], strategy_timeout=12.5)
     assert router.timeout == 12.5
+
+
+# ── V3-only batched mode ──────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_router_v3_batched_mode_emits_trade_when_amount_out_beats_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        # Return amount_out=1100 (> buy_amount=900) on the FIRST path; zeros otherwise.
+        out = []
+        for i, p in enumerate(paths):
+            out.append(V3BatchedQuote(path=p, amount_out=1100 if i == 0 else 0))
+        return out
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    result = await router.solve(_make_auction([_make_order()], auction_id="7"))
+    assert isinstance(result, Solution)
+    assert len(result.trades) == 1
+    assert result.trades[0].order_uid == "o1"
+
+
+@pytest.mark.asyncio
+async def test_router_v3_batched_mode_skips_orders_below_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        return [V3BatchedQuote(path=p, amount_out=800) for p in paths]
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    # buy_amount=900, all quotes return 800 → no trade
+    result = await router.solve(_make_auction([_make_order()]))
+    assert isinstance(result, NoSolution)
+
+
+@pytest.mark.asyncio
+async def test_router_falls_back_to_legacy_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag off → legacy `quote_best_path` path is used (not batched_v3_quote)."""
+    from src.routing.multihop import HopQuote
+
+    legacy_called = False
+    batched_called = False
+
+    async def mock_legacy(*args: object, **kwargs: object) -> list[HopQuote]:
+        nonlocal legacy_called
+        legacy_called = True
+        return [
+            HopQuote(
+                factory="sushi",
+                pool="0x" + "0" * 40,
+                token_in="0xa",
+                token_out="0xb",
+                amount_in=1000,
+                amount_out=1100,
+            )
+        ]
+
+    async def mock_batched(*args: object, **kwargs: object) -> list[object]:
+        nonlocal batched_called
+        batched_called = True
+        return []
+
+    monkeypatch.setattr("src.solver.router.quote_best_path", mock_legacy)
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=False)
+    await router.solve(_make_auction([_make_order()]))
+    assert legacy_called
+    assert not batched_called
+
+
+def test_config_has_v3_only_batched_default() -> None:
+    from src.config import Settings
+    s = Settings()
+    assert s.router_v3_only_batched is True

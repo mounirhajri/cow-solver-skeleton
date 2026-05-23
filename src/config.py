@@ -55,6 +55,11 @@ class Settings(BaseSettings):
         ]
     )
 
+    # RouterSolver path. V3-only batched mode skips V2 entirely and submits all
+    # quotes for an auction in one Multicall3 round-trip. Dramatically reduces
+    # RPC load (~80x) but loses access to V2-only pools (rare on Arbitrum).
+    router_v3_only_batched: bool = True
+
     # LongTailRouter (Pool-Indexer). Bursts ~60 RPC calls per auction on top of
     # RouterSolver's load. On a tight Alchemy free-tier concurrent-connection
     # quota that pushes RouterSolver into "Authentication required" rejections.
