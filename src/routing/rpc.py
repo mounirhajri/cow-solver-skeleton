@@ -30,4 +30,12 @@ class RpcClient:
             "params": [{"to": to, "data": data}, block],
         }
         resp = await self._client.post(self.url, json=payload, timeout=5.0)
-        return str(resp.json()["result"])
+        body = resp.json()
+        if "error" in body:
+            err = body["error"]
+            code = err.get("code", "?") if isinstance(err, dict) else "?"
+            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            raise RuntimeError(f"RPC error {code}: {msg}")
+        if "result" not in body:
+            raise RuntimeError(f"RPC response missing 'result': {body}")
+        return str(body["result"])
