@@ -151,16 +151,20 @@ async def persist_winner_and_outcomes(
             n_orders = len(comp_auction.get("orders") or []) or len(
                 auction_payload.get("orders", [])
             )
-            session.add(
-                ShadowAuction(
-                    auction_id=auction_id,
-                    polled_at=datetime.now(UTC),
-                    n_orders=n_orders,
-                    raw_competition=raw_competition,
-                    raw_auction=auction_payload,
+            try:
+                session.add(
+                    ShadowAuction(
+                        auction_id=auction_id,
+                        polled_at=datetime.now(UTC),
+                        n_orders=n_orders,
+                        raw_competition=raw_competition,
+                        raw_auction=auction_payload,
+                    )
                 )
-            )
-            await session.flush()  # ensure FK target exists before children
+                await session.flush()  # ensure FK target exists before children
+            except IntegrityError:
+                await session.rollback()
+                # Row was inserted concurrently — that's fine, proceed to children.
         await session.commit()
 
     # ── Winner + token outcomes ───────────────────────────────────────────────
@@ -232,16 +236,20 @@ async def persist_skipped_auction(
             select(ShadowAuction).where(ShadowAuction.auction_id == auction_id)
         )
         if existing.scalar_one_or_none() is None:
-            session.add(
-                ShadowAuction(
-                    auction_id=auction_id,
-                    polled_at=datetime.now(UTC),
-                    n_orders=n_orders,
-                    raw_competition=raw_competition,
-                    raw_auction=auction_payload,
+            try:
+                session.add(
+                    ShadowAuction(
+                        auction_id=auction_id,
+                        polled_at=datetime.now(UTC),
+                        n_orders=n_orders,
+                        raw_competition=raw_competition,
+                        raw_auction=auction_payload,
+                    )
                 )
-            )
-            await session.flush()  # ensure FK target exists before child insert
+                await session.flush()  # ensure FK target exists before child insert
+            except IntegrityError:
+                await session.rollback()
+                # Row inserted concurrently — safe to continue to child insert.
 
         session.add(
             ShadowSolution(
