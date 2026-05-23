@@ -60,9 +60,9 @@ async def persist_shadow_attempt(
             # Fallback: extract from auction.tokens.referencePrice (always present
             # in shadow-poller payloads even when raw_competition is unavailable).
             native_prices = {
-                addr.lower(): int(tok.referencePrice)
+                addr.lower(): int(tok.reference_price)
                 for addr, tok in auction.tokens.items()
-                if tok.referencePrice
+                if tok.reference_price
             }
 
         for a in attempts:
