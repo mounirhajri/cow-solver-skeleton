@@ -1,6 +1,5 @@
 """Test that the chronological train/test split is order-preserving."""
 import pandas as pd
-import pytest
 
 from edge.classifier.train import _chronological_split
 
