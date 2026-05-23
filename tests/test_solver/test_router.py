@@ -266,9 +266,12 @@ async def test_semaphore_limits_concurrent_quotes(monkeypatch: pytest.MonkeyPatc
 def test_config_has_router_settings() -> None:
     from src.config import Settings
     s = Settings()
-    assert s.router_max_orders == 50
-    assert s.router_max_concurrent == 20
+    assert s.router_max_orders == 9
+    assert s.router_max_concurrent == 3
     assert s.router_strategy_timeout == 11.0
+    # Router uses WETH-only intermediates to stay within Alchemy free-tier rate limit
+    assert len(s.router_intermediate_tokens) == 1
+    assert s.router_intermediate_tokens[0].lower() == "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
 
 
 def test_router_exposes_timeout_attribute() -> None:

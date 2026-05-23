@@ -187,7 +187,7 @@ def load_default_strategies() -> list[SolverStrategy]:
     # Shares the same multicall/rpc instance as NaiveSolver (no extra connections).
     strategies.append(RouterSolver(
         multicall=multicall,
-        intermediates=settings.intermediate_tokens,
+        intermediates=settings.router_intermediate_tokens,
         max_orders=settings.router_max_orders,
         max_concurrent=settings.router_max_concurrent,
         strategy_timeout=settings.router_strategy_timeout,

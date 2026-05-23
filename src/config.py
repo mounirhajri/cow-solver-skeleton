@@ -37,12 +37,23 @@ class Settings(BaseSettings):
     solve_timeout_seconds: float = 13.0  # slightly below CoW's 15s deadline
 
     # RouterSolver concurrency
-    # Arbitrum auctions have ~1200 orders; quoting all of them sequentially
-    # exhausts the 5 s per-strategy timeout. Cap to the largest orders and
-    # quote them in parallel to stay well under budget.
-    router_max_orders: int = 50        # top-N sell orders by sell_amount
-    router_max_concurrent: int = 20   # parallel RPC quote slots (semaphore)
+    # Alchemy free tier: ~330 CU/s = ~12 eth_calls/s.  Each in-flight order
+    # occupies one concurrent slot and issues sequential Multicall3 requests.
+    # max_concurrent=3 keeps ≤3 requests in-flight at once → ~10 req/s = 260 CU/s,
+    # safely under the rate limit.  With WETH-only intermediates each order needs
+    # ~9 sequential calls (~2.7 s on Alchemy); 9 orders / 3 concurrent = 3 waves
+    # × 2.7 s = 8.1 s, comfortably inside the 11 s per-strategy budget.
+    router_max_orders: int = 9         # top-N sell orders by sell_amount
+    router_max_concurrent: int = 3     # parallel RPC quote slots (semaphore)
     router_strategy_timeout: float = 11.0  # per-strategy timeout for router-v2 (s)
+    # Intermediates for router-v2.  Restricted to WETH only (vs the full list used
+    # by naive) to halve the per-order call count: direct + WETH 2-hop = 9 calls
+    # instead of direct + WETH/USDC/USDT 2-hop = 21 calls.
+    router_intermediate_tokens: list[str] = Field(
+        default_factory=lambda: [
+            "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",  # WETH only
+        ]
+    )
 
     # Postgres
     database_url: str = "postgresql+asyncpg://solver:solver@localhost:5432/solver"
