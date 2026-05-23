@@ -165,6 +165,43 @@ async def test_prices_in_solution():
 
 
 @pytest.mark.asyncio
+async def test_rf_filter_invoked_when_classifier_passed(monkeypatch):
+    """When classifier+model wired, the filter is called on sell_orders."""
+
+    class _DummyClassifier:
+        model = "loaded"
+
+        def score(self, features: dict) -> float:  # noqa: ARG002
+            return 1.0
+
+    captured: dict[str, object] = {}
+
+    async def fake_filter(orders, session_factory, classifier, threshold=0.4):
+        captured["called"] = True
+        captured["n_in"] = len(orders)
+        captured["threshold"] = threshold
+        return orders  # pass through unchanged
+
+    monkeypatch.setattr(
+        "edge.matching.rf_filter.filter_orders_by_token_quality", fake_filter
+    )
+
+    m = BipartiteMatcher(
+        classifier=_DummyClassifier(),
+        session_factory=lambda: None,
+        rf_threshold=0.4,
+    )
+    auction = _mk_auction([
+        _mk_order("oA", "0xa", "0xb", 1000, 800),
+        _mk_order("oB", "0xb", "0xa", 1000, 800),
+    ])
+    result = await m.solve(auction)
+    assert captured.get("called") is True
+    assert captured.get("n_in") == 2
+    assert isinstance(result, Solution)
+
+
+@pytest.mark.asyncio
 async def test_exact_match_symmetric():
     """Exact match: A sells 1000 for 1000, B sells 1000 for 1000."""
     m = BipartiteMatcher()

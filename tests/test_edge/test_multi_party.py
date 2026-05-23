@@ -245,6 +245,43 @@ async def test_partially_priced_ring_is_excluded() -> None:
 # ── Limit price boundary ─────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
+async def test_rf_filter_invoked_when_classifier_passed(monkeypatch) -> None:
+    """When classifier+model wired, the filter is called before OTM filter."""
+
+    class _DummyClassifier:
+        model = "loaded"
+
+        def score(self, features: dict) -> float:  # noqa: ARG002
+            return 1.0
+
+    captured: dict[str, object] = {}
+
+    async def fake_filter(orders, session_factory, classifier, threshold=0.4):
+        captured["called"] = True
+        captured["n_in"] = len(orders)
+        return orders  # pass through unchanged
+
+    monkeypatch.setattr(
+        "edge.matching.rf_filter.filter_orders_by_token_quality", fake_filter
+    )
+
+    orders = [
+        _mk_order("o1", "0xA", "0xB"),
+        _mk_order("o2", "0xB", "0xC"),
+        _mk_order("o3", "0xC", "0xA"),
+    ]
+    tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
+    solver = CoWMatchingSolver(
+        classifier=_DummyClassifier(),
+        session_factory=lambda: None,
+    )
+    result = await solver.solve(_mk_auction(orders, tokens))
+    assert captured.get("called") is True
+    assert captured.get("n_in") == 3
+    assert isinstance(result, Solution)
+
+
+@pytest.mark.asyncio
 async def test_ring_at_exact_limit_price_is_feasible() -> None:
     """buy_amount == sell_amount (zero surplus) is treated as ITM and attempted."""
     orders = [
