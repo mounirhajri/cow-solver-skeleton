@@ -236,6 +236,29 @@ before committing to KYC, dedicated RPC, and the DAO onboarding queue.
 | G3 | Bipartite-CoW hypothetical win-rate | ≥ 25 % | `analyze_cow_rings --days 7` (already at 33 %) |
 | G4 | Median router-v2 CIP-14 score | ≥ 50 % of winner median | same script, delta column |
 | G5 | Zero solver-side outages > 30 min (server, OOM, crash) | observed | `docker logs cow-solver --since 24h` daily check |
+| G6 | Projected net monthly result ≥ €0 (break-even gate) | ≥ €0 | `scripts/estimate_economics.py --days 7` |
+
+**G6 rationale (added 2026-05-23 after reading docs.cow.fi/cow-protocol/reference/core/auctions/accounting):**
+G1–G5 measure technical viability. G6 measures economic viability — a solver that
+technically wins 10 % of router auctions but earns less than its hosting cost
+is a learning project, not a business. The CoW accounting doc introduces three
+factors that pre-G6 ignored:
+
+1. **Minimum transfer threshold** — weekly totals below a chain-specific dust
+   threshold are not paid out at all. At ~0.0012 ETH/week (our current bipartite
+   surplus), we are at or below the likely Arbitrum threshold.
+2. **Overdraft is real capital risk** — slippage can push our weekly balance
+   negative; the deficit is recorded on-chain at
+   `0x8fd67ea651329fd142d7cfd8e90406f133f26e8a` and must be repaid by us via
+   `payOverdraft`. Not a "no reward" situation — an active liability.
+3. **15 % bonding-pool service fee** (CIP-48) applied to positive COW rewards;
+   may shift to 10 % day-1 + 20 % HODL under the pending May-2026 CIP draft.
+
+The economics estimator (`scripts/estimate_economics.py`) projects weekly
+ETH surplus into monthly net result using current ETH/COW prices, configured
+server cost, and the bonding-pool fee schedule. G6 passes only when the
+**point estimate is ≥ €0 AND the lower bound of the confidence band is
+≥ −€20/month** (small buffer for shadow→barn variance).
 
 **Fail-fast triggers (stop early, don't wait full week):**
 
@@ -245,13 +268,20 @@ before committing to KYC, dedicated RPC, and the DAO onboarding queue.
 - Day 3 check-in: bipartite win-rate dropped below 15 % → naive-Composer interaction
   regression, debug first
 
-**On Pass:** start KYC flow (passport scan, Gewerbeschein), open Telegram contact with
-CoW Team (t.me/cowprotocol), provision paid RPC tier, write Phase-2 plan for
-CoWJohnsonSolver.
+**On Pass (all G1–G6):** start KYC flow (passport scan, Gewerbeschein), open
+Telegram contact with CoW Team (t.me/cowprotocol), provision paid RPC tier,
+write Phase-2 plan for CoWJohnsonSolver.
 
-**On Fail:** archive the project as a learning investment. Document what would have
-needed to change (likely: RF pre-filter for Johnson's, dedicated RPC, or different chain).
-Do NOT proceed to KYC — sunk cost.
+**On Technical Pass but G6 Fail (G1–G5 OK, projected net < €0):** do NOT proceed
+to KYC. Instead, identify which lever can move us above break-even — volume
+(Phase 3 CoWJohnsonSolver + RF filter), margin (Long-Tail pool indexer), or
+quote rewards (only feasible after establishment as a known solver). Re-run the
+gate after one of those ships. Multi-month delay is acceptable; KYC + bonding
+spot is harder to undo than to defer.
+
+**On Fail (any of G1–G5):** archive the project as a learning investment.
+Document what would have needed to change (likely: RF pre-filter for Johnson's,
+dedicated RPC, or different chain). Do NOT proceed to KYC — sunk cost.
 
 **Cost during gate:** €0 incremental (continue on free Alchemy + shared Hetzner).
 **Decision lead time after Pass:** ~3 weeks until first Barn settlements.
