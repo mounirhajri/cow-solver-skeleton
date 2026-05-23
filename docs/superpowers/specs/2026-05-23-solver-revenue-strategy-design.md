@@ -1,7 +1,7 @@
 # CoW Solver — Competitive Strategy & Revenue Plan
 
 **Date:** 2026-05-23  
-**Status:** Approved  
+**Status:** Approved · Phase 1 substantially implemented 2026-05-23; gate added (see §6)
 **Goal:** Become a registered, revenue-generating CoW Protocol solver earning weekly COW token rewards.
 
 ---
@@ -30,9 +30,29 @@ Real winner scores are ~0.001 ETH. On-chain execution with oracle prices would r
 
 ---
 
-## Phase 1 — RouterSolver Order-Cap (1–2 days) 🎯 HIGHEST PRIORITY
+## Phase 1 — RouterSolver Order-Cap (✅ implemented 2026-05-23)
 
-### Problem
+### Status
+
+Implemented in commits `ac4fa51` (concurrency tuning + WETH-only intermediates) and the
+2026-05-23 router patch (ETH-value sort key). What landed:
+
+- Order-cap (`router_max_orders = 9` for Alchemy free tier)
+- `asyncio.gather` + Semaphore (`router_max_concurrent = 3`)
+- Per-strategy 11 s timeout exposed via `RouterSolver.timeout`
+- HTTP 429 / JSON-RPC -32005 retry with exponential back-off (0.2 s / 0.6 s / 1.8 s) in
+  `src/routing/rpc.py`
+- ETH-value sort: `sell_amount * reference_price // 10**18`, fallback to raw
+  `sell_amount` when reference price missing
+
+### Open operational risk
+
+The free Alchemy tier still produces sustained `RPC error 429` under load — the
+3-step back-off exhausts before the 11 s budget. **Dedicated RPC (Alchemy paid /
+QuickNode / own node) is a hard prerequisite for Barn**. Decision deferred until
+the §6 Go/No-Go gate.
+
+### Original problem (kept for context)
 RouterSolver loops over all ~1200 orders and makes on-chain multicall quotes for each.
 Per-strategy timeout = 13s ÷ 5 strategies = 2.6s. Always times out. Zero real solutions.
 
@@ -193,11 +213,59 @@ New file: `src/solver/price_refiner.py`
 
 ---
 
+## 6. Go/No-Go Gate — 1 week honest shadow (before any KYC spend)
+
+**Why this gate exists.** Spec 2 Phase 1 is implemented. The Phase-2 exit gate in the
+original design spec (≥5 % hypothetical win-rate) was met on bipartite CoW solutions
+in isolation (33 % over 7 days, see `analyze_cow_rings --days 7` on 2026-05-23), but
+that is a slice — only ~5 auctions/day match bipartite. Naive surplus in shadow is
+inflated by oracle-price clearing and is not a valid signal. We need to know whether
+**router-v2 with real DEX prices** is competitive on the *full* Arbitrum order flow
+before committing to KYC, dedicated RPC, and the DAO onboarding queue.
+
+**Gate window:** 7 calendar days starting 2026-05-24 (00:00 UTC).
+
+**Tooling.** `scripts/analyze_router_solutions.py` produces the headline metric.
+
+**Pass criteria (need ALL to start KYC):**
+
+| # | Metric | Threshold | How measured |
+|---|--------|-----------|--------------|
+| G1 | Router-v2 solutions produced per day | ≥ 30 | `analyze_router_solutions --days 7` total / 7 |
+| G2 | Router-v2 hypothetical win-rate (router-only auctions) | ≥ 10 % | same script, hypothetical-wins count |
+| G3 | Bipartite-CoW hypothetical win-rate | ≥ 25 % | `analyze_cow_rings --days 7` (already at 33 %) |
+| G4 | Median router-v2 CIP-14 score | ≥ 50 % of winner median | same script, delta column |
+| G5 | Zero solver-side outages > 30 min (server, OOM, crash) | observed | `docker logs cow-solver --since 24h` daily check |
+
+**Fail-fast triggers (stop early, don't wait full week):**
+
+- After 48 h: < 5 router-v2 solutions/day → RPC throttle is fatal; need paid tier *before*
+  the gate is meaningful
+- Any day: solver crashes / OOM > 3× → stability blocker before KYC
+- Day 3 check-in: bipartite win-rate dropped below 15 % → naive-Composer interaction
+  regression, debug first
+
+**On Pass:** start KYC flow (passport scan, Gewerbeschein), open Telegram contact with
+CoW Team (t.me/cowprotocol), provision paid RPC tier, write Phase-2 plan for
+CoWJohnsonSolver.
+
+**On Fail:** archive the project as a learning investment. Document what would have
+needed to change (likely: RF pre-filter for Johnson's, dedicated RPC, or different chain).
+Do NOT proceed to KYC — sunk cost.
+
+**Cost during gate:** €0 incremental (continue on free Alchemy + shared Hetzner).
+**Decision lead time after Pass:** ~3 weeks until first Barn settlements.
+
+---
+
 ## Prioritized Backlog
 
-1. 🎯 **RouterSolver order-cap + parallel quotes** — 1-2 days, immediate revenue impact
-2. 🎯 **Solver registration** — 1 day, parallel with above (check bond requirement first)
-3. **Run `extract_features.py` + `train_classifier.py`** — prerequisite for Phase 3
-4. **CoWJohnsonSolver** — 1-2 weeks, pure CoW surplus
-5. **Accurate scoring (4a + 4b)** — 1 week, analytics quality
-6. **JIT trades** — requires capital, future phase
+1. ✅ **RouterSolver order-cap + parallel quotes + ETH-value sort** — *done 2026-05-23*
+2. ✅ **`analyze_router_solutions.py`** — *done 2026-05-23, gating tool*
+3. 🎯 **Run 7-day honest shadow + measure G1–G5** — see §6 above
+4. **Solver registration (KYC + bonding pool)** — Gated on §6 Pass
+5. **Dedicated RPC tier (Alchemy paid / QuickNode)** — Gated on §6 Pass, ~€50–100/mo
+6. **Run `extract_features.py` + `train_classifier.py`** — prerequisite for Phase 3 RF filter
+7. **CoWJohnsonSolver** — 1-2 weeks, pure CoW surplus, only after §6 Pass
+8. **Accurate scoring (4a + 4b)** — 4b shipped, 4a (winner-price comparison column) open
+9. **JIT trades** — requires capital, future phase
