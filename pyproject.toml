@@ -22,6 +22,7 @@ dependencies = [
     "greenlet>=3.1",
     "eth-abi>=5.1",
     "lightgbm>=4.5",
+    "optuna>=3.6",
     "scikit-learn>=1.5",
     "pandas>=2.2",
 ]
@@ -83,4 +84,8 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["pandas", "pandas.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["optuna", "optuna.*"]
 ignore_missing_imports = true
