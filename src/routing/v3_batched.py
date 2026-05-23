@@ -15,6 +15,7 @@ is negligible and the RPC budget is the bottleneck.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from eth_abi import decode, encode  # type: ignore[attr-defined]
 
@@ -141,22 +142,37 @@ def _build_call(path: V3Path, quoter_address: str) -> Call:
     return Call(target=quoter_address, call_data=call_data, allow_failure=True)
 
 
+# Each QuoterV2 call costs ~200–300k gas; Multicall3 adds dispatch overhead.
+# Alchemy and most providers cap eth_call at 30M gas. Empirically a single
+# aggregate of 72 quotes overflowed ("out of gas" -32000) — chunk to stay
+# comfortably under the cap. 25 quotes ≈ 7M gas, well within budget.
+_MAX_CALLS_PER_BATCH = 25
+
+
 async def batched_v3_quote(
     multicall: Multicall3,
     paths: list[V3Path],
     quoter_address: str = QUOTER_V2_ADDRESS,
 ) -> list[V3BatchedQuote]:
-    """Submit ALL paths in one Multicall3.aggregate() and decode.
+    """Submit paths in batched Multicall3.aggregate() calls and decode.
 
     Returns one V3BatchedQuote per input V3Path, in the same order. Reverted
     calls (pool not found, etc.) yield amount_out=0 — the result list always
     matches the input list length so callers can correlate positionally.
+
+    Paths are chunked into batches of `_MAX_CALLS_PER_BATCH` to stay under
+    provider-side eth_call gas caps. With 72 paths and chunk=25 that's 3
+    multicalls — still ~27× fewer RPC round-trips than the per-order legacy
+    fan-out.
     """
     if not paths:
         return []
 
     calls = [_build_call(p, quoter_address) for p in paths]
-    results = await multicall.aggregate(calls)
+    results: list[Any] = []
+    for i in range(0, len(calls), _MAX_CALLS_PER_BATCH):
+        chunk = calls[i : i + _MAX_CALLS_PER_BATCH]
+        results.extend(await multicall.aggregate(chunk))
 
     quotes: list[V3BatchedQuote] = []
     for path, result in zip(paths, results, strict=True):
