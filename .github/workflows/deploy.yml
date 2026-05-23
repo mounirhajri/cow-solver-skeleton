@@ -62,8 +62,7 @@ jobs:
             -o BatchMode=yes \
             "$USER@$HOST" bash -s << 'ENDSSH'
           set -e
-          COMPOSE_DIR=$(find /opt /home -name "docker-compose.prod.yml" 2>/dev/null -printf "%h\n" | head -1)
-          cd "$COMPOSE_DIR"
+          cd /opt/mhagentic/stack/cow-solver
           docker compose -f docker-compose.prod.yml pull cow-solver reconciler shadow-poller
           docker compose -f docker-compose.prod.yml up -d cow-solver reconciler shadow-poller
           sleep 8
