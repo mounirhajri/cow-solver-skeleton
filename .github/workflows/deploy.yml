@@ -49,18 +49,25 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ vars.DEPLOY_ENABLED == 'true' }}
     steps:
-      - uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.HETZNER_HOST }}
-          username: ${{ secrets.HETZNER_USER }}
-          key: ${{ secrets.HETZNER_SSH_KEY }}
-          script: |
-            set -e
-            cd /opt/mhagentic/stack
-            docker compose pull cow-solver reconciler shadow-poller
-            docker compose up -d cow-solver reconciler shadow-poller
-            sleep 8
-            # Run alembic migrations (idempotent — `upgrade head` is a no-op when up to date)
-            docker compose exec -T cow-solver uv run alembic upgrade head
-            docker compose ps cow-solver reconciler shadow-poller
-            curl -fsS http://localhost:8000/health
+      - name: Deploy via SSH
+        env:
+          SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+          HOST: ${{ secrets.HETZNER_HOST }}
+          USER: ${{ secrets.HETZNER_USER }}
+        run: |
+          echo "$SSH_KEY" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+          ssh -i /tmp/deploy_key \
+            -o StrictHostKeyChecking=no \
+            -o BatchMode=yes \
+            "$USER@$HOST" bash -s << 'ENDSSH'
+          set -e
+          COMPOSE_DIR=$(find /opt /home -name "docker-compose.prod.yml" 2>/dev/null -printf "%h\n" | head -1)
+          cd "$COMPOSE_DIR"
+          docker compose -f docker-compose.prod.yml pull cow-solver reconciler shadow-poller
+          docker compose -f docker-compose.prod.yml up -d cow-solver reconciler shadow-poller
+          sleep 8
+          docker compose -f docker-compose.prod.yml exec -T cow-solver /app/.venv/bin/alembic upgrade head
+          docker compose -f docker-compose.prod.yml ps cow-solver reconciler shadow-poller
+          curl -fsS http://localhost:8000/health
+          ENDSSH
