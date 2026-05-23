@@ -199,21 +199,26 @@ def load_default_strategies() -> list[SolverStrategy]:
         ))
         # Long-tail router shares the multicall instance with NaiveSolver/RouterSolver
         # and is backed by a Redis cache (pool addresses ~7d, reserves ~60s).
-        redis_client = aioredis.Redis.from_url(
-            settings.redis_url, decode_responses=False
-        )
-        pool_cache = PoolCache(
-            redis=redis_client,
-            key_prefix=settings.redis_key_prefix,
-            reserves_ttl=settings.pool_cache_ttl_seconds,
-        )
-        strategies.append(LongTailRouter(
-            multicall=multicall,
-            pool_cache=pool_cache,
-        ))
+        # Gated by settings.long_tail_enabled: when an Alchemy free-tier connection
+        # quota is the bottleneck, the extra concurrent multicalls from LongTail
+        # starve RouterSolver. Set LONG_TAIL_ENABLED=false to disable in prod.
+        if settings.long_tail_enabled:
+            redis_client = aioredis.Redis.from_url(
+                settings.redis_url, decode_responses=False
+            )
+            pool_cache = PoolCache(
+                redis=redis_client,
+                key_prefix=settings.redis_key_prefix,
+                reserves_ttl=settings.pool_cache_ttl_seconds,
+            )
+            strategies.append(LongTailRouter(
+                multicall=multicall,
+                pool_cache=pool_cache,
+            ))
         log.info(
             "edge_strategies_loaded",
             rf_model_loaded=classifier.model is not None,
+            long_tail_enabled=settings.long_tail_enabled,
         )
     except ImportError:
         log.info("edge_strategies_not_present", reason="public_clone_or_phase0")

@@ -55,6 +55,12 @@ class Settings(BaseSettings):
         ]
     )
 
+    # LongTailRouter (Pool-Indexer). Bursts ~60 RPC calls per auction on top of
+    # RouterSolver's load. On a tight Alchemy free-tier concurrent-connection
+    # quota that pushes RouterSolver into "Authentication required" rejections.
+    # Disable in prod until paid RPC tier is provisioned.
+    long_tail_enabled: bool = True
+
     # Postgres
     database_url: str = "postgresql+asyncpg://solver:solver@localhost:5432/solver"
 
