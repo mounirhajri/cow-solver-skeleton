@@ -204,3 +204,11 @@ def format_summary(summary: Summary) -> str:
     else:
         lines.append("Score comparison: no scored solutions yet (backfill_scores.py not run?).")
     return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    window = AnalysisWindow.days(7)
+    summary = asyncio.run(analyze(window))
+    print(format_summary(summary))
