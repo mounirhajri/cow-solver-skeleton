@@ -60,6 +60,11 @@ class ShadowSolution(Base):
     # CIP-14 quality score in wei (ETH-denominated surplus, same formula as
     # cowprotocol/services driver).  NULL for no-solution / skipped rows.
     our_score_wei: Mapped[int | None] = mapped_column(Numeric(40, 0))
+    # Same CIP-14 score, but our trades re-evaluated at the *winner's*
+    # clearingPrices instead of our own.  Isolates "wrong trades picked" (≈
+    # our_score_wei, both low vs winner) from "our prices are off" (≪
+    # our_score_wei).  NULL until backfill / winner-persistence has run.
+    score_vs_winner_prices_wei: Mapped[int | None] = mapped_column(Numeric(40, 0))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
