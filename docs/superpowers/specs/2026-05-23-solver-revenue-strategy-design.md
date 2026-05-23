@@ -37,8 +37,9 @@ RouterSolver loops over all ~1200 orders and makes on-chain multicall quotes for
 Per-strategy timeout = 13s ÷ 5 strategies = 2.6s. Always times out. Zero real solutions.
 
 ### Fix
-Sort orders by ETH value (`sell_amount × reference_price`), take top N before the loop.
+Two changes needed together — order-cap alone is not enough:
 
+**1. Order-cap:** Sort by ETH value, take top N before the loop.
 ```python
 # src/solver/router.py  — RouterSolver.solve()
 orders = sorted(
@@ -47,18 +48,29 @@ orders = sorted(
     reverse=True,
 )[:self._order_cap]   # default 30
 ```
-
 Where `_eth_value` = `sell_amount * token.reference_price // 10**18` (pure math, no I/O).
+
+**2. Parallel quotes:** Current loop is sequential — 30 orders × ~100ms RPC round-trip = 3s,
+still over the 2.6s budget. Switch to `asyncio.gather` so all 30 quote concurrently:
+```python
+paths = await asyncio.gather(
+    *[quote_best_path(self._multicall, o.sell_token, o.buy_token,
+                      o.sell_amount, self._intermediates)
+      for o in orders],
+    return_exceptions=True,
+)
+```
+With concurrency: ~100–300ms total for 30 orders (shared multicall batching).
 
 ### Files changed
 | File | Change |
 |------|--------|
-| `src/solver/router.py` | `order_cap: int = 30` param, sort+slice before loop |
+| `src/solver/router.py` | `order_cap: int = 30` param; sort+slice; parallel `asyncio.gather` |
 | `src/config.py` | `router_order_cap: int = 30` setting |
 | `src/solver/orchestrator.py` | pass `settings.router_order_cap` to `RouterSolver` |
 
 ### Expected outcome
-- RouterSolver finishes in ~200–500ms (30 orders × ~10ms per multicall batch)
+- RouterSolver finishes in ~100–300ms (30 concurrent multicall quotes)
 - Produces solutions with **real DEX prices** — no oracle inflation
 - `our_score_wei` becomes an accurate CIP-14 score
 - Directly competitive with other solvers in the live competition
@@ -73,6 +85,14 @@ Where `_eth_value` = `sell_amount * token.reference_price // 10**18` (pure math,
 Register as an official CoW Protocol solver on Arbitrum One.
 Once RouterSolver produces real solutions, flip from shadow mode to live submission.
 
+**Prerequisites:**
+- ⚠️ **Solver Bond**: CoW Protocol requires staking COW tokens as collateral to register.
+  Amount and process: https://docs.cow.fi/cow-protocol/reference/core/auctions/bonding
+  This may be a capital requirement — verify before committing to timeline.
+- Solver endpoint (`/solve`) must be publicly accessible (current Hetzner setup qualifies).
+
+**Code change**: One env var flip from shadow mode to live submission.
+
 **Revenue starts here.** Weekly COW token payouts begin.
 
 ---
@@ -85,6 +105,12 @@ CoW ring trades (pure surplus, zero AMM cost) are missed because:
 - `CoWMatchingSolver` currently finds 0 solutions (graph too noisy)
 
 ### Design
+
+**Prerequisites for Phase 3:**
+- `extract_features.py` must have run to populate `token_features` table (on-chain data per token)
+- `train_classifier.py` must have produced a model in `/data/models/current.pkl`
+- Requires sufficient labeled data: ≥ 100 auctions with winner data for cold-start RF
+  (we have ~291 now — enough to start, improves over time)
 
 **Step 1 — RF pre-filter** (existing `edge.classifier`):
 ```
@@ -169,8 +195,9 @@ New file: `src/solver/price_refiner.py`
 
 ## Prioritized Backlog
 
-1. ✅ **RouterSolver order-cap** — 1-2 days, immediate revenue impact
-2. ✅ **Solver registration** — 1 day, parallel with above
-3. **CoWJohnsonSolver** — 1-2 weeks, pure CoW surplus
-4. **Accurate scoring (4a + 4b)** — 1 week, analytics quality
-5. **JIT trades** — requires capital, future phase
+1. 🎯 **RouterSolver order-cap + parallel quotes** — 1-2 days, immediate revenue impact
+2. 🎯 **Solver registration** — 1 day, parallel with above (check bond requirement first)
+3. **Run `extract_features.py` + `train_classifier.py`** — prerequisite for Phase 3
+4. **CoWJohnsonSolver** — 1-2 weeks, pure CoW surplus
+5. **Accurate scoring (4a + 4b)** — 1 week, analytics quality
+6. **JIT trades** — requires capital, future phase
