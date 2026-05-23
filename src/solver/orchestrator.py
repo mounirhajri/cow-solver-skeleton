@@ -173,9 +173,12 @@ def load_default_strategies() -> list[SolverStrategy]:
     ))
 
     try:
+        import redis.asyncio as aioredis
+
         from edge.classifier.predict import TokenClassifier
         from edge.matching import BipartiteMatcher, CoWMatchingSolver
         from edge.pool_indexer import LongTailRouter
+        from edge.pool_indexer.pool_cache import PoolCache
         from src.persistence.db import get_session_factory
 
         # TokenClassifier.load() never raises — when the pickle is missing it
@@ -194,7 +197,20 @@ def load_default_strategies() -> list[SolverStrategy]:
             classifier=classifier,
             session_factory=session_factory,
         ))
-        strategies.append(LongTailRouter())
+        # Long-tail router shares the multicall instance with NaiveSolver/RouterSolver
+        # and is backed by a Redis cache (pool addresses ~7d, reserves ~60s).
+        redis_client = aioredis.Redis.from_url(
+            settings.redis_url, decode_responses=False
+        )
+        pool_cache = PoolCache(
+            redis=redis_client,
+            key_prefix=settings.redis_key_prefix,
+            reserves_ttl=settings.pool_cache_ttl_seconds,
+        )
+        strategies.append(LongTailRouter(
+            multicall=multicall,
+            pool_cache=pool_cache,
+        ))
         log.info(
             "edge_strategies_loaded",
             rf_model_loaded=classifier.model is not None,
