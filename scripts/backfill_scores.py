@@ -132,9 +132,9 @@ async def backfill(dry_run: bool = False, batch_size: int = 500) -> None:
             error_count += 1
             continue
 
-            if score == 0:
-                zero_count += 1
-            updates.append({"id": sol_id, "our_score_wei": score if score > 0 else None})
+        if score == 0:
+            zero_count += 1
+        updates.append({"id": sol_id, "our_score_wei": score if score > 0 else None})
 
     print(
         f"  Scored: {len(updates)} | zero/null: {zero_count} | errors: {error_count}"

@@ -159,9 +159,18 @@ def load_default_strategies() -> list[SolverStrategy]:
 
     strategies: list[SolverStrategy] = []
 
-    # Naive first: <10 ms, always produces a solution based on oracle prices.
-    # Ensures the /solve response is never delayed by slow strategies.
-    strategies.append(NaiveSolver())
+    rpc = RpcClient(settings.rpc_arbitrum)
+    multicall = Multicall3(rpc)
+
+    # Naive first: <10 ms to find trades (oracle prices as filter).
+    # With multicall injected, oracle clearing prices are replaced with real
+    # DEX quotes for the specific token pairs touched — typically 3-10 pairs,
+    # done in parallel, adds ~200-500 ms but produces accurate CIP-14 scores.
+    strategies.append(NaiveSolver(
+        multicall=multicall,
+        intermediates=settings.intermediate_tokens,
+        refine_timeout=3.0,
+    ))
 
     try:
         from edge.matching import BipartiteMatcher, CoWMatchingSolver
@@ -174,10 +183,8 @@ def load_default_strategies() -> list[SolverStrategy]:
     except ImportError:
         log.info("edge_strategies_not_present", reason="public_clone_or_phase0")
 
-    # Router-v2 last: on-chain quotes for 1200 orders may exhaust per-strategy
-    # timeout, but runs alongside naive in shadow mode for comparison data.
-    rpc = RpcClient(settings.rpc_arbitrum)
-    multicall = Multicall3(rpc)
+    # Router-v2 last: on-chain quotes for top-N orders by sell_amount.
+    # Shares the same multicall/rpc instance as NaiveSolver (no extra connections).
     strategies.append(RouterSolver(
         multicall=multicall,
         intermediates=settings.intermediate_tokens,

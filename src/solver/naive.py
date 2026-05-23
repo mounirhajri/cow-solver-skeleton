@@ -1,7 +1,14 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from src.log import get_logger
 from src.models.auction import Auction
 from src.models.solution import Solution, Trade
 from src.solver.base import NoSolution
+
+if TYPE_CHECKING:
+    from src.routing.multicall import Multicall3
 
 log = get_logger(__name__)
 
@@ -11,9 +18,23 @@ class NaiveSolver:
 
     No external API needed — reference prices come from the auction payload
     itself (Chainlink/oracle-based). This is a valid Phase 1 baseline.
+
+    When *multicall* is provided, oracle clearing prices are replaced with
+    real on-chain DEX quotes via price_refiner.refine_solution_prices().
+    This produces accurate CIP-14 scores for shadow analytics.
     """
 
     name = "naive"
+
+    def __init__(
+        self,
+        multicall: "Multicall3 | None" = None,
+        intermediates: list[str] | None = None,
+        refine_timeout: float = 3.0,
+    ) -> None:
+        self._multicall = multicall
+        self._intermediates = intermediates or []
+        self._refine_timeout = refine_timeout
 
     async def solve(self, auction: Auction) -> Solution | NoSolution:
         trades: list[Trade] = []
@@ -55,4 +76,16 @@ class NaiveSolver:
         if not trades:
             return NoSolution()
 
-        return Solution(id=int(auction.id), prices=prices, trades=trades, interactions=[])
+        solution = Solution(id=int(auction.id), prices=prices, trades=trades, interactions=[])
+
+        if self._multicall:
+            from src.solver.price_refiner import refine_solution_prices
+            solution = await refine_solution_prices(
+                solution,
+                auction,
+                self._multicall,
+                self._intermediates,
+                timeout=self._refine_timeout,
+            )
+
+        return solution
