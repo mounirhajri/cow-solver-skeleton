@@ -15,7 +15,6 @@ from src.shadow.scoring import (
     orders_by_uid_from_auction,
 )
 
-
 # ── helpers ─────────────────────────────────────────────────────────────────
 
 
