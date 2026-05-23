@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from functools import cache
+from functools import lru_cache
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import (
 from src.config import settings
 
 
-@cache
+@lru_cache(maxsize=1)
 def get_engine() -> AsyncEngine:
     """Singleton async engine. Cached per-process."""
     return create_async_engine(

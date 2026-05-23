@@ -1,11 +1,11 @@
 import logging
 import sys
-from typing import IO, TextIO, cast
+from typing import IO, Optional, TextIO, cast
 
 import structlog
 
 
-def configure_logging(level: str = "INFO", stream: IO[str] | None = None) -> None:
+def configure_logging(level: str = "INFO", stream: Optional[IO[str]] = None) -> None:
     """Configure structlog to emit JSON to stdout (or supplied stream)."""
 
     out_stream: TextIO = cast(TextIO, stream) if stream is not None else sys.stdout
