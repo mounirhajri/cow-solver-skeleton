@@ -56,6 +56,14 @@ async def persist_shadow_attempt(
         # Pre-compute CIP-14 scores for all attempts that produced solutions.
         uid_map = orders_by_uid_from_auction(auction)
         native_prices = extract_native_prices(raw_competition or {})
+        if not native_prices:
+            # Fallback: extract from auction.tokens.referencePrice (always present
+            # in shadow-poller payloads even when raw_competition is unavailable).
+            native_prices = {
+                addr.lower(): int(tok.referencePrice)
+                for addr, tok in auction.tokens.items()
+                if tok.referencePrice
+            }
 
         for a in attempts:
             score: int | None = None
