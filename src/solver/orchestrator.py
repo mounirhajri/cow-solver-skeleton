@@ -36,16 +36,18 @@ class SolverOrchestrator:
         strategies: Sequence[SolverStrategy],
         per_strategy_timeout: float = 5.0,
         run_all_strategies: bool = True,
+        compose: bool = True,
     ) -> None:
         if not strategies:
             raise ValueError("at least one strategy required")
         self._strategies = list(strategies)
         self._timeout = per_strategy_timeout
         self._run_all = run_all_strategies
+        self._compose = compose
 
     async def solve(self, auction: Auction) -> tuple[Solution | NoSolution, list[AttemptRecord]]:
         attempts: list[AttemptRecord] = []
-        winner: Solution | NoSolution = NoSolution()
+        winning_solutions: list[tuple[str, Solution]] = []
 
         for strat in self._strategies:
             start = time.perf_counter()
@@ -86,9 +88,9 @@ class SolverOrchestrator:
                     solution=result.model_dump(mode="json", by_alias=True),
                     error=None,
                 ))
-                if isinstance(winner, NoSolution):
+                if not winning_solutions:
                     log.info("strategy_won", strategy=strat.name, auction_id=auction.id)
-                    winner = result
+                winning_solutions.append((strat.name, result))
                 # If run_all is False, stop at first winner
                 if not self._run_all:
                     break
@@ -101,7 +103,35 @@ class SolverOrchestrator:
                     error=None,
                 ))
 
-        return winner, attempts
+        # Try composing when multiple strategies produced solutions
+        if self._compose and len(winning_solutions) > 1:
+            try:
+                from edge.matching import CandidateSolution, compose
+                candidates = [
+                    CandidateSolution(strategy=name, solution=sol)
+                    for name, sol in winning_solutions
+                ]
+                composed = compose(candidates, auction_id=int(auction.id))
+                if composed is not None:
+                    log.info("composer_merged",
+                             n_candidates=len(winning_solutions),
+                             n_trades=len(composed.trades),
+                             auction_id=auction.id)
+                    attempts.append(AttemptRecord(
+                        strategy="composer",
+                        status="solved",
+                        latency_ms=None,
+                        solution=composed.model_dump(mode="json", by_alias=True),
+                        error=None,
+                    ))
+                    return composed, attempts
+            except ImportError:
+                pass  # edge not present — fall through to first-winner
+
+        # First-winner fallback
+        if winning_solutions:
+            return winning_solutions[0][1], attempts
+        return NoSolution(), attempts
 
 
 def load_default_strategies() -> list[SolverStrategy]:
