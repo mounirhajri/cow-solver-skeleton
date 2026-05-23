@@ -52,6 +52,27 @@ The free Alchemy tier still produces sustained `RPC error 429` under load — th
 QuickNode / own node) is a hard prerequisite for Barn**. Decision deferred until
 the §6 Go/No-Go gate.
 
+### Structural limitation surfaced 2026-05-23 evening (Phase 1 NOT actually fixed)
+
+After resolving the RPC-Auth issue (concurrent-connection limit; mitigated by
+disabling LongTailRouter via `LONG_TAIL_ENABLED=false`), RouterSolver was
+verified to run cleanly: no timeouts, no errors, but **4/4 `no_solution`** in
+shadow database. Reason: `src/routing/amm_v2.py` only knows Sushi + Camelot
+**V2** factories with UniV2 constant-product math. The real liquidity on
+Arbitrum lives in **V3 pools** (UniV3, Camelot V3, Solidly forks) with
+concentrated liquidity. Our top-9-orders × 1-hop + 2-hop-via-WETH routing
+produces quotes too small to beat order limit prices.
+
+**Consequence:** G1 (≥30 Router-Solutions/Tag) is structurally FAIL with the
+current routing scope, even with dedicated RPC. The "Phase 1 success metric"
+from the original Current-State block (`router-v2: X/30 solved` where X > 0) is
+not actually met by this iteration. What Phase 1 fixed was the timeout — the
+algorithmic scope is the next bottleneck.
+
+**Fix path:** wire V3 Quoter (`QuoterV2.quoteExactInputSingle` /
+`quoteExactInput`) into the router-v2 quote selection. Tracked as the dominant
+post-Gate task.
+
 ### Original problem (kept for context)
 RouterSolver loops over all ~1200 orders and makes on-chain multicall quotes for each.
 Per-strategy timeout = 13s ÷ 5 strategies = 2.6s. Always times out. Zero real solutions.
@@ -307,12 +328,15 @@ dedicated RPC, or different chain). Do NOT proceed to KYC — sunk cost.
 
 ## Prioritized Backlog
 
-1. ✅ **RouterSolver order-cap + parallel quotes + ETH-value sort** — *done 2026-05-23*
+1. ✅ **RouterSolver order-cap + parallel quotes + ETH-value sort** — *done 2026-05-23* (timeout fixed, V3-routing-scope still open — see Phase 1 Structural limitation)
 2. ✅ **`analyze_router_solutions.py`** — *done 2026-05-23, gating tool*
-3. 🎯 **Run 7-day honest shadow + measure G1–G5** — see §6 above
-4. **Solver registration (KYC + bonding pool)** — Gated on §6 Pass
-5. **Dedicated RPC tier (Alchemy paid / QuickNode)** — Gated on §6 Pass, ~€50–100/mo
-6. **Run `extract_features.py` + `train_classifier.py`** — prerequisite for Phase 3 RF filter
-7. **CoWJohnsonSolver** — 1-2 weeks, pure CoW surplus, only after §6 Pass
-8. **Accurate scoring (4a + 4b)** — 4b shipped, 4a (winner-price comparison column) open
-9. **JIT trades** — requires capital, future phase
+3. ✅ **Phase 2 Pool-Indexer MVP (LongTailRouter + Redis cache)** — *done 2026-05-23, currently **disabled in prod** via `LONG_TAIL_ENABLED=false` until paid Alchemy tier handles concurrent-connection burden*
+4. ✅ **Phase 3 RF pre-filter Option B** — *done 2026-05-23, **no-op in prod** (no trained model; binary classifier structurally unreachable in shadow per `TokenOutcome.caused_revert` semantics)*
+5. ✅ **Phase 4a winner-price comparison column** — *shipped 2026-05-23 but **dormant on Arbitrum**; CoW `solver_competition` API does not expose `clearingPrices`. Code stays for future Mainnet expansion / API change*
+6. 🎯 **Run 7-day honest shadow + measure G1–G6** — see §6 above. Starts 2026-05-24 00:00 UTC
+7. 🎯 **V3 Quoter routing in RouterSolver** — post-Gate priority if G1 fails as expected. 5-10 days. Without this, Router-v2 won't produce real solutions
+8. **Solver registration (KYC + bonding pool)** — Gated on §6 Pass (currently very unlikely without V3-routing)
+9. **Dedicated RPC tier (Alchemy paid / QuickNode)** — Gated on §6 Pass, ~€50–100/mo, unlocks LongTailRouter re-enabling
+10. **Run `extract_features.py` + `train_classifier.py` with fresh scam-labels** — needs external scam-list seed (honeypot.is, mev-inspect-py); binary classifier unreachable in shadow mode otherwise
+11. **CoWJohnsonSolver** — DEFERRED, superseded by RF-filter-in-existing-edge-solvers (Phase 3 Option B)
+12. **JIT trades** — requires capital, future phase
