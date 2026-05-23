@@ -46,3 +46,22 @@ def test_handles_snake_case_keys():
     outcomes = extract_token_outcomes(auction, None, None)
     addrs = {o["token_address"] for o in outcomes}
     assert addrs == {"0xa", "0xb"}
+
+
+def test_winner_with_empty_clearing_prices_falls_back_to_all_auction_tokens():
+    """CoW Arbitrum API returns clearingPrices={} — all auction tokens should
+    still be marked appeared_in_winner when a winner solution exists."""
+    auction = {"orders": [{"sellToken": "0xA", "buyToken": "0xB"}]}
+    winner = {"clearingPrices": {}, "orders": [{"id": "0xdeadbeef"}]}
+    outcomes = extract_token_outcomes(auction, winner, None)
+    by_addr = {o["token_address"]: o for o in outcomes}
+    assert by_addr["0xa"]["appeared_in_winner"], "0xa should be legit (winner fallback)"
+    assert by_addr["0xb"]["appeared_in_winner"], "0xb should be legit (winner fallback)"
+
+
+def test_no_winner_means_appeared_in_winner_false_even_with_auction_tokens():
+    """When winner_solution is None, appeared_in_winner must stay False."""
+    auction = {"orders": [{"sellToken": "0xA", "buyToken": "0xB"}]}
+    outcomes = extract_token_outcomes(auction, None, None)
+    for o in outcomes:
+        assert not o["appeared_in_winner"]

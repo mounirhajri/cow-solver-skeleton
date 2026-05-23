@@ -57,6 +57,16 @@ def extract_token_outcomes(
     winner_tokens = _winner_tokens(winner_solution)
     ours_tokens = _winner_tokens(our_solution)
 
+    # The CoW Protocol /solver_competition endpoint on Arbitrum returns
+    # clearingPrices: {} for every solution — token-level data is not
+    # available there.  Solution orders also only carry UIDs, not sell/buy
+    # token addresses.  Fallback: if we know a winner exists but couldn't
+    # extract its specific tokens, treat every auction token as
+    # "appeared_in_winner" — the auction itself settled successfully, so all
+    # tokens in it were considered legitimate by the protocol.
+    if winner_solution is not None and not winner_tokens:
+        winner_tokens = set(tokens)
+
     return [
         {
             "token_address": t,
