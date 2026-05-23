@@ -9,7 +9,7 @@ import contextlib
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 from src.log import get_logger
@@ -20,6 +20,7 @@ from src.shadow.scoring import (
     compute_solution_score,
     extract_native_prices,
     orders_by_uid_from_auction,
+    score_at_external_prices,
 )
 from src.solver.orchestrator import AttemptRecord
 
@@ -200,7 +201,93 @@ async def persist_winner_and_outcomes(
                 )
             )
 
+        # ── Recompute our scores at the winner's clearing prices ─────────────
+        # Phase 4a: isolates "wrong trades chosen" from "our prices off".
+        # Must never break winner/outcome persistence — wrap defensively.
+        try:
+            await _backfill_winner_price_scores_for_auction(
+                session, auction_id, winner_sol, raw_competition, auction_payload
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "winner_price_score_recompute_failed",
+                auction_id=auction_id,
+                error=str(e),
+            )
+
         await session.commit()
+
+
+async def _backfill_winner_price_scores_for_auction(
+    session: Any,
+    auction_id: int,
+    winner_sol: dict[str, Any] | None,
+    raw_competition: dict[str, Any],
+    auction_payload: dict[str, Any],
+) -> None:
+    """Update ``score_vs_winner_prices_wei`` for every solved row of this auction.
+
+    Only fills rows where the column is still NULL (idempotent).  Skips
+    silently when prerequisites (winner clearingPrices, native prices, orders)
+    cannot be assembled — the dedicated backfill script handles those.
+    """
+    if winner_sol is None:
+        return
+
+    # CoW API uses camelCase clearingPrices; our own solver dict uses "prices".
+    clearing_prices = winner_sol.get("clearingPrices") or winner_sol.get("prices") or {}
+    if not clearing_prices:
+        return
+
+    # Native prices: prefer raw_competition.auction.prices, fall back to
+    # raw_auction.tokens[*].referencePrice (mirrors persist_shadow_attempt).
+    native_prices = extract_native_prices(raw_competition or {})
+    if not native_prices:
+        for addr, tok in (auction_payload or {}).get("tokens", {}).items():
+            ref = (
+                tok.get("referencePrice")
+                if isinstance(tok, dict)
+                else None
+            ) or (tok.get("reference_price") if isinstance(tok, dict) else None)
+            if ref:
+                with contextlib.suppress(ValueError, TypeError):
+                    native_prices[addr.lower()] = int(ref)
+    if not native_prices:
+        return
+
+    # auction_payload may be a placeholder ({"backfilled": true}) from
+    # backfill flows — there are no orders to score against here; the
+    # dedicated backfill script handles those rows via the CoW API.
+    uid_map = orders_by_uid_from_auction(auction_payload or {})
+    if not uid_map:
+        return
+
+    q = await session.execute(
+        select(ShadowSolution.id, ShadowSolution.solution)
+        .where(ShadowSolution.auction_id == auction_id)
+        .where(ShadowSolution.status == "solved")
+        .where(ShadowSolution.solution.is_not(None))
+        .where(ShadowSolution.score_vs_winner_prices_wei.is_(None))
+    )
+    rows = q.all()
+
+    for sol_id, solution in rows:
+        if not isinstance(solution, dict):
+            continue
+        try:
+            raw_score = score_at_external_prices(
+                solution, uid_map, native_prices, clearing_prices
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        # Keep 0 as NULL (consistent with our_score_wei handling).
+        value = raw_score if raw_score > 0 else None
+        await session.execute(
+            update(ShadowSolution)
+            .where(ShadowSolution.id == sol_id)
+            .where(ShadowSolution.score_vs_winner_prices_wei.is_(None))
+            .values(score_vs_winner_prices_wei=value)
+        )
 
 
 async def persist_winner_and_outcomes_safe(

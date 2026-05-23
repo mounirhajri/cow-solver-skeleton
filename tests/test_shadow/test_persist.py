@@ -50,6 +50,7 @@ async def session_factory(monkeypatch):
                 solution TEXT,
                 error TEXT,
                 our_score_wei NUMERIC,
+                score_vs_winner_prices_wei NUMERIC,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """))
@@ -285,6 +286,108 @@ async def test_persist_winner_creates_auction_row_when_missing(session_factory) 
         winners = (await s.execute(select(ShadowWinner))).scalars().all()
         assert len(winners) == 1
         assert winners[0].winner_solver == "0xdef"
+
+
+@pytest.mark.asyncio
+async def test_persist_winner_populates_score_vs_winner_prices(session_factory) -> None:
+    """persist_winner_and_outcomes recomputes our score at winner clearingPrices."""
+    from src.persistence.models import ShadowAuction, ShadowSolution
+    from src.shadow.persist import persist_winner_and_outcomes
+
+    ETH = 10**18
+    auction_id = 4242
+
+    # Auction + one solved solution row whose trades we can score
+    async with session_factory() as s:
+        s.add(
+            ShadowAuction(
+                auction_id=auction_id,
+                polled_at=datetime.now(UTC),
+                n_orders=1,
+                raw_competition={},
+                raw_auction={},
+            )
+        )
+        s.add(
+            ShadowSolution(
+                auction_id=auction_id,
+                strategy="naive",
+                status="solved",
+                latency_ms=10,
+                solution={
+                    "prices": {"0xsell": str(11 * ETH), "0xbuy": str(10 * ETH)},
+                    "trades": [
+                        {
+                            "kind": "fulfillment",
+                            "orderUid": "0xabc",
+                            "executedAmount": str(1000 * ETH),
+                        }
+                    ],
+                },
+                error=None,
+            )
+        )
+        await s.commit()
+
+    # Winner uses different (better) clearingPrices → score @ winner prices > our_score
+    comp = {
+        "auctionId": str(auction_id),
+        "auction": {"prices": {"0xbuy": str(ETH)}},
+        "solutions": [
+            {
+                "solver": "0xwinner",
+                "score": "0",
+                "isWinner": True,
+                "ranking": 1,
+                "clearingPrices": {"0xsell": str(2 * ETH), "0xbuy": str(ETH)},
+                "trades": [],
+            }
+        ],
+    }
+    auction_payload = {
+        "orders": [
+            {
+                "uid": "0xabc",
+                "sellToken": "0xsell",
+                "buyToken": "0xbuy",
+                "sellAmount": str(1000 * ETH),
+                "buyAmount": str(900 * ETH),
+                "kind": "sell",
+            }
+        ],
+        "tokens": {"0xbuy": {"referencePrice": str(ETH)}},
+    }
+
+    await persist_winner_and_outcomes(auction_id, comp, auction_payload, None)
+
+    async with session_factory() as s:
+        sol = (
+            await s.execute(
+                select(ShadowSolution).where(ShadowSolution.auction_id == auction_id)
+            )
+        ).scalar_one()
+        assert sol.score_vs_winner_prices_wei is not None
+        assert int(sol.score_vs_winner_prices_wei) > 0
+
+    # Second call must not overwrite (idempotency: where col IS NULL)
+    sentinel = 12345
+    async with session_factory() as s:
+        await s.execute(
+            ShadowSolution.__table__.update()
+            .where(ShadowSolution.auction_id == auction_id)
+            .values(score_vs_winner_prices_wei=sentinel)
+        )
+        await s.commit()
+
+    await persist_winner_and_outcomes(auction_id, comp, auction_payload, None)
+
+    async with session_factory() as s:
+        sol = (
+            await s.execute(
+                select(ShadowSolution).where(ShadowSolution.auction_id == auction_id)
+            )
+        ).scalar_one()
+        assert int(sol.score_vs_winner_prices_wei) == sentinel
 
 
 @pytest.mark.asyncio

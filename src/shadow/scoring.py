@@ -151,6 +151,31 @@ def compute_solution_score(
     return total
 
 
+def score_at_external_prices(
+    solution: dict[str, Any],
+    orders_by_uid: dict[str, dict[str, Any]],
+    native_prices: dict[str, int],
+    clearing_prices: dict[str, Any],
+) -> int:
+    """Score *our* trades but using externally supplied clearing prices.
+
+    Used for the winner-price comparison column (Phase 4a): re-evaluates our
+    fulfillments at the winner's clearingPrices to isolate "wrong trades
+    chosen" from "our prices were off".
+
+    Lower-cases ``clearing_prices`` keys to match the convention in
+    :func:`compute_solution_score`.  Does not mutate ``solution``.
+    """
+    if not solution:
+        return 0
+    cp_lower: dict[str, Any] = {}
+    for tok, price in (clearing_prices or {}).items():
+        if isinstance(tok, str):
+            cp_lower[tok.lower()] = price
+    substituted = {**solution, "prices": cp_lower}
+    return compute_solution_score(substituted, orders_by_uid, native_prices)
+
+
 def extract_native_prices(raw_competition: dict[str, Any]) -> dict[str, int]:
     """Pull ``auction.prices`` from a competition response dict.
 

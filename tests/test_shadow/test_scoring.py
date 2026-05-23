@@ -13,6 +13,7 @@ from src.shadow.scoring import (
     compute_solution_score,
     extract_native_prices,
     orders_by_uid_from_auction,
+    score_at_external_prices,
 )
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -210,6 +211,89 @@ def test_orders_by_uid_from_dict() -> None:
     result = orders_by_uid_from_auction(raw)
     assert "uid1" in result
     assert result["uid1"]["sellToken"] == "0xa"
+
+
+# ── score_at_external_prices (Phase 4a) ──────────────────────────────────────
+
+
+def _sell_setup() -> tuple[dict, dict, dict]:
+    ETH = 10**18
+    orders = {
+        "0xabc": {
+            "sellToken": "0xSELL",
+            "buyToken": "0xBUY",
+            "sellAmount": str(1000 * ETH),
+            "buyAmount": str(900 * ETH),
+            "kind": "sell",
+        }
+    }
+    solution = {
+        "prices": {"0xsell": str(11 * ETH), "0xbuy": str(10 * ETH)},
+        "trades": [
+            {
+                "kind": "fulfillment",
+                "orderUid": "0xabc",
+                "executedAmount": str(1000 * ETH),
+            }
+        ],
+    }
+    native = {"0xbuy": ETH}
+    return solution, orders, native
+
+
+def test_score_at_external_prices_identity_matches_compute() -> None:
+    """Passing the solution's own prices reproduces compute_solution_score."""
+    solution, orders, native = _sell_setup()
+    expected = compute_solution_score(solution, orders, native)
+    assert (
+        score_at_external_prices(solution, orders, native, solution["prices"]) == expected
+    )
+
+
+def test_score_at_external_prices_does_not_mutate_input() -> None:
+    solution, orders, native = _sell_setup()
+    snapshot = dict(solution["prices"])
+    ETH = 10**18
+    other = {"0xsell": str(20 * ETH), "0xbuy": str(10 * ETH)}
+    score_at_external_prices(solution, orders, native, other)
+    assert solution["prices"] == snapshot
+
+
+def test_score_at_external_prices_substitution_changes_score() -> None:
+    """Different clearing prices deterministically change the score."""
+    solution, orders, native = _sell_setup()
+    own = compute_solution_score(solution, orders, native)
+    ETH = 10**18
+    # Better external price: 2.0 instead of 1.1  →  larger surplus
+    better = {"0xsell": str(2 * ETH), "0xbuy": str(ETH)}
+    new_score = score_at_external_prices(solution, orders, native, better)
+    assert new_score > own
+    # Worse external price (at the limit) → zero
+    at_limit = {"0xsell": str(9 * ETH), "0xbuy": str(10 * ETH)}
+    assert score_at_external_prices(solution, orders, native, at_limit) == 0
+
+
+def test_score_at_external_prices_missing_token_skips_trade() -> None:
+    """If a trade's token has no entry in clearing_prices, the trade scores 0."""
+    solution, orders, native = _sell_setup()
+    # Drop the buy-token price → cp_buy = 0 → trade skipped
+    ETH = 10**18
+    partial = {"0xsell": str(11 * ETH)}
+    assert score_at_external_prices(solution, orders, native, partial) == 0
+
+
+def test_score_at_external_prices_empty_returns_zero() -> None:
+    solution, orders, native = _sell_setup()
+    assert score_at_external_prices(solution, orders, native, {}) == 0
+
+
+def test_score_at_external_prices_lowercases_keys() -> None:
+    """Mixed-case external clearing prices must be normalised."""
+    solution, orders, native = _sell_setup()
+    ETH = 10**18
+    mixed = {"0xSELL": str(11 * ETH), "0xBUY": str(10 * ETH)}
+    expected = compute_solution_score(solution, orders, native)
+    assert score_at_external_prices(solution, orders, native, mixed) == expected
 
 
 def test_orders_by_uid_from_pydantic() -> None:
