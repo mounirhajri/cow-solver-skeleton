@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from src.log import get_logger
 from src.models.auction import Auction
@@ -35,7 +36,11 @@ async def persist_shadow_attempt(
     auction_id = int(auction.id)
 
     async with Session() as session:
-        # Dialect-agnostic upsert: check-then-insert (works with both Postgres and sqlite)
+        # Upsert shadow_auctions: check-then-insert with IntegrityError guard.
+        # Race: both this BackgroundTask and persist_winner_and_outcomes_safe
+        # (called directly by the shadow poller) may attempt the insert
+        # concurrently.  The second insert raises IntegrityError which we
+        # catch and ignore — the row already exists, which is fine.
         existing = (
             await session.execute(
                 select(ShadowAuction).where(ShadowAuction.auction_id == auction_id)
@@ -43,21 +48,26 @@ async def persist_shadow_attempt(
         ).first()
 
         if existing is None:
-            session.add(
-                ShadowAuction(
-                    auction_id=auction_id,
-                    polled_at=datetime.now(UTC),
-                    n_orders=len(auction.orders),
-                    raw_competition=raw_competition or {},
-                    raw_auction=auction.model_dump(mode="json", by_alias=True),
+            try:
+                session.add(
+                    ShadowAuction(
+                        auction_id=auction_id,
+                        polled_at=datetime.now(UTC),
+                        n_orders=len(auction.orders),
+                        raw_competition=raw_competition or {},
+                        raw_auction=auction.model_dump(mode="json", by_alias=True),
+                    )
                 )
-            )
+                await session.flush()
+            except IntegrityError:
+                await session.rollback()
+                # Row inserted by the concurrent path — continue to solution inserts.
 
         # Pre-compute CIP-14 scores for all attempts that produced solutions.
         uid_map = orders_by_uid_from_auction(auction)
         native_prices = extract_native_prices(raw_competition or {})
         if not native_prices:
-            # Fallback: extract from auction.tokens.referencePrice (always present
+            # Fallback: extract from auction.tokens.reference_price (always present
             # in shadow-poller payloads even when raw_competition is unavailable).
             native_prices = {
                 addr.lower(): int(tok.reference_price)
@@ -69,7 +79,10 @@ async def persist_shadow_attempt(
             score: int | None = None
             if a.solution and uid_map and native_prices:
                 with contextlib.suppress(Exception):  # noqa: BLE001
-                    score = compute_solution_score(a.solution, uid_map, native_prices) or None
+                    raw_score = compute_solution_score(a.solution, uid_map, native_prices)
+                    # Keep 0 as NULL (no real surplus); only store positive scores.
+                    # A score of 0 means the solution is valid but unprofitable.
+                    score = raw_score if raw_score > 0 else None
             session.add(
                 ShadowSolution(
                     auction_id=auction_id,

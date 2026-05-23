@@ -63,9 +63,25 @@ class RouterSolver:
                     executed_amount=order.sell_amount,
                 )
             )
-            # Implied per-order clearing ratio (composer harmonizes later)
-            prices.setdefault(order.sell_token, executed_buy)
-            prices.setdefault(order.buy_token, order.sell_amount)
+            # Clearing prices must be ETH-denominated (wei per token unit, scaled
+            # 1e18) so CIP-14 scoring produces correct ETH surplus values.
+            # Prefer the auction's reference prices (oracle-backed, consistent
+            # across all orders); fall back to the on-chain execution ratio only
+            # when reference prices are missing.
+            sell_info = auction.tokens.get(order.sell_token)
+            buy_info = auction.tokens.get(order.buy_token)
+            if (
+                sell_info and sell_info.reference_price
+                and buy_info and buy_info.reference_price
+            ):
+                prices.setdefault(order.sell_token, sell_info.reference_price)
+                prices.setdefault(order.buy_token, buy_info.reference_price)
+            else:
+                # Execution-ratio fallback: ratio cp_sell/cp_buy = executed_buy/sell_amount
+                # is correct but values aren't ETH-denominated, so cross-pair
+                # scoring will be approximate.
+                prices.setdefault(order.sell_token, executed_buy)
+                prices.setdefault(order.buy_token, order.sell_amount)
 
         if not trades:
             return NoSolution()

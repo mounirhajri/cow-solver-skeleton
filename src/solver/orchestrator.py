@@ -137,8 +137,8 @@ class SolverOrchestrator:
 def load_default_strategies() -> list[SolverStrategy]:
     """Build the strategy chain. Loads edge strategies if private submodule present.
 
-    Order: edge strategies first (more specialized), router-v2 as workhorse,
-    naive last (fallback).
+    Order: naive first (always fast, anchors the response), then edge strategies
+    (specialized, selective), then router-v2 (slow on-chain quotes, shadow data).
     """
     from src.config import settings
     from src.routing.multicall import Multicall3
@@ -148,21 +148,25 @@ def load_default_strategies() -> list[SolverStrategy]:
 
     strategies: list[SolverStrategy] = []
 
+    # Naive first: <10 ms, always produces a solution based on oracle prices.
+    # Ensures the /solve response is never delayed by slow strategies.
+    strategies.append(NaiveSolver())
+
     try:
         from edge.matching import BipartiteMatcher, CoWMatchingSolver
         from edge.pool_indexer import LongTailRouter
 
-        strategies.append(BipartiteMatcher())  # cheap, selective
-        strategies.append(CoWMatchingSolver())  # multi-party rings
+        strategies.append(BipartiteMatcher())   # cheap graph matching
+        strategies.append(CoWMatchingSolver())  # multi-party ring matching
         strategies.append(LongTailRouter())
         log.info("edge_strategies_loaded")
     except ImportError:
         log.info("edge_strategies_not_present", reason="public_clone_or_phase0")
 
-    # Router-v2: primary workhorse
+    # Router-v2 last: on-chain quotes for 1200 orders may exhaust per-strategy
+    # timeout, but runs alongside naive in shadow mode for comparison data.
     rpc = RpcClient(settings.rpc_arbitrum)
     multicall = Multicall3(rpc)
     strategies.append(RouterSolver(multicall=multicall, intermediates=settings.intermediate_tokens))
 
-    strategies.append(NaiveSolver())
     return strategies

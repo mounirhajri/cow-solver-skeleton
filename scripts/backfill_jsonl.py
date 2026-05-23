@@ -108,7 +108,7 @@ async def backfill(jsonl_path: Path) -> dict[str, int]:
                     pseudo_auction = {
                         "orders": [
                             {"sellToken": t, "buyToken": t}
-                            for t in our_solution["prices"].keys()
+                            for t in our_solution["prices"]
                         ]
                     }
                     outcomes = extract_token_outcomes(pseudo_auction, None, our_solution)
