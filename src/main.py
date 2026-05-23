@@ -47,7 +47,11 @@ def create_app(
                 timeout=settings.solve_timeout_seconds,
             )
         except TimeoutError:
-            log.warning("solve_timeout", auction_id=auction.id, timeout=settings.solve_timeout_seconds)
+            log.warning(
+                "solve_timeout",
+                auction_id=auction.id,
+                timeout=settings.solve_timeout_seconds,
+            )
             SOLVE_TOTAL.labels(outcome="error").inc()
             return _empty_solution(auction.id)
         except Exception as e:  # noqa: BLE001

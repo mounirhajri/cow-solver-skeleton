@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.models.auction import Auction, Token
+from src.models.auction import Auction
 from src.models.solution import Solution, Trade
 from src.solver.price_refiner import refine_solution_prices
 
@@ -21,8 +21,14 @@ def _make_auction(sell_amount: int, buy_amount: int) -> Auction:
     return Auction.model_validate({
         "id": "9999",
         "tokens": {
-            WETH: {"decimals": 18, "referencePrice": str(1_800 * 10**18), "availableBalance": "0", "trusted": True},
-            USDC: {"decimals": 6, "referencePrice": str(10**18 // 1800), "availableBalance": "0", "trusted": True},
+            WETH: {
+                "decimals": 18, "referencePrice": str(1_800 * 10**18),
+                "availableBalance": "0", "trusted": True,
+            },
+            USDC: {
+                "decimals": 6, "referencePrice": str(10**18 // 1800),
+                "availableBalance": "0", "trusted": True,
+            },
         },
         "orders": [
             {
@@ -145,7 +151,10 @@ async def test_naive_solver_with_multicall_calls_price_refiner() -> None:
         interactions=[],
     )
 
-    with patch("src.solver.price_refiner.refine_solution_prices", new=AsyncMock(return_value=refined)) as mock_refine:
+    with patch(
+        "src.solver.price_refiner.refine_solution_prices",
+        new=AsyncMock(return_value=refined),
+    ) as mock_refine:
         result = await solver.solve(auction)
 
     mock_refine.assert_called_once()

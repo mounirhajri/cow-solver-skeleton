@@ -31,7 +31,7 @@ log = get_logger(__name__)
 async def refine_solution_prices(
     solution: Solution,
     auction: Auction,
-    multicall: "Multicall3",
+    multicall: Multicall3,
     intermediates: list[str],
     timeout: float = 3.0,
 ) -> Solution:
@@ -83,7 +83,11 @@ async def refine_solution_prices(
                 timeout=timeout,
             )
         except Exception as exc:  # noqa: BLE001
-            log.debug("price_refiner_quote_failed", pair=f"{sell_token[:8]}->{buy_token[:8]}", error=str(exc))
+            log.debug(
+                "price_refiner_quote_failed",
+                pair=f"{sell_token[:8]}->{buy_token[:8]}",
+                error=str(exc),
+            )
             return None
         if path is None:
             return None
@@ -169,7 +173,7 @@ async def refine_solution_prices(
         return solution
 
     n_oracle = len(solution.trades) - len(refined_trades)
-    n_refined = sum(1 for k in refined_prices if any(
+    sum(1 for k in refined_prices if any(
         (orders_by_uid.get(t.order_uid) and
          orders_by_uid[t.order_uid].sell_token in real_prices or
          orders_by_uid[t.order_uid].buy_token in real_prices)
