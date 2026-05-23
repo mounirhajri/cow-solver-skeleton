@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.models.auction import Auction
+from src.models.auction import Auction, Token
 from src.models.order import Order
 from src.models.solution import Solution
 from src.solver.base import NoSolution
@@ -28,10 +28,14 @@ def _make_order(**kwargs: object) -> Order:
     return Order(**defaults)  # type: ignore[arg-type]
 
 
-def _make_auction(orders: list[Order], auction_id: str = "1") -> Auction:
+def _make_auction(
+    orders: list[Order],
+    auction_id: str = "1",
+    tokens: dict[str, Token] | None = None,
+) -> Auction:
     return Auction(
         id=auction_id,
-        tokens={},
+        tokens=tokens or {},
         orders=orders,
         liquidity=[],
         effectiveGasPrice=0,
@@ -185,6 +189,83 @@ async def test_order_cap_default_is_50(monkeypatch: pytest.MonkeyPatch) -> None:
     await router.solve(_make_auction(orders))
 
     assert call_count == 50
+
+
+# ── ETH-value sort ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_order_cap_sorts_by_eth_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With reference prices set, sort ranks by ETH-equivalent value, not raw amount.
+
+    USDC has 6 decimals so a 1000-USDC order has sell_amount=1e9, while a
+    1-WETH order has sell_amount=1e18. Raw-amount sort would always rank WETH
+    higher. With reference prices (USDC≈2.5e14, WETH=1e18 wei per token unit),
+    a 1 WETH order (~1 ETH) should outrank a 1000 USDC order (~0.25 ETH).
+    """
+    quoted_amounts: list[int] = []
+
+    async def mock_quote(
+        _mc: object, _si: object, _bi: object, amount_in: int, _ints: object
+    ) -> None:
+        quoted_amounts.append(amount_in)
+        return None
+
+    monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
+
+    weth = "0x" + "1" * 40
+    usdc = "0x" + "2" * 40
+    dai = "0x" + "3" * 40
+    tokens = {
+        weth: Token(decimals=18, referencePrice=10**18),       # 1 WETH = 1 ETH
+        usdc: Token(decimals=6, referencePrice=25 * 10**13),   # 1 USDC ≈ 0.00025 ETH
+        dai:  Token(decimals=18, referencePrice=10**18),       # buy-side, irrelevant
+    }
+    orders = [
+        _make_order(uid="weth", sellToken=weth, buyToken=dai, sellAmount=10**18, buyAmount=1),
+        _make_order(uid="usdc", sellToken=usdc, buyToken=dai, sellAmount=1000 * 10**6, buyAmount=1),
+    ]
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], max_orders=1)
+    await router.solve(_make_auction(orders, tokens=tokens))
+
+    assert quoted_amounts == [10**18], (
+        "max_orders=1 should pick the WETH order (≈1 ETH) over the USDC order (≈0.25 ETH)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_order_cap_falls_back_to_sell_amount_when_no_reference_price(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When tokens lack reference prices, sort falls back to raw sell_amount."""
+    quoted_amounts: list[int] = []
+
+    async def mock_quote(
+        _mc: object, _si: object, _bi: object, amount_in: int, _ints: object
+    ) -> None:
+        quoted_amounts.append(amount_in)
+        return None
+
+    monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
+
+    weth = "0x" + "1" * 40
+    usdc = "0x" + "2" * 40
+    # reference_price=None means fallback path
+    tokens = {
+        weth: Token(decimals=18, referencePrice=None),
+        usdc: Token(decimals=6, referencePrice=None),
+    }
+    orders = [
+        _make_order(uid="weth", sellToken=weth, sellAmount=10**18, buyAmount=1),
+        _make_order(uid="usdc", sellToken=usdc, sellAmount=10**9, buyAmount=1),
+    ]
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], max_orders=1)
+    await router.solve(_make_auction(orders, tokens=tokens))
+
+    assert quoted_amounts == [10**18], (
+        "fallback should pick the larger raw sell_amount (10^18 > 10^9)"
+    )
 
 
 # ── Parallelism ───────────────────────────────────────────────────────────────

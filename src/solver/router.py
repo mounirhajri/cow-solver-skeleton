@@ -27,6 +27,7 @@ import asyncio
 
 from src.log import get_logger
 from src.models.auction import Auction
+from src.models.order import Order
 from src.models.solution import Solution, Trade
 from src.routing.multicall import Multicall3
 from src.routing.multihop import HopQuote, quote_best_path
@@ -37,6 +38,23 @@ log = get_logger(__name__)
 _DEFAULT_MAX_ORDERS = 50
 _DEFAULT_MAX_CONCURRENT = 20
 _DEFAULT_STRATEGY_TIMEOUT = 11.0
+
+
+def _eth_value_sort_key(order: Order, auction: Auction) -> int:
+    """ETH-equivalent value of a sell order, used for cross-token sort.
+
+    Auction `Token.reference_price` is ETH-denominated (wei per token unit,
+    scaled 1e18 per CoW convention), so ETH value is
+    ``sell_amount * reference_price // 10**18``.
+
+    When the reference price is missing (None or 0), falls back to the raw
+    ``sell_amount`` so callers with empty ``tokens={}`` retain legacy
+    largest-amount-first ordering.
+    """
+    token_info = auction.tokens.get(order.sell_token)
+    if token_info is None or not token_info.reference_price:
+        return order.sell_amount
+    return order.sell_amount * token_info.reference_price // 10**18
 
 
 class RouterSolver:
@@ -61,11 +79,13 @@ class RouterSolver:
         self.timeout: float = strategy_timeout
 
     async def solve(self, auction: Auction) -> Solution | NoSolution:
-        # Only sell orders; cap to the largest N by sell_amount so we stay
-        # within the per-strategy timeout even on 1200-order Arbitrum auctions.
+        # Only sell orders; cap to the largest N by ETH-equivalent value so the
+        # selection is decimals-aware (USDC's 1e6 base vs WETH's 1e18 base would
+        # otherwise let raw sell_amount always favour WETH-denominated orders).
+        # Falls back to raw sell_amount when reference prices are missing.
         sell_orders = sorted(
             [o for o in auction.orders if o.kind == "sell"],
-            key=lambda o: o.sell_amount,
+            key=lambda o: _eth_value_sort_key(o, auction),
             reverse=True,
         )[: self._max_orders]
 
