@@ -42,12 +42,12 @@ class RpcClient:
             "params": [{"to": to, "data": data}, block],
         }
         last_exc: Exception = RuntimeError("eth_call: no attempts made")
-        for attempt, delay in enumerate((*_RETRY_DELAYS, None), start=1):
+        for _attempt, delay in enumerate((*_RETRY_DELAYS, None), start=1):
             resp = await self._client.post(self.url, json=payload, timeout=5.0)
 
             # HTTP-level rate limit (some providers return 429 directly)
             if resp.status_code == 429:
-                last_exc = RuntimeError(f"RPC error 429: Too Many Requests")
+                last_exc = RuntimeError("RPC error 429: Too Many Requests")
                 if delay is not None:
                     await asyncio.sleep(delay)
                 continue

@@ -28,7 +28,7 @@ class NaiveSolver:
 
     def __init__(
         self,
-        multicall: "Multicall3 | None" = None,
+        multicall: Multicall3 | None = None,
         intermediates: list[str] | None = None,
         refine_timeout: float = 3.0,
     ) -> None:
