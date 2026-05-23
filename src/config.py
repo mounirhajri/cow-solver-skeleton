@@ -40,8 +40,9 @@ class Settings(BaseSettings):
     # Arbitrum auctions have ~1200 orders; quoting all of them sequentially
     # exhausts the 5 s per-strategy timeout. Cap to the largest orders and
     # quote them in parallel to stay well under budget.
-    router_max_orders: int = 100      # top-N sell orders by sell_amount
+    router_max_orders: int = 50        # top-N sell orders by sell_amount
     router_max_concurrent: int = 20   # parallel RPC quote slots (semaphore)
+    router_strategy_timeout: float = 9.0  # per-strategy timeout for router-v2 (s)
 
     # Postgres
     database_url: str = "postgresql+asyncpg://solver:solver@localhost:5432/solver"

@@ -34,8 +34,9 @@ from src.solver.base import NoSolution
 
 log = get_logger(__name__)
 
-_DEFAULT_MAX_ORDERS = 100
+_DEFAULT_MAX_ORDERS = 50
 _DEFAULT_MAX_CONCURRENT = 20
+_DEFAULT_STRATEGY_TIMEOUT = 9.0
 
 
 class RouterSolver:
@@ -47,11 +48,17 @@ class RouterSolver:
         intermediates: list[str],
         max_orders: int = _DEFAULT_MAX_ORDERS,
         max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
+        strategy_timeout: float = _DEFAULT_STRATEGY_TIMEOUT,
     ) -> None:
         self._multicall = multicall
         self._intermediates = intermediates
         self._max_orders = max_orders
         self._max_concurrent = max_concurrent
+        # Advertise a custom timeout so the orchestrator gives us more headroom
+        # than the default 5 s per-strategy limit. On-chain quoting needs ~3 serial
+        # RPC round-trips per order; 50 orders / 20 concurrent ≈ 3 waves × ~1 s = ~3 s,
+        # comfortably inside 9 s even on a slow public Arbitrum endpoint.
+        self.timeout: float = strategy_timeout
 
     async def solve(self, auction: Auction) -> Solution | NoSolution:
         # Only sell orders; cap to the largest N by sell_amount so we stay

@@ -98,6 +98,27 @@ async def test_orchestrator_returns_nosolution_if_all_fail(auction: Auction) -> 
     assert attempts[0].status == "no_solution"
 
 
+async def test_orchestrator_uses_per_strategy_timeout_attribute(auction: Auction) -> None:
+    """A strategy with a .timeout attribute uses it instead of the orchestrator default."""
+    # s1 sleeps for 0.3 s — longer than the orchestrator default (0.1 s) but within
+    # its own declared timeout (0.5 s).  It should NOT be cancelled.
+    async def medium_solve(a: Auction) -> Solution | NoSolution:
+        await asyncio.sleep(0.3)
+        return _solution()
+
+    s1 = AsyncMock(name="s1")
+    s1.name = "medium"
+    s1.solve.side_effect = medium_solve
+    s1.timeout = 0.5  # strategy declares its own, longer timeout
+
+    orch = SolverOrchestrator(strategies=[s1], per_strategy_timeout=0.1)
+    result, attempts = await orch.solve(auction)
+
+    # Should have succeeded, not timed out
+    assert isinstance(result, Solution)
+    assert attempts[0].status == "solved"
+
+
 async def test_orchestrator_run_all_strategies_collects_all_attempts(auction: Auction) -> None:
     """With run_all_strategies=True, all strategies run even after a winner is found."""
     sol = _solution()

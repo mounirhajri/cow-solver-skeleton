@@ -51,8 +51,19 @@ class SolverOrchestrator:
 
         for strat in self._strategies:
             start = time.perf_counter()
+            # Strategies may declare their own timeout via a numeric `timeout`
+            # attribute (e.g. RouterSolver needs 9 s for on-chain RPC quoting).
+            # Only honour the attribute when it is an actual number; mock objects
+            # expose a `timeout` as a child mock, not a float, so we fall back to
+            # the orchestrator-wide default in that case.
+            _strat_timeout_attr = getattr(strat, "timeout", None)
+            strat_timeout = (
+                _strat_timeout_attr
+                if isinstance(_strat_timeout_attr, (int, float))
+                else self._timeout
+            )
             try:
-                result = await asyncio.wait_for(strat.solve(auction), timeout=self._timeout)
+                result = await asyncio.wait_for(strat.solve(auction), timeout=strat_timeout)
             except TimeoutError:
                 latency_ms = int((time.perf_counter() - start) * 1000)
                 log.warning("strategy_timeout", strategy=strat.name, auction_id=auction.id)
@@ -61,7 +72,7 @@ class SolverOrchestrator:
                     status="timeout",
                     latency_ms=latency_ms,
                     solution=None,
-                    error=f"timeout after {self._timeout}s",
+                    error=f"timeout after {strat_timeout}s",
                 ))
                 continue
             except Exception as e:  # noqa: BLE001
@@ -172,6 +183,7 @@ def load_default_strategies() -> list[SolverStrategy]:
         intermediates=settings.intermediate_tokens,
         max_orders=settings.router_max_orders,
         max_concurrent=settings.router_max_concurrent,
+        strategy_timeout=settings.router_strategy_timeout,
     ))
 
     return strategies

@@ -165,8 +165,8 @@ async def test_order_cap_limits_quotes_to_top_n(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.asyncio
-async def test_order_cap_default_is_100(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Default max_orders=100: 150 orders → only 100 quoted."""
+async def test_order_cap_default_is_50(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default max_orders=50: 150 orders → only 50 quoted."""
     call_count = 0
 
     async def mock_quote(*args: object, **kwargs: object) -> None:
@@ -184,7 +184,7 @@ async def test_order_cap_default_is_100(monkeypatch: pytest.MonkeyPatch) -> None
     router = RouterSolver(multicall=multicall, intermediates=[])
     await router.solve(_make_auction(orders))
 
-    assert call_count == 100
+    assert call_count == 50
 
 
 # ── Parallelism ───────────────────────────────────────────────────────────────
@@ -266,5 +266,23 @@ async def test_semaphore_limits_concurrent_quotes(monkeypatch: pytest.MonkeyPatc
 def test_config_has_router_settings() -> None:
     from src.config import Settings
     s = Settings()
-    assert s.router_max_orders == 100
+    assert s.router_max_orders == 50
     assert s.router_max_concurrent == 20
+    assert s.router_strategy_timeout == 9.0
+
+
+def test_router_exposes_timeout_attribute() -> None:
+    """RouterSolver must declare .timeout so the orchestrator can use it."""
+    from unittest.mock import MagicMock
+    multicall = MagicMock()
+    router = RouterSolver(multicall=multicall, intermediates=[])
+    assert hasattr(router, "timeout")
+    assert router.timeout == 9.0
+
+
+def test_router_timeout_overridable() -> None:
+    """Custom strategy_timeout is stored on the instance."""
+    from unittest.mock import MagicMock
+    multicall = MagicMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], strategy_timeout=12.5)
+    assert router.timeout == 12.5
