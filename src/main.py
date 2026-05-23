@@ -1,3 +1,4 @@
+import asyncio
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -41,7 +42,14 @@ def create_app(
         auction = Auction.model_validate(body)
 
         try:
-            result, attempts = await orchestrator.solve(auction)
+            result, attempts = await asyncio.wait_for(
+                orchestrator.solve(auction),
+                timeout=settings.solve_timeout_seconds,
+            )
+        except TimeoutError:
+            log.warning("solve_timeout", auction_id=auction.id, timeout=settings.solve_timeout_seconds)
+            SOLVE_TOTAL.labels(outcome="error").inc()
+            return _empty_solution(auction.id)
         except Exception as e:  # noqa: BLE001
             log.error("solve_error", auction_id=auction.id, error=str(e))
             SOLVE_TOTAL.labels(outcome="error").inc()

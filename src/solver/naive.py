@@ -35,6 +35,14 @@ class NaiveSolver:
         self._multicall = multicall
         self._intermediates = intermediates or []
         self._refine_timeout = refine_timeout
+        # Declare a custom per-strategy timeout so the orchestrator gives the
+        # price refiner enough room.  The budget-divided default (13 s / 5
+        # strategies ≈ 2.6 s) is shorter than refine_timeout (3 s), so naive
+        # would be cancelled before the refiner finishes without this override.
+        # A global asyncio.wait_for(solve_timeout_seconds=13 s) in main.py caps
+        # the entire solve call, so individual strategy overrides cannot cause
+        # the server to miss CoW Protocol's 15 s response deadline.
+        self.timeout: float = refine_timeout + 1.0
 
     async def solve(self, auction: Auction) -> Solution | NoSolution:
         trades: list[Trade] = []
