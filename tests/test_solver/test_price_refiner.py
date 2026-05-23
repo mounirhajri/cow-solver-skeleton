@@ -87,9 +87,10 @@ async def test_refine_replaces_oracle_prices_with_real_dex_prices() -> None:
         result = await refine_solution_prices(solution, auction, multicall, [])
 
     assert len(result.trades) == 1
-    # Prices should now reflect real DEX ratio: cp_sell=real_out, cp_buy=sell_amount
-    assert result.prices[WETH] == real_out
-    assert result.prices[USDC] == sell_amount
+    # Prices keep oracle/reference values — consistent unit system for CIP-14.
+    # DEX quote is used only to verify the trade is executable, not to replace prices.
+    assert result.prices[WETH] == 1_800 * 10**18
+    assert result.prices[USDC] == 10**18 // 1800
 
 
 @pytest.mark.asyncio

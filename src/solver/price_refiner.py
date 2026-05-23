@@ -165,8 +165,18 @@ async def refine_solution_prices(
             continue
 
         refined_trades.append(trade)
-        refined_prices.setdefault(order.sell_token, cp_sell)
-        refined_prices.setdefault(order.buy_token, cp_buy)
+        # Use oracle/reference prices for the clearing-price dict so that all
+        # tokens share one consistent unit system (ETH wei per 10^18 atoms).
+        # Mixing DEX swap-amounts with oracle prices across different token
+        # pairs produces astronomically wrong cross-pair exchange rates and
+        # therefore astronomically inflated CIP-14 surplus.  The DEX check
+        # above already ensures the trade is executable at real market prices.
+        sell_info = auction.tokens.get(order.sell_token)
+        buy_info = auction.tokens.get(order.buy_token)
+        if sell_info and sell_info.reference_price:
+            refined_prices.setdefault(order.sell_token, int(sell_info.reference_price))
+        if buy_info and buy_info.reference_price:
+            refined_prices.setdefault(order.buy_token, int(buy_info.reference_price))
 
     if not refined_trades:
         log.debug("price_refiner_all_dropped", auction_id=auction.id)
