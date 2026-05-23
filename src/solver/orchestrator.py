@@ -173,13 +173,32 @@ def load_default_strategies() -> list[SolverStrategy]:
     ))
 
     try:
+        from edge.classifier.predict import TokenClassifier
         from edge.matching import BipartiteMatcher, CoWMatchingSolver
         from edge.pool_indexer import LongTailRouter
+        from src.persistence.db import get_session_factory
 
-        strategies.append(BipartiteMatcher())   # cheap graph matching
-        strategies.append(CoWMatchingSolver())  # multi-party ring matching
+        # TokenClassifier.load() never raises — when the pickle is missing it
+        # returns an instance whose `.model is None`, which the filter treats
+        # as a no-op. So a missing model degrades gracefully to the old path.
+        classifier = TokenClassifier.load()
+        # `get_session_factory()` returns an `async_sessionmaker[AsyncSession]`
+        # — itself a callable that yields an AsyncSession context. The filter
+        # opens its own short-lived session via `async with session_factory()`.
+        session_factory = get_session_factory()
+        strategies.append(BipartiteMatcher(
+            classifier=classifier,
+            session_factory=session_factory,
+        ))
+        strategies.append(CoWMatchingSolver(
+            classifier=classifier,
+            session_factory=session_factory,
+        ))
         strategies.append(LongTailRouter())
-        log.info("edge_strategies_loaded")
+        log.info(
+            "edge_strategies_loaded",
+            rf_model_loaded=classifier.model is not None,
+        )
     except ImportError:
         log.info("edge_strategies_not_present", reason="public_clone_or_phase0")
 
