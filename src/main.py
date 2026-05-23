@@ -72,7 +72,7 @@ def create_app(
         SOLVE_DURATION.observe(time.perf_counter() - start)
         if shadow_logger:
             shadow_logger.record(auction_id=auction.id, our_solution=result)
-        return result.model_dump(by_alias=True, mode="json")
+        return result.model_dump(by_alias=True, mode="json")  # type: ignore[no-any-return]
 
     return app
 

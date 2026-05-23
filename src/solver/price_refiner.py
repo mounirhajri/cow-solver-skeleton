@@ -173,13 +173,6 @@ async def refine_solution_prices(
         return solution
 
     n_oracle = len(solution.trades) - len(refined_trades)
-    sum(1 for k in refined_prices if any(
-        (orders_by_uid.get(t.order_uid) and
-         orders_by_uid[t.order_uid].sell_token in real_prices or
-         orders_by_uid[t.order_uid].buy_token in real_prices)
-        for t in refined_trades
-        if t.order_uid in orders_by_uid
-    ))
     log.info(
         "price_refiner_done",
         auction_id=auction.id,
