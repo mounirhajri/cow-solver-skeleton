@@ -18,11 +18,14 @@ from dataclasses import dataclass
 
 from eth_abi import decode, encode  # type: ignore[attr-defined]
 
+from src.log import get_logger
 from src.routing.amm_v3 import (
     QUOTE_EXACT_INPUT_SINGLE_SELECTOR,
     QUOTER_V2_ADDRESS,
 )
 from src.routing.multicall import Call, Multicall3
+
+log = get_logger(__name__)
 
 # keccak256("quoteExactInput(bytes,uint256)")[:4] = cdca1753 (verified)
 QUOTE_EXACT_INPUT_SELECTOR = "cdca1753"
@@ -93,13 +96,15 @@ def _encode_quote_exact_input_single(
 
 def _decode_single_hop_return(data: bytes) -> int:
     """Decode `(uint256, uint160, uint32, uint256)` and return amount_out, else 0."""
+    # 4 static-typed 32-byte fields = 128 bytes minimum.
     if len(data) < 128:
         return 0
     try:
         amount_out, _sqrt, _ticks, _gas = decode(
             ["uint256", "uint160", "uint32", "uint256"], data
         )
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log.debug("single_hop_decode_failed", error=str(e), nbytes=len(data))
         return 0
     return int(amount_out)
 
@@ -112,7 +117,8 @@ def _decode_multi_hop_return(data: bytes) -> int:
         amount_out, _sqrts, _ticks, _gas = decode(
             ["uint256", "uint160[]", "uint32[]", "uint256"], data
         )
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log.debug("multi_hop_decode_failed", error=str(e), nbytes=len(data))
         return 0
     return int(amount_out)
 

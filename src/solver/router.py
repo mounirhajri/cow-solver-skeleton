@@ -139,6 +139,12 @@ class RouterSolver:
     def _select_best_quote_per_order(
         quotes: list[V3BatchedQuote],
     ) -> dict[str, V3BatchedQuote]:
+        # Strict `>` keeps the first candidate per order_uid on ties. Since
+        # _build_v3_candidate_paths iterates FEE_TIERS in declared order
+        # (100, 500, 3000, 10000) and intermediates in declared order, the
+        # de-facto tie-break is "lower fee tier wins, then direct over 2-hop".
+        # Any future reshuffle of the build order would change selected pools —
+        # if a stronger contract is needed, replace with explicit sort key.
         best: dict[str, V3BatchedQuote] = {}
         for q in quotes:
             if q.amount_out == 0:
