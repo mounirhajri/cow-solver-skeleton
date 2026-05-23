@@ -63,10 +63,10 @@ jobs:
             "$USER@$HOST" bash -s << 'ENDSSH'
           set -e
           cd /opt/mhagentic/stack/cow-solver
-          docker compose -f docker-compose.prod.yml pull cow-solver reconciler shadow-poller
-          docker compose -f docker-compose.prod.yml up -d cow-solver reconciler shadow-poller
+          sudo docker compose -f docker-compose.prod.yml pull cow-solver reconciler shadow-poller
+          sudo docker compose -f docker-compose.prod.yml up -d cow-solver reconciler shadow-poller
           sleep 8
-          docker compose -f docker-compose.prod.yml exec -T cow-solver /app/.venv/bin/alembic upgrade head
-          docker compose -f docker-compose.prod.yml ps cow-solver reconciler shadow-poller
+          sudo docker compose -f docker-compose.prod.yml exec -T cow-solver /app/.venv/bin/alembic upgrade head
+          sudo docker compose -f docker-compose.prod.yml ps cow-solver reconciler shadow-poller
           curl -fsS http://localhost:8000/health
           ENDSSH
