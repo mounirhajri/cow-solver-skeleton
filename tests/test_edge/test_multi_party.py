@@ -261,8 +261,10 @@ async def test_rf_filter_invoked_when_classifier_passed(monkeypatch) -> None:
         captured["n_in"] = len(orders)
         return orders  # pass through unchanged
 
+    # Patch on the importing module: multi_party imports the symbol at load time,
+    # so patching rf_filter's namespace wouldn't affect multi_party's reference.
     monkeypatch.setattr(
-        "edge.matching.rf_filter.filter_orders_by_token_quality", fake_filter
+        "edge.matching.multi_party.filter_orders_by_token_quality", fake_filter
     )
 
     orders = [
@@ -279,6 +281,46 @@ async def test_rf_filter_invoked_when_classifier_passed(monkeypatch) -> None:
     assert captured.get("called") is True
     assert captured.get("n_in") == 3
     assert isinstance(result, Solution)
+
+
+@pytest.mark.asyncio
+async def test_rf_filter_drops_orders_touching_low_score_tokens(monkeypatch) -> None:
+    """Behavioural: an order touching a token below threshold is removed before
+    ring enumeration. The remaining orders are below MIN_RING_LENGTH → NoSolution.
+
+    Without the filter (see `test_ring_*` above) the same auction finds a ring.
+    """
+    scores_by_token = {"0xa": 0.9, "0xb": 0.9, "0xc": 0.1}  # token C is "scam"
+
+    async def fake_fetch(_session_factory, addresses):
+        return {
+            a.lower(): {"_test_score": scores_by_token.get(a.lower(), 0.5)}
+            for a in addresses
+        }
+
+    monkeypatch.setattr("edge.matching.rf_filter._fetch_token_features", fake_fetch)
+
+    class _FakeClassifier:
+        model = "fake"
+
+        def score(self, features: dict) -> float:
+            return features.get("_test_score", 0.5)
+
+    orders = [
+        _mk_order("o1", "0xA", "0xB"),  # both pass: kept
+        _mk_order("o2", "0xB", "0xC"),  # 0xC fails: dropped
+        _mk_order("o3", "0xC", "0xA"),  # 0xC fails: dropped
+    ]
+    tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
+    solver = CoWMatchingSolver(
+        classifier=_FakeClassifier(),
+        session_factory=lambda: None,  # not called — _fetch is monkeypatched
+        rf_threshold=0.4,
+    )
+    result = await solver.solve(_mk_auction(orders, tokens))
+    assert isinstance(result, NoSolution), (
+        "after filter only o1 survives (< MIN_RING_LENGTH=3) → no ring possible"
+    )
 
 
 @pytest.mark.asyncio

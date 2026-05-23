@@ -182,8 +182,10 @@ async def test_rf_filter_invoked_when_classifier_passed(monkeypatch):
         captured["threshold"] = threshold
         return orders  # pass through unchanged
 
+    # Patch on the importing module: bipartite imports the symbol at load time,
+    # so patching rf_filter's namespace wouldn't affect bipartite's reference.
     monkeypatch.setattr(
-        "edge.matching.rf_filter.filter_orders_by_token_quality", fake_filter
+        "edge.matching.bipartite.filter_orders_by_token_quality", fake_filter
     )
 
     m = BipartiteMatcher(
@@ -199,6 +201,46 @@ async def test_rf_filter_invoked_when_classifier_passed(monkeypatch):
     assert captured.get("called") is True
     assert captured.get("n_in") == 2
     assert isinstance(result, Solution)
+
+
+@pytest.mark.asyncio
+async def test_rf_filter_drops_orders_with_low_score_tokens(monkeypatch):
+    """Behavioural: orders touching a token below threshold are excluded from matching.
+
+    Two would-be matches in the auction:
+      - (oA, oB): both tokens score high → should match
+      - (oC, oD): one token scores low   → should be filtered out
+    """
+    scores_by_token = {"0xa": 0.9, "0xb": 0.9, "0xgood": 0.9, "0xbad": 0.1}
+
+    async def fake_fetch(_session_factory, addresses):
+        # Inject the per-token score as a synthetic feature; FakeClassifier reads it.
+        return {a.lower(): {"_test_score": scores_by_token.get(a.lower(), 0.5)} for a in addresses}
+
+    monkeypatch.setattr("edge.matching.rf_filter._fetch_token_features", fake_fetch)
+
+    class _FakeClassifier:
+        model = "fake"  # truthy so the gate lets the filter run
+
+        def score(self, features: dict) -> float:
+            return features.get("_test_score", 0.5)
+
+    m = BipartiteMatcher(
+        classifier=_FakeClassifier(),
+        session_factory=lambda: None,  # not called — _fetch is monkeypatched
+        rf_threshold=0.4,
+    )
+    auction = _mk_auction([
+        _mk_order("oA", "0xa", "0xb", 1000, 800),
+        _mk_order("oB", "0xb", "0xa", 1000, 800),
+        _mk_order("oC", "0xgood", "0xbad", 1000, 800),  # touches 0xbad → dropped
+        _mk_order("oD", "0xbad", "0xgood", 1000, 800),  # touches 0xbad → dropped
+    ])
+    result = await m.solve(auction)
+    assert isinstance(result, Solution)
+    trade_uids = {t.order_uid for t in result.trades}
+    assert "oA" in trade_uids and "oB" in trade_uids
+    assert "oC" not in trade_uids and "oD" not in trade_uids
 
 
 @pytest.mark.asyncio
