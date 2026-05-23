@@ -21,8 +21,9 @@ from sqlalchemy import select
 
 from src.persistence.db import get_session_factory
 from src.persistence.models import ShadowAuction, ShadowSolution, ShadowWinner
+from src.solver.router import RouterSolver
 
-_STRATEGY = "router-v2"
+_STRATEGY = RouterSolver.name
 
 
 def _count_trades(solution: dict[str, Any] | None) -> int:
@@ -56,7 +57,7 @@ async def analyze_router_solutions(days: int = 7) -> None:
         rows = q.all()
 
     print(f"\n{'=' * 60}")
-    print(f"Router-v2 Shadow Analysis - last {days} day(s)")
+    print(f"Router-v2 Shadow Analysis — last {days} day(s)")
     print(f"{'=' * 60}")
     print(f"Total router-v2 solutions: {len(rows)}")
 
