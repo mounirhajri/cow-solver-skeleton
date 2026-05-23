@@ -196,6 +196,7 @@ def load_default_strategies() -> list[SolverStrategy]:
         strategies.append(CoWMatchingSolver(
             classifier=classifier,
             session_factory=session_factory,
+            otm_tolerance_bps=settings.multi_party_otm_tolerance_bps,
         ))
         # Long-tail router shares the multicall instance with NaiveSolver/RouterSolver
         # and is backed by a Redis cache (pool addresses ~7d, reserves ~60s).

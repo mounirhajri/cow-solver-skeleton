@@ -88,6 +88,33 @@ def test_order_not_in_money() -> None:
     assert _order_in_money(order, tokens) is False
 
 
+def test_order_otm_within_tolerance_is_accepted() -> None:
+    """At 100 bps tolerance: a 0.5 % OTM order is treated as viable."""
+    tokens = {"A": _mk_token(price=10**18), "B": _mk_token(price=10**18)}
+    # sell_value = 995, buy_value = 1000 → -0.5 % OTM, within 1 % tolerance
+    order = _mk_order("o1", "A", "B", sell_amount=995, buy_amount=1000)
+    assert _order_in_money(order, tokens) is False  # strict default
+    assert _order_in_money(order, tokens, tolerance_bps=100) is True
+
+
+def test_order_far_otm_rejected_even_with_tolerance() -> None:
+    """2 % OTM falls outside the 100 bps tolerance band."""
+    tokens = {"A": _mk_token(price=10**18), "B": _mk_token(price=10**18)}
+    # sell_value = 980, buy_value = 1000 → -2 % OTM
+    order = _mk_order("o1", "A", "B", sell_amount=980, buy_amount=1000)
+    assert _order_in_money(order, tokens, tolerance_bps=100) is False
+    assert _order_in_money(order, tokens, tolerance_bps=200) is True
+
+
+def test_order_tolerance_zero_matches_strict_legacy() -> None:
+    """tolerance_bps=0 reproduces the pre-relax behaviour exactly."""
+    tokens = {"A": _mk_token(price=10**18), "B": _mk_token(price=10**18)}
+    itm = _mk_order("o1", "A", "B", sell_amount=1000, buy_amount=900)
+    otm = _mk_order("o2", "A", "B", sell_amount=900, buy_amount=1000)
+    assert _order_in_money(itm, tokens, 0) is True
+    assert _order_in_money(otm, tokens, 0) is False
+
+
 def test_order_not_in_money_when_unpriced() -> None:
     """Missing reference price → not viable (same as False)."""
     tokens: dict[str, Token] = {}

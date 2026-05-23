@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     # RPC load (~80x) but loses access to V2-only pools (rare on Arbitrum).
     router_v3_only_batched: bool = True
 
+    # Multi-Party CoW Matching: OTM-tolerance (in basis points) widens the
+    # viable-order graph beyond strict reference-price-ITM. At 100 bps (1 %)
+    # the graph grows ~3-5×; Johnson stays cheap, more ring candidates reach
+    # the LP. 0 = strict ITM (legacy behaviour).
+    multi_party_otm_tolerance_bps: int = 100
+
     # LongTailRouter (Pool-Indexer). Bursts ~60 RPC calls per auction on top of
     # RouterSolver's load. On a tight Alchemy free-tier concurrent-connection
     # quota that pushes RouterSolver into "Authentication required" rejections.
