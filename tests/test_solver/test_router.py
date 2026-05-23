@@ -268,7 +268,7 @@ def test_config_has_router_settings() -> None:
     s = Settings()
     assert s.router_max_orders == 50
     assert s.router_max_concurrent == 20
-    assert s.router_strategy_timeout == 9.0
+    assert s.router_strategy_timeout == 11.0
 
 
 def test_router_exposes_timeout_attribute() -> None:
@@ -277,7 +277,7 @@ def test_router_exposes_timeout_attribute() -> None:
     multicall = MagicMock()
     router = RouterSolver(multicall=multicall, intermediates=[])
     assert hasattr(router, "timeout")
-    assert router.timeout == 9.0
+    assert router.timeout == 11.0
 
 
 def test_router_timeout_overridable() -> None:

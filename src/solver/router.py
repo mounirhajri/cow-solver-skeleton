@@ -36,7 +36,7 @@ log = get_logger(__name__)
 
 _DEFAULT_MAX_ORDERS = 50
 _DEFAULT_MAX_CONCURRENT = 20
-_DEFAULT_STRATEGY_TIMEOUT = 9.0
+_DEFAULT_STRATEGY_TIMEOUT = 11.0
 
 
 class RouterSolver:
