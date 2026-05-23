@@ -3,9 +3,8 @@ are absent (< MIN_SCAM_SAMPLES).  Verifies the sklearn-compatible interface so
 the rest of the pipeline (predict.py, train.py) needs no changes."""
 import numpy as np
 import pandas as pd
-import pytest
 
-from edge.classifier.train import AnomalyScorer, MIN_SCAM_SAMPLES
+from edge.classifier.train import MIN_SCAM_SAMPLES, AnomalyScorer
 
 
 def _make_feature_df(n: int, seed: int = 0) -> pd.DataFrame:
@@ -90,8 +89,7 @@ def test_min_scam_samples_constant_is_positive():
 
 def test_anomaly_path_taken_when_no_scam_labels(monkeypatch):
     """_train_model must return model_type='isolation_forest' when df has no scam rows."""
-    import pandas as pd
-    from edge.classifier.feature_engineering import ENGINEERED_FEATURE_COLUMNS, RAW_FEATURE_COLUMNS
+    from edge.classifier.feature_engineering import RAW_FEATURE_COLUMNS
     from edge.classifier.train import _train_model
 
     rng = np.random.default_rng(42)
@@ -110,7 +108,7 @@ def test_anomaly_path_taken_when_no_scam_labels(monkeypatch):
 def test_binary_path_taken_when_enough_scam_labels():
     """_train_model must return a binary model when scam labels >= MIN_SCAM_SAMPLES."""
     from edge.classifier.feature_engineering import RAW_FEATURE_COLUMNS
-    from edge.classifier.train import _train_model, MIN_SCAM_SAMPLES
+    from edge.classifier.train import MIN_SCAM_SAMPLES, _train_model
 
     rng = np.random.default_rng(7)
     n_legit = 40
