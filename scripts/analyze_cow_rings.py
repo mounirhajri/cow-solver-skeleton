@@ -19,6 +19,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from scripts._analyze_common import print_winner_price_block
 from src.persistence.db import get_session_factory
 from src.persistence.models import ShadowAuction, ShadowSolution, ShadowWinner
 
@@ -109,7 +110,11 @@ async def analyze_cow_rings(days: int = 7) -> None:
             .join(ShadowAuction, ShadowAuction.auction_id == ShadowSolution.auction_id)
             .outerjoin(ShadowWinner, ShadowWinner.auction_id == ShadowSolution.auction_id)
             .where(ShadowAuction.polled_at >= since)
-            .where(ShadowSolution.strategy.in_(["cow-matching-bipartite", "cow-matching-multi-party"]))
+            .where(
+                ShadowSolution.strategy.in_(
+                    ["cow-matching-bipartite", "cow-matching-multi-party"]
+                )
+            )
             .where(ShadowSolution.status == "solved")
             .order_by(ShadowSolution.auction_id)
         )
@@ -160,9 +165,9 @@ async def analyze_cow_rings(days: int = 7) -> None:
             ETH = 1e18
             our_scores = [s / ETH for _, s, _ in scored]
             win_scores = [w / ETH for _, _, w in scored]
-            deltas = [o - w for o, w in zip(our_scores, win_scores)]
+            deltas = [o - w for o, w in zip(our_scores, win_scores, strict=True)]
 
-            print(f"\nCIP-14 Score (ETH):")
+            print("\nCIP-14 Score (ETH):")
             print(f"  Ours:   mean={statistics.mean(our_scores):+.6f}  "
                   f"median={statistics.median(our_scores):+.6f}  "
                   f"max={max(our_scores):+.6f}")
@@ -175,35 +180,7 @@ async def analyze_cow_rings(days: int = 7) -> None:
             wins = sum(1 for d in deltas if d > 0)
             print(f"\nHypothetical wins:  {wins}/{len(scored)} ({wins/len(scored):.0%})")
 
-            # Phase 4a — winner-price comparison block
-            wp_scored = [
-                (int(r.score_vs_winner_prices_wei), int(r.winner_score))
-                for r in group
-                if r.score_vs_winner_prices_wei is not None and r.winner_score is not None
-            ]
-            if not wp_scored:
-                print(
-                    "\nscore_vs_winner_prices_wei: not yet populated "
-                    "— run backfill_winner_price_scores.py"
-                )
-            else:
-                wp_ours = [s / ETH for s, _ in wp_scored]
-                wp_deltas = [(s - w) / ETH for s, w in wp_scored]
-                wp_wins = sum(1 for d in wp_deltas if d > 0)
-                print("\nCIP-14 Score @ winner prices (ETH):")
-                print(
-                    f"  Ours: mean={statistics.mean(wp_ours):+.6f}  "
-                    f"median={statistics.median(wp_ours):+.6f}  "
-                    f"max={max(wp_ours):+.6f}"
-                )
-                print(
-                    f"  Delta vs winner: mean={statistics.mean(wp_deltas):+.6f}  "
-                    f"median={statistics.median(wp_deltas):+.6f}"
-                )
-                print(
-                    f"Wins @ winner prices: {wp_wins}/{len(wp_scored)} "
-                    f"({wp_wins / len(wp_scored):.0%})"
-                )
+            print_winner_price_block(group)
 
             # Winner breakdown — who wins when we don't?
             losses = [(r, o, w) for r, o, w in scored if o < w]
@@ -216,7 +193,7 @@ async def analyze_cow_rings(days: int = 7) -> None:
                     print(f"  {cnt:3d}x  {short}")
 
         # Sample: show a few actual solutions
-        print(f"\nSample solutions (up to 3):")
+        print("\nSample solutions (up to 3):")
         for r in group[:3]:
             trades = _count_trades(r.solution)
             our = f"{int(r.our_score_wei)/1e18:.6f} ETH" if r.our_score_wei else "unscored"
