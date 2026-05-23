@@ -48,45 +48,6 @@ class Summary:
     n_positive_delta: int
 
 
-def _compute_solution_surplus(
-    solution: dict[str, Any] | None, auction: dict[str, Any] | None
-) -> int | None:
-    """Compute aggregate surplus across a solution's trades.
-
-    surplus = sum over trades of (executed_amount * sell_price / buy_price - required_buy_amount).
-
-    Returns None if solution or auction is missing or malformed.
-    """
-    if solution is None or auction is None:
-        return None
-    trades = solution.get("trades") or []
-    prices = solution.get("prices") or {}
-    orders = {o.get("uid"): o for o in auction.get("orders", [])}
-    total = 0
-    for trade in trades:
-        uid = trade.get("orderUid") or trade.get("order_uid")
-        order = orders.get(uid)
-        if order is None:
-            continue
-        executed = int(trade.get("executedAmount") or trade.get("executed_amount") or 0)
-        sell_token = (order.get("sellToken") or order.get("sell_token") or "").lower()
-        buy_token = (order.get("buyToken") or order.get("buy_token") or "").lower()
-        sell_price_raw = prices.get(sell_token) or prices.get(sell_token.lower())
-        buy_price_raw = prices.get(buy_token) or prices.get(buy_token.lower())
-        # Prices in Solution can be strings or ints
-        try:
-            sell_price = int(sell_price_raw) if sell_price_raw is not None else None
-            buy_price = int(buy_price_raw) if buy_price_raw is not None else None
-        except (ValueError, TypeError):
-            continue
-        if sell_price is None or buy_price is None or buy_price == 0:
-            continue
-        required_buy = int(order.get("buyAmount") or order.get("buy_amount") or 0)
-        # Approximate: executed_buy = executed * sell_price / buy_price
-        executed_buy = (executed * sell_price) // buy_price
-        total += executed_buy - required_buy
-    return total
-
 
 async def analyze(window: AnalysisWindow) -> Summary:
     Session = get_session_factory()
@@ -154,28 +115,33 @@ async def analyze(window: AnalysisWindow) -> Summary:
         )
         n_solved_any = n_solved_q.scalar() or 0
 
-        # Surplus delta — needs per-auction join
-        delta_q = await session.execute(
+        # Score comparison — use CIP-14 our_score_wei vs winner score.
+        # Best solution per auction = highest our_score_wei among solved rows.
+        score_q = await session.execute(
             select(
-                ShadowAuction.raw_auction,
-                ShadowSolution.solution,
-                ShadowWinner.raw_solution,
+                ShadowSolution.auction_id,
+                func.max(ShadowSolution.our_score_wei).label("best_our_score"),
+                ShadowWinner.score.label("winner_score"),
             )
-            .select_from(ShadowAuction)
-            .join(ShadowSolution, ShadowSolution.auction_id == ShadowAuction.auction_id)
-            .join(ShadowWinner, ShadowWinner.auction_id == ShadowAuction.auction_id)
+            .select_from(ShadowSolution)
+            .join(ShadowAuction, ShadowAuction.auction_id == ShadowSolution.auction_id)
+            .join(ShadowWinner, ShadowWinner.auction_id == ShadowSolution.auction_id)
             .where(ShadowAuction.polled_at >= window.since)
             .where(ShadowAuction.polled_at <= window.until)
             .where(ShadowSolution.status == "solved")
+            .where(ShadowSolution.our_score_wei.is_not(None))
+            .where(ShadowWinner.score.is_not(None))
+            .group_by(ShadowSolution.auction_id, ShadowWinner.score)
         )
         deltas: list[float] = []
         n_positive = 0
-        for raw_auction, our_solution, winner_solution in delta_q.all():
-            ours = _compute_solution_surplus(our_solution, raw_auction)
-            theirs = _compute_solution_surplus(winner_solution, raw_auction)
-            if ours is None or theirs is None:
+        for _aid, best_ours, winner_score in score_q.all():
+            try:
+                ours_f = float(best_ours)
+                theirs_f = float(winner_score)
+            except (TypeError, ValueError):
                 continue
-            d = float(ours - theirs)
+            d = ours_f - theirs_f
             deltas.append(d)
             if d > 0:
                 n_positive += 1
@@ -229,10 +195,12 @@ def format_summary(summary: Summary) -> str:
         )
     lines.append("")
     if summary.surplus_delta_mean is not None:
-        lines.append(f"Hypothetical wins (delta>0):  {summary.n_positive_delta}")
-        lines.append(f"Win-rate (hypothetical):      {summary.win_rate_hypothetical:.1%}")
-        lines.append(f"Mean surplus delta:           {summary.surplus_delta_mean:+.2e}")
-        lines.append(f"Median surplus delta:         {summary.surplus_delta_median:+.2e}")
+        ETH = 1e18
+        lines.append("Score comparison (CIP-14, vs winner):")
+        lines.append(f"  Hypothetical wins (our > winner): {summary.n_positive_delta}")
+        lines.append(f"  Win-rate (hypothetical):          {summary.win_rate_hypothetical:.1%}")
+        lines.append(f"  Mean  delta:  {summary.surplus_delta_mean/ETH:+.6f} ETH")
+        lines.append(f"  Median delta: {summary.surplus_delta_median/ETH:+.6f} ETH")  # type: ignore[operator]
     else:
-        lines.append("Surplus delta: no comparable batches yet.")
+        lines.append("Score comparison: no scored solutions yet (backfill_scores.py not run?).")
     return "\n".join(lines)

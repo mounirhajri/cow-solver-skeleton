@@ -57,6 +57,9 @@ class ShadowSolution(Base):
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     solution: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     error: Mapped[str | None] = mapped_column(Text)
+    # CIP-14 quality score in wei (ETH-denominated surplus, same formula as
+    # cowprotocol/services driver).  NULL for no-solution / skipped rows.
+    our_score_wei: Mapped[int | None] = mapped_column(Numeric(40, 0))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 

@@ -5,6 +5,7 @@ Called from /solve via BackgroundTasks — must never raise; logs and swallows.
 
 from __future__ import annotations
 
+import contextlib
 from datetime import UTC, datetime
 from typing import Any
 
@@ -14,6 +15,11 @@ from src.log import get_logger
 from src.models.auction import Auction
 from src.persistence.db import get_session_factory
 from src.persistence.models import ShadowAuction, ShadowSolution
+from src.shadow.scoring import (
+    compute_solution_score,
+    extract_native_prices,
+    orders_by_uid_from_auction,
+)
 from src.solver.orchestrator import AttemptRecord
 
 log = get_logger(__name__)
@@ -47,7 +53,15 @@ async def persist_shadow_attempt(
                 )
             )
 
+        # Pre-compute CIP-14 scores for all attempts that produced solutions.
+        uid_map = orders_by_uid_from_auction(auction)
+        native_prices = extract_native_prices(raw_competition or {})
+
         for a in attempts:
+            score: int | None = None
+            if a.solution and uid_map and native_prices:
+                with contextlib.suppress(Exception):  # noqa: BLE001
+                    score = compute_solution_score(a.solution, uid_map, native_prices) or None
             session.add(
                 ShadowSolution(
                     auction_id=auction_id,
@@ -56,6 +70,7 @@ async def persist_shadow_attempt(
                     latency_ms=a.latency_ms,
                     solution=a.solution,
                     error=a.error,
+                    our_score_wei=score,
                 )
             )
 

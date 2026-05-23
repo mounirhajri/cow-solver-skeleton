@@ -49,6 +49,7 @@ async def session_factory(monkeypatch):
                 latency_ms INTEGER,
                 solution TEXT,
                 error TEXT,
+                our_score_wei NUMERIC,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """))
