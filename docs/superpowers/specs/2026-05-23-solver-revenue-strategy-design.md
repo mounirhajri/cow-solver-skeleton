@@ -119,6 +119,20 @@ Once RouterSolver produces real solutions, flip from shadow mode to live submiss
 
 ## Phase 3 — CoWJohnsonSolver: RF + Johnson's Cycle Finder (1–2 weeks)
 
+> **Implemented 2026-05-23 (Option B):** RF filter added as a preprocessing
+> step inside the existing `edge/matching/bipartite.py` and
+> `edge/matching/multi_party.py` solvers, NOT as a new
+> `src/solver/cow_johnson.py`. Rationale: Johnson + LP are already wired in
+> `edge/matching/multi_party.py`; only the RF pre-filter step was missing.
+> New file: `edge/matching/rf_filter.py`. Orchestrator now passes a
+> `TokenClassifier` and session factory to both edge matching solvers.
+>
+> The implementation is **inactive until operational steps run on the
+> server**: `extract_features.py` must populate `token_features`, AND
+> `train_classifier.py` must produce `/data/models/current.pkl`. Until then
+> `TokenClassifier.load().model is None` and the filter falls through as a
+> no-op — current 5 wins/day behaviour is preserved.
+
 ### Problem
 CoW ring trades (pure surplus, zero AMM cost) are missed because:
 - The order graph has 1200 nodes — Johnson's algorithm is intractable at that scale
@@ -163,8 +177,11 @@ Best non-overlapping profitable cycles → `Solution` with clearing prices and t
 ### Files
 | File | Action |
 |------|--------|
-| `src/solver/cow_johnson.py` | New — `CoWJohnsonSolver` strategy class |
-| `src/solver/orchestrator.py` | Add to chain after naive, before router |
+| `src/solver/cow_johnson.py` | DEFERRED / NOT BUILT — superseded by Option B (RF filter inside existing edge solvers) |
+| `edge/matching/rf_filter.py` | NEW — `filter_orders_by_token_quality` async pre-filter |
+| `edge/matching/bipartite.py` | Updated — `BipartiteMatcher.__init__` accepts optional `classifier`, `session_factory`, `rf_threshold` |
+| `edge/matching/multi_party.py` | Updated — `CoWMatchingSolver.__init__` same triple; RF filter runs BEFORE OTM filter |
+| `src/solver/orchestrator.py` | Updated — `load_default_strategies()` wires `TokenClassifier.load()` + `get_session_factory()` into both edge solvers |
 
 ### Chain position after Phase 3
 ```
