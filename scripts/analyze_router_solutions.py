@@ -44,6 +44,7 @@ async def analyze_router_solutions(days: int = 7) -> None:
                 ShadowSolution.status,
                 ShadowSolution.solution,
                 ShadowSolution.our_score_wei,
+                ShadowSolution.score_vs_winner_prices_wei,
                 ShadowWinner.score.label("winner_score"),
                 ShadowWinner.winner_solver,
             )
@@ -111,6 +112,36 @@ async def analyze_router_solutions(days: int = 7) -> None:
 
     wins = sum(1 for d in deltas if d > 0)
     print(f"\nHypothetical wins: {wins}/{len(scored)} ({wins / len(scored):.0%})")
+
+    # Phase 4a — winner-price comparison block
+    wp_scored = [
+        (int(r.score_vs_winner_prices_wei), int(r.winner_score))
+        for r in rows
+        if r.score_vs_winner_prices_wei is not None and r.winner_score is not None
+    ]
+    if not wp_scored:
+        print(
+            "\nscore_vs_winner_prices_wei: not yet populated "
+            "— run backfill_winner_price_scores.py"
+        )
+    else:
+        wp_ours = [s / ETH for s, _ in wp_scored]
+        wp_deltas = [(s - w) / ETH for s, w in wp_scored]
+        wp_wins = sum(1 for d in wp_deltas if d > 0)
+        print("\nCIP-14 Score @ winner prices (ETH):")
+        print(
+            f"  Ours: mean={statistics.mean(wp_ours):+.6f}  "
+            f"median={statistics.median(wp_ours):+.6f}  "
+            f"max={max(wp_ours):+.6f}"
+        )
+        print(
+            f"  Delta vs winner: mean={statistics.mean(wp_deltas):+.6f}  "
+            f"median={statistics.median(wp_deltas):+.6f}"
+        )
+        print(
+            f"Wins @ winner prices: {wp_wins}/{len(wp_scored)} "
+            f"({wp_wins / len(wp_scored):.0%})"
+        )
 
     losses = [(r, o, w) for r, o, w in scored if o < w]
     if losses:
