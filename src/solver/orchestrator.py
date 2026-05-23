@@ -167,6 +167,11 @@ def load_default_strategies() -> list[SolverStrategy]:
     # timeout, but runs alongside naive in shadow mode for comparison data.
     rpc = RpcClient(settings.rpc_arbitrum)
     multicall = Multicall3(rpc)
-    strategies.append(RouterSolver(multicall=multicall, intermediates=settings.intermediate_tokens))
+    strategies.append(RouterSolver(
+        multicall=multicall,
+        intermediates=settings.intermediate_tokens,
+        max_orders=settings.router_max_orders,
+        max_concurrent=settings.router_max_concurrent,
+    ))
 
     return strategies

@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     amm_state_lazy: bool = True
     solve_timeout_seconds: float = 13.0  # slightly below CoW's 15s deadline
 
+    # RouterSolver concurrency
+    # Arbitrum auctions have ~1200 orders; quoting all of them sequentially
+    # exhausts the 5 s per-strategy timeout. Cap to the largest orders and
+    # quote them in parallel to stay well under budget.
+    router_max_orders: int = 100      # top-N sell orders by sell_amount
+    router_max_concurrent: int = 20   # parallel RPC quote slots (semaphore)
+
     # Postgres
     database_url: str = "postgresql+asyncpg://solver:solver@localhost:5432/solver"
 

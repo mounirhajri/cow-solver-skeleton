@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -37,6 +38,8 @@ def _make_auction(orders: list[Order], auction_id: str = "1") -> Auction:
         deadline=None,
     )
 
+
+# ── Existing behaviour ────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_router_no_orders_returns_no_solution() -> None:
@@ -131,3 +134,137 @@ async def test_router_skips_buy_orders(monkeypatch: pytest.MonkeyPatch) -> None:
     result = await router.solve(auction)
     assert isinstance(result, NoSolution)
     assert not called
+
+
+# ── Order cap ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_order_cap_limits_quotes_to_top_n(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With max_orders=3, only the 3 largest sell_amount orders are quoted."""
+    quoted_amounts: list[int] = []
+
+    async def mock_quote(
+        _mc: object, _si: object, _bi: object, amount_in: int, _ints: object
+    ) -> None:
+        quoted_amounts.append(amount_in)
+        return None
+
+    monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
+
+    orders = [
+        _make_order(uid=f"o{i}", sellAmount=i * 100, buyAmount=1)
+        for i in range(1, 8)  # sell amounts: 100, 200, ..., 700
+    ]
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], max_orders=3)
+    await router.solve(_make_auction(orders))
+
+    assert sorted(quoted_amounts, reverse=True) == [700, 600, 500], (
+        "should quote only the 3 largest orders"
+    )
+
+
+@pytest.mark.asyncio
+async def test_order_cap_default_is_100(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default max_orders=100: 150 orders → only 100 quoted."""
+    call_count = 0
+
+    async def mock_quote(*args: object, **kwargs: object) -> None:
+        nonlocal call_count
+        call_count += 1
+        return None
+
+    monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
+
+    orders = [
+        _make_order(uid=f"o{i}", sellAmount=i)
+        for i in range(1, 151)  # 150 orders
+    ]
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[])
+    await router.solve(_make_auction(orders))
+
+    assert call_count == 100
+
+
+# ── Parallelism ───────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_quotes_run_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With 10 orders and max_concurrent=10, all quotes start before any finishes."""
+    started: list[int] = []
+    finished: list[int] = []
+    barrier = asyncio.Event()
+
+    async def mock_quote(
+        _mc: object, _si: object, _bi: object, amount_in: int, _ints: object
+    ) -> None:
+        started.append(amount_in)
+        await barrier.wait()  # all coroutines park here
+        finished.append(amount_in)
+        return None
+
+    monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
+
+    orders = [_make_order(uid=f"o{i}", sellAmount=i * 10) for i in range(1, 11)]
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], max_concurrent=10)
+
+    solve_task = asyncio.create_task(router.solve(_make_auction(orders)))
+
+    # Yield control so coroutines can reach the barrier
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # All 10 should have started before any finishes
+    assert len(started) == 10, f"expected 10 started, got {len(started)}"
+    assert len(finished) == 0, "none should have finished yet (barrier not released)"
+
+    barrier.set()
+    await solve_task
+
+
+@pytest.mark.asyncio
+async def test_semaphore_limits_concurrent_quotes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With max_concurrent=3, at most 3 quotes are in-flight at once."""
+    in_flight = 0
+    max_in_flight_seen = 0
+    gate = asyncio.Event()
+
+    async def mock_quote(
+        _mc: object, _si: object, _bi: object, amount_in: int, _ints: object
+    ) -> None:
+        nonlocal in_flight, max_in_flight_seen
+        in_flight += 1
+        max_in_flight_seen = max(max_in_flight_seen, in_flight)
+        await gate.wait()
+        in_flight -= 1
+        return None
+
+    monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
+
+    orders = [_make_order(uid=f"o{i}", sellAmount=i * 10) for i in range(1, 11)]
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], max_concurrent=3)
+
+    solve_task = asyncio.create_task(router.solve(_make_auction(orders)))
+
+    # Let the first wave (semaphore=3) start
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert max_in_flight_seen <= 3, (
+        f"semaphore violated: {max_in_flight_seen} quotes ran simultaneously"
+    )
+
+    gate.set()
+    await solve_task
+
+
+# ── Config integration ────────────────────────────────────────────────────────
+
+def test_config_has_router_settings() -> None:
+    from src.config import Settings
+    s = Settings()
+    assert s.router_max_orders == 100
+    assert s.router_max_concurrent == 20
