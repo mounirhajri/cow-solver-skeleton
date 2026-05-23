@@ -64,10 +64,22 @@ async def test_pool_addresses_order_invariant() -> None:
 async def test_pool_addresses_uses_7d_ttl() -> None:
     fake = _FakeRedis()
     cache = PoolCache(redis=fake)
-    await cache.set_pool_addresses("0xa", "0xb", {})
+    await cache.set_pool_addresses("0xa", "0xb", {"sushi": "0xcc"})
     assert fake.setex_calls
     _, ttl = fake.setex_calls[-1]
     assert ttl == 7 * 24 * 3600
+
+
+@pytest.mark.asyncio
+async def test_pool_addresses_empty_uses_short_negative_cache_ttl() -> None:
+    """Negative result (no pool found) is cached for 5 min, not 7 days,
+    so a newly-deployed pool becomes discoverable within minutes."""
+    fake = _FakeRedis()
+    cache = PoolCache(redis=fake)
+    await cache.set_pool_addresses("0xa", "0xb", {})
+    assert fake.setex_calls
+    _, ttl = fake.setex_calls[-1]
+    assert ttl == 5 * 60
 
 
 @pytest.mark.asyncio
