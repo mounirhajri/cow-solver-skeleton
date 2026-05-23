@@ -30,7 +30,7 @@ BASE_URL = "https://api.cow.fi/arbitrum_one/api/v1"
 # Only auctions this small are /solve-able within rate-limit safety.
 # Arbitrum auctions are typically 500-1500 orders; only small batches
 # go through the full per-order fetch path. Larger ones get metadata-only.
-MAX_ORDERS = 50
+MAX_ORDERS = 150
 
 SOLVER_URL = os.environ.get("SOLVER_INTERNAL_URL", "http://cow-solver:8000")
 SHADOW_LOG_PATH = Path(os.environ.get("SHADOW_LOG_PATH", "/data/shadow.jsonl"))
