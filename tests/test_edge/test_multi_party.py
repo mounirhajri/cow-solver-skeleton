@@ -1,7 +1,11 @@
 """Tests for CoWMatchingSolver (multi-party ring matching)."""
 import pytest
 
-from edge.matching.multi_party import CoWMatchingSolver, _has_reference_price
+from edge.matching.multi_party import (
+    CoWMatchingSolver,
+    _has_reference_price,
+    _order_in_money,
+)
 from src.models.auction import Auction, Token
 from src.models.order import Order
 from src.models.solution import Solution
@@ -61,11 +65,41 @@ def test_has_reference_price_none_price() -> None:
     assert _has_reference_price("0xA", tokens) is False
 
 
+# ── _order_in_money helper ────────────────────────────────────────────────────
+
+def test_order_in_money_when_surplus() -> None:
+    """sell_amount * p_sell > buy_amount * p_buy → in the money."""
+    tokens = {"A": _mk_token(price=10**18), "B": _mk_token(price=10**18)}
+    order = _mk_order("o1", "A", "B", sell_amount=1000, buy_amount=900)
+    assert _order_in_money(order, tokens) is True
+
+
+def test_order_in_money_at_exact_parity() -> None:
+    """sell_amount * p_sell == buy_amount * p_buy → still in the money (equality)."""
+    tokens = {"A": _mk_token(price=10**18), "B": _mk_token(price=10**18)}
+    order = _mk_order("o1", "A", "B", sell_amount=1000, buy_amount=1000)
+    assert _order_in_money(order, tokens) is True
+
+
+def test_order_not_in_money() -> None:
+    """sell_amount * p_sell < buy_amount * p_buy → out of the money."""
+    tokens = {"A": _mk_token(price=10**18), "B": _mk_token(price=10**18)}
+    order = _mk_order("o1", "A", "B", sell_amount=900, buy_amount=1000)
+    assert _order_in_money(order, tokens) is False
+
+
+def test_order_not_in_money_when_unpriced() -> None:
+    """Missing reference price → not viable (same as False)."""
+    tokens: dict[str, Token] = {}
+    order = _mk_order("o1", "A", "B", sell_amount=1000, buy_amount=900)
+    assert _order_in_money(order, tokens) is False
+
+
 # ── Happy path ────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_3_ring_produces_solution() -> None:
-    """A → B → C → A ring with priced tokens should yield a solution."""
+    """A → B → C → A ring with in-money orders should yield a solution."""
     orders = [
         _mk_order("o1", "0xA", "0xB"),
         _mk_order("o2", "0xB", "0xC"),
@@ -118,27 +152,76 @@ async def test_buy_orders_are_excluded() -> None:
     ]
     tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
     solver = CoWMatchingSolver()
-    # Only 2 sell orders — can't form a 3-ring
     result = await solver.solve(_mk_auction(orders, tokens))
     assert isinstance(result, NoSolution)
 
 
-# ── Unpriced token filtering (the root cause of 0/171) ────────────────────────
+# ── Out-of-the-money filter (the real root cause of 0/192) ───────────────────
+
+@pytest.mark.asyncio
+async def test_otm_orders_excluded_from_graph() -> None:
+    """Out-of-the-money orders must not enter the ring graph.
+
+    In real auctions ~1 000+ orders are out-of-the-money at reference prices.
+    Any ring containing such an order is mathematically infeasible (the LP's
+    ring-balance constraint forces a common settlement value V, which cannot
+    simultaneously satisfy both an OTM buy requirement and an ITM sell bound).
+
+    The 3-ring here has o3 asking for more than reference prices can provide
+    (sell_amount * p_sell < buy_amount * p_buy). The graph should drop o3,
+    leaving only 2 in-money orders — not enough for a 3-ring → NoSolution.
+    """
+    tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
+    orders = [
+        _mk_order("o1", "0xA", "0xB", sell_amount=1000, buy_amount=900),   # ITM
+        _mk_order("o2", "0xB", "0xC", sell_amount=1000, buy_amount=900),   # ITM
+        _mk_order("o3", "0xC", "0xA", sell_amount=900, buy_amount=2000),   # OTM
+    ]
+    solver = CoWMatchingSolver()
+    result = await solver.solve(_mk_auction(orders, tokens))
+    assert isinstance(result, NoSolution)
+
+
+@pytest.mark.asyncio
+async def test_otm_orders_mixed_with_valid_ring() -> None:
+    """OTM orders are silently dropped; valid ITM ring still produces a solution.
+
+    This mirrors the real production case: 1095 orders, ~26 ITM.  The solver
+    should only operate on ITM orders and find the ring among them.
+    """
+    tokens = {
+        "0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token(),
+        "0xX": _mk_token(), "0xY": _mk_token(),
+    }
+    itm_ring = [
+        _mk_order("o1", "0xA", "0xB", sell_amount=1000, buy_amount=900),
+        _mk_order("o2", "0xB", "0xC", sell_amount=1000, buy_amount=900),
+        _mk_order("o3", "0xC", "0xA", sell_amount=1000, buy_amount=900),
+    ]
+    # OTM orders mixed in (asking 10x more than reference prices allow)
+    otm_noise = [
+        _mk_order("n1", "0xX", "0xY", sell_amount=100, buy_amount=100_000),
+        _mk_order("n2", "0xY", "0xX", sell_amount=100, buy_amount=100_000),
+        _mk_order("n3", "0xA", "0xC", sell_amount=100, buy_amount=100_000),
+    ]
+    solver = CoWMatchingSolver()
+    result = await solver.solve(_mk_auction(itm_ring + otm_noise, tokens))
+    assert isinstance(result, Solution)
+    solved_uids = {t.order_uid for t in result.trades}
+    assert solved_uids == {"o1", "o2", "o3"}
+    assert not solved_uids.intersection({"n1", "n2", "n3"})
+
+
+# ── Unpriced token filtering ──────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_unpriced_ring_tokens_yield_no_solution() -> None:
-    """If all ring tokens lack reference prices, all rings are infeasible → NoSolution.
-
-    Before the fix, the graph was built from ALL orders regardless of pricing,
-    producing rings that the LP immediately rejects. After the fix, such orders
-    are not added to the graph at all.
-    """
+    """Orders with unpriced tokens are treated as OTM → NoSolution."""
     orders = [
         _mk_order("o1", "0xX", "0xY"),
         _mk_order("o2", "0xY", "0xZ"),
         _mk_order("o3", "0xZ", "0xX"),
     ]
-    # No reference prices for any of these tokens
     tokens: dict[str, Token] = {}
     solver = CoWMatchingSolver()
     result = await solver.solve(_mk_auction(orders, tokens))
@@ -146,57 +229,14 @@ async def test_unpriced_ring_tokens_yield_no_solution() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mixed_priced_unpriced_uses_only_priced_orders() -> None:
-    """Orders with priced tokens form a ring; unpriced orders are ignored.
-
-    Ring o1→o2→o3 uses priced tokens and should yield a solution.
-    Orders o4→o5 use unpriced tokens and should be silently dropped.
-    """
-    # Priced ring: A→B→C→A
-    priced = [
-        _mk_order("o1", "0xA", "0xB"),
-        _mk_order("o2", "0xB", "0xC"),
-        _mk_order("o3", "0xC", "0xA"),
-    ]
-    # Unpriced pair (no reference_price in tokens dict)
-    unpriced = [
-        _mk_order("o4", "0xX", "0xY"),
-        _mk_order("o5", "0xY", "0xX"),
-    ]
-    tokens = {
-        "0xA": _mk_token(),
-        "0xB": _mk_token(),
-        "0xC": _mk_token(),
-        # 0xX and 0xY intentionally absent
-    }
-    solver = CoWMatchingSolver()
-    result = await solver.solve(_mk_auction(priced + unpriced, tokens))
-    assert isinstance(result, Solution)
-    solved_uids = {t.order_uid for t in result.trades}
-    # Only the priced ring should be in the solution
-    assert solved_uids == {"o1", "o2", "o3"}
-    assert "o4" not in solved_uids
-    assert "o5" not in solved_uids
-
-
-@pytest.mark.asyncio
 async def test_partially_priced_ring_is_excluded() -> None:
-    """A ring where only some tokens are priced should not produce a solution.
-
-    o1 (A→B), o2 (B→C), o3 (C→A): B is unpriced.
-    The graph filter drops o1 and o2 (B appears as buy/sell), leaving too few
-    priced orders to form a ring.
-    """
+    """A ring where one token is unpriced → that order is OTM → no ring forms."""
     orders = [
-        _mk_order("o1", "0xA", "0xB"),  # 0xB unpriced
-        _mk_order("o2", "0xB", "0xC"),  # 0xB unpriced
+        _mk_order("o1", "0xA", "0xB"),  # 0xB unpriced → OTM
+        _mk_order("o2", "0xB", "0xC"),  # 0xB unpriced → OTM
         _mk_order("o3", "0xC", "0xA"),
     ]
-    tokens = {
-        "0xA": _mk_token(),
-        # 0xB: no entry → unpriced
-        "0xC": _mk_token(),
-    }
+    tokens = {"0xA": _mk_token(), "0xC": _mk_token()}  # 0xB absent
     solver = CoWMatchingSolver()
     result = await solver.solve(_mk_auction(orders, tokens))
     assert isinstance(result, NoSolution)
@@ -206,11 +246,7 @@ async def test_partially_priced_ring_is_excluded() -> None:
 
 @pytest.mark.asyncio
 async def test_ring_at_exact_limit_price_is_feasible() -> None:
-    """An order where buy_amount == sell_amount (no surplus) should still be fillable.
-
-    The LP solution is exactly at the limit price boundary. Before the tolerance
-    fix, float truncation could drop below it and reject the ring.
-    """
+    """buy_amount == sell_amount (zero surplus) is treated as ITM and attempted."""
     orders = [
         _mk_order("o1", "0xA", "0xB", sell_amount=1000, buy_amount=1000),
         _mk_order("o2", "0xB", "0xC", sell_amount=1000, buy_amount=1000),
@@ -219,5 +255,4 @@ async def test_ring_at_exact_limit_price_is_feasible() -> None:
     tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
     solver = CoWMatchingSolver()
     result = await solver.solve(_mk_auction(orders, tokens))
-    # May or may not produce a solution at zero-surplus — key is it doesn't crash
     assert isinstance(result, (Solution, NoSolution))
