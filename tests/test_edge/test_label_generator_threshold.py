@@ -1,6 +1,4 @@
 """Test dynamic WINS_FOR_LEGIT threshold in label_generator."""
-import pytest
-
 from edge.classifier.label_generator import (
     WINS_FOR_LEGIT_COLD_START,
     WINS_FOR_LEGIT_MATURE,
