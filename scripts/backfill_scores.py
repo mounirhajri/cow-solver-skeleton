@@ -112,6 +112,19 @@ async def backfill(dry_run: bool = False, batch_size: int = 500) -> None:
 
             native_prices = extract_native_prices(raw_competition or {})
 
+            # Fallback: raw_competition often lacks auction.prices for shadow rows.
+            # raw_auction always contains tokens[addr].referencePrice (stored by
+            # persist_shadow_attempt from the Auction model). Use that instead —
+            # same values persist.py uses when raw_competition is unavailable.
+            if not native_prices:
+                for addr, tok in (raw_auction or {}).get("tokens", {}).items():
+                    ref = tok.get("referencePrice") or tok.get("reference_price")
+                    if ref:
+                        try:
+                            native_prices[addr.lower()] = int(ref)
+                        except (ValueError, TypeError):
+                            pass
+
             # Try orders from raw_auction first (fast path)
             uid_map = orders_by_uid_from_auction(raw_auction or {})
 
