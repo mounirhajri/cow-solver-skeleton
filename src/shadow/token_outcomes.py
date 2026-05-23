@@ -35,12 +35,27 @@ def extract_token_outcomes(
         if isinstance(token_addr, str):
             tokens.add(token_addr.lower())
 
-    winner_tokens = {
-        k.lower() for k in (winner_solution or {}).get("prices", {})
-    }
-    ours_tokens = {
-        k.lower() for k in (our_solution or {}).get("prices", {})
-    }
+    # CoW API uses "clearingPrices" (camelCase); our solver returns "prices".
+    # Accept both, plus the orders array as additional signal.
+    def _winner_tokens(sol: dict[str, Any] | None) -> set[str]:
+        if not sol:
+            return set()
+        toks: set[str] = set()
+        for key in ("prices", "clearingPrices"):
+            for k in sol.get(key, {}) or {}:
+                if isinstance(k, str):
+                    toks.add(k.lower())
+        # Fall back to orders' tokens if no clearing prices recorded
+        for o in sol.get("orders", []) or []:
+            if isinstance(o, dict):
+                for tk_key in ("sellToken", "buyToken", "sell_token", "buy_token"):
+                    val = o.get(tk_key)
+                    if isinstance(val, str):
+                        toks.add(val.lower())
+        return toks
+
+    winner_tokens = _winner_tokens(winner_solution)
+    ours_tokens = _winner_tokens(our_solution)
 
     return [
         {
