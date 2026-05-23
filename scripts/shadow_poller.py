@@ -2,8 +2,9 @@
 
 Replaces the cow-shadow-driver binary (which removed --shadow mode in recent versions).
 Polls solver_competition/latest from the public CoW Orderbook API, reconstructs a
-minimal auction payload from order UIDs, calls our solver, and logs results with
-winner comparison — no solver registration required.
+full auction payload by batch-fetching order details via POST /orders/by_uids (128
+per request), calls our solver, and logs results with winner comparison — no solver
+registration required.
 
 Uses urllib (not httpx) for CoW API calls — the CoW API blocks httpx's TLS fingerprint
 but accepts curl/urllib connections.
@@ -27,10 +28,10 @@ from scripts.liveness import touch_liveness
 from src.shadow.persist import persist_skipped_auction_safe, persist_winner_and_outcomes_safe
 
 BASE_URL = "https://api.cow.fi/arbitrum_one/api/v1"
-# Only auctions this small are /solve-able within rate-limit safety.
-# Arbitrum auctions are typically 500-1500 orders; only small batches
-# go through the full per-order fetch path. Larger ones get metadata-only.
-MAX_ORDERS = 150
+# Max UIDs per POST /orders/by_uids call (API limit).
+BY_UIDS_BATCH_SIZE = 128
+# Solver timeout — full 1200-order auctions may take longer than small batches.
+SOLVER_TIMEOUT = 30.0
 
 SOLVER_URL = os.environ.get("SOLVER_INTERNAL_URL", "http://cow-solver:8000")
 SHADOW_LOG_PATH = Path(os.environ.get("SHADOW_LOG_PATH", "/data/shadow.jsonl"))
@@ -84,31 +85,68 @@ def _urllib_get(url: str) -> "dict[str, Any] | None":
         raise
 
 
+def _urllib_post_json(url: str, body: list[str]) -> "list[Any]":
+    """POST a JSON body and return the parsed response list."""
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"User-Agent": _UA, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, context=_SSL_CTX, timeout=30) as resp:
+            result: list[Any] = json.loads(resp.read())
+            return result
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise RateLimitedError(url) from e
+        raise
+
+
 async def _cow_get(url: str) -> "dict[str, Any] | None":
     return await asyncio.to_thread(_urllib_get, url)
 
 
-async def _fetch_order(uid: str) -> "dict[str, Any] | None":
-    try:
-        return await _cow_get(f"{BASE_URL}/orders/{uid}")
-    except RateLimitedError:
-        raise
-    except Exception:
-        return None
+async def _fetch_orders_by_uids(uids: list[str]) -> list[dict[str, Any]]:
+    """Batch-fetch full order objects for a list of UIDs.
+
+    Uses POST /orders/by_uids with batches of BY_UIDS_BATCH_SIZE (128).
+    Returns only successfully fetched orders (skips error entries).
+    Raises RateLimitedError if any batch hits HTTP 429.
+    """
+    if not uids:
+        return []
+
+    url = f"{BASE_URL}/orders/by_uids"
+    chunks = [uids[i : i + BY_UIDS_BATCH_SIZE] for i in range(0, len(uids), BY_UIDS_BATCH_SIZE)]
+
+    # Fetch all chunks concurrently
+    batch_results: list[list[Any]] = await asyncio.gather(
+        *[asyncio.to_thread(_urllib_post_json, url, chunk) for chunk in chunks]
+    )
+
+    orders: list[dict[str, Any]] = []
+    for batch in batch_results:
+        for item in batch:
+            if "order" in item:
+                orders.append(item["order"])
+            # items with "error" key are silently skipped (expired/unknown UIDs)
+
+    return orders
 
 
 async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
-    """Poll for the latest auction, persist metadata, and optionally call /solve.
+    """Poll for the latest auction, batch-fetch all orders, and call /solve.
 
     Always persists: shadow_auction row + winner + per-token outcomes derived from
-    the competition response (no per-order fetches needed for this path).
+    the competition response.
 
-    Conditionally calls /solve: only when ``len(orders) <= MAX_ORDERS``.  For
-    larger auctions a ``poller-skipped`` row is written to ``shadow_solutions`` so
-    the analyzer knows we saw the auction but did not attempt a solution.
+    Fetches all orders via POST /orders/by_uids (128 UIDs per request, concurrent
+    batches) — eliminates the former MAX_ORDERS cap that blocked all Arbitrum
+    auctions (~1200 orders each).
 
-    Returns ``"ok"`` for every successfully processed auction (whether or not
-    /solve was called) and ``"rate_limited"`` if CoW API returned HTTP 429.
+    Returns ``"ok"`` on success and ``"rate_limited"`` if CoW API returned HTTP 429.
     """
     try:
         comp = await _cow_get(f"{BASE_URL}/solver_competition/latest")
@@ -130,8 +168,6 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
         str(k): str(v) for k, v in (auction_data.get("prices") or {}).items()
     }
 
-    # Build a skeleton auction payload from competition metadata alone.
-    # orders[] will be populated below only if len(uids) <= MAX_ORDERS.
     tokens = {
         addr: {
             "decimals": 18,
@@ -152,50 +188,64 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
 
     our_solution = None
 
-    if len(uids) <= MAX_ORDERS:
-        # Small enough — fetch each order and call /solve
+    if uids:
         try:
-            orders = [
-                o
-                for o in await asyncio.gather(*[_fetch_order(uid) for uid in uids])
-                if o is not None
-            ]
+            orders = await _fetch_orders_by_uids(uids)
         except RateLimitedError as exc:
             log.warning("rate_limited", extra={"url": str(exc)})
+            # Persist what we have (metadata only) and record as skipped
+            await persist_winner_and_outcomes_safe(
+                auction_id=auction_id,
+                raw_competition=comp,
+                auction_payload=auction_payload,
+                our_solution=None,
+            )
+            await persist_skipped_auction_safe(
+                auction_id=auction_id,
+                auction_payload=auction_payload,
+                raw_competition=comp,
+                n_orders=len(uids),
+            )
             return "rate_limited"
+        except Exception as exc:
+            log.warning(
+                "order_fetch_failed",
+                extra={"auction_id": auction_id, "n_uids": len(uids), "error": str(exc)},
+            )
+            orders = []
 
         auction_payload["orders"] = orders
 
-        try:
-            resp = await solver.post(
-                f"{SOLVER_URL}/solve", json=auction_payload, timeout=14.0
-            )
-            if resp.status_code == 200:
-                our_solution = resp.json()
-        except Exception as exc:
-            log.warning("solver_call_failed", extra={"auction_id": auction_id, "error": str(exc)})
-    else:
-        log.info(
-            "auction_too_large_to_solve",
-            extra={"auction_id": auction_id, "n_orders": len(uids)},
-        )
+        if orders:
+            try:
+                resp = await solver.post(
+                    f"{SOLVER_URL}/solve", json=auction_payload, timeout=SOLVER_TIMEOUT
+                )
+                if resp.status_code == 200:
+                    our_solution = resp.json()
+            except Exception as exc:
+                log.warning(
+                    "solver_call_failed",
+                    extra={"auction_id": auction_id, "error": str(exc)},
+                )
 
-    # Always: persist winner + token outcomes from the competition response
+    log.info(
+        "auction_processed",
+        extra={
+            "auction_id": auction_id,
+            "n_uids": len(uids),
+            "orders_fetched": len(auction_payload["orders"]),
+            "solved": our_solution is not None,
+        },
+    )
+
+    # Always persist winner + token outcomes from the competition response
     await persist_winner_and_outcomes_safe(
         auction_id=auction_id,
         raw_competition=comp,
         auction_payload=auction_payload,
         our_solution=our_solution,
     )
-
-    # For large auctions: also write a poller-skipped solution row
-    if len(uids) > MAX_ORDERS:
-        await persist_skipped_auction_safe(
-            auction_id=auction_id,
-            auction_payload=auction_payload,
-            raw_competition=comp,
-            n_orders=len(uids),
-        )
 
     # JSONL backup
     solutions: list[dict[str, Any]] = list(comp.get("solutions") or [])
@@ -205,7 +255,8 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
     entry = {
         "auction_id": str(auction_id),
         "timestamp": datetime.now(UTC).isoformat(),
-        "orders_sampled": len(auction_payload["orders"]),
+        "n_uids": len(uids),
+        "orders_fetched": len(auction_payload["orders"]),
         "our_solution": our_solution,
         "winner_solution": (
             {"solver": winner["solver"], "score": winner.get("score")}
@@ -216,16 +267,6 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
     SHADOW_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with SHADOW_LOG_PATH.open("a") as f:
         f.write(json.dumps(entry) + "\n")
-
-    log.info(
-        "auction_processed",
-        extra={
-            "auction_id": auction_id,
-            "orders_sampled": len(auction_payload["orders"]),
-            "solved": our_solution is not None,
-            "winner": winner["solver"] if winner else None,
-        },
-    )
 
     touch_liveness(LIVENESS_PATH)
     return "ok"
@@ -257,8 +298,7 @@ async def main() -> None:
                     extra={"current": round(delay, 1), "reason": "exception"},
                 )
             # Touch liveness AFTER the cycle — proves we got through poll_once
-            # without infinite-hanging. This fixes the code-review concern from
-            # Task 0.1 where the touch was at the top of the loop.
+            # without infinite-hanging.
             touch_liveness(LIVENESS_PATH)
             await asyncio.sleep(delay)
 
