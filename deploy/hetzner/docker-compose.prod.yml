@@ -83,3 +83,4 @@ services:
 networks:
   stack:
     external: true
+    name: stack_stack
