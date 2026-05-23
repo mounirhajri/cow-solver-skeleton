@@ -27,12 +27,12 @@ async def analyze() -> None:
         n_features = (await session.execute(select(func.count()).select_from(TokenFeatures))).scalar()
         n_with_tvl = (
             await session.execute(
-                select(func.count()).where(TokenFeatures.tvl_usd.is_not(None))
+                select(func.count()).select_from(TokenFeatures).where(TokenFeatures.tvl_usd.is_not(None))
             )
         ).scalar()
         n_with_holder = (
             await session.execute(
-                select(func.count()).where(TokenFeatures.holder_count.is_not(None))
+                select(func.count()).select_from(TokenFeatures).where(TokenFeatures.holder_count.is_not(None))
             )
         ).scalar()
         distinct_tokens = (
