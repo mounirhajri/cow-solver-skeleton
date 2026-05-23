@@ -84,6 +84,13 @@ async def backfill(dry_run: bool = False, batch_size: int = 500) -> None:
     async with httpx.AsyncClient() as client:
         for sol_id, auction_id, solution, raw_auction, raw_competition in rows:
             try:
+                # Guard: JSON null deserialises to Python None even when
+                # the SQL column is NOT NULL – skip non-dict solutions.
+                if not isinstance(solution, dict):
+                    zero_count += 1
+                    updates.append({"id": sol_id, "our_score_wei": None})
+                    continue
+
                 native_prices = extract_native_prices(raw_competition or {})
 
                 # Try orders from raw_auction first (fast path)
