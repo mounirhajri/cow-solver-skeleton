@@ -125,20 +125,71 @@ are subtle (the protocol clamps to `buyAmount`).
 ## Phase 4 — Integration test + live verification (~1 d)
 
 ### Test
-- Add a fixture auction from shadow JSONL with a known
-  `partiallyFillable=true` order whose full-fill misses limit but 70 %
-  clears. Run full strategy chain. Assert exactly one Solution emitted with
-  `executedAmount < sellAmount`.
+
+`tests/test_solver/test_partial_fills_integration.py` — two new tests:
+
+1. **`test_partial_fillable_sell_emits_partial_solution_end_to_end`** —
+   `partiallyFillable=True` sell order, full(1000)→800 miss, 0.75x(750)→700
+   clears. Asserts `Solution` with `executed_amount=750` (< `sell_amount=1000`).
+
+2. **`test_non_partial_sell_full_miss_emits_no_solution_end_to_end`** —
+   identical AMM mock, `partiallyFillable=False`. Asserts `NoSolution`
+   (regression guard: partial-quote-search must not fire for non-partial orders).
+
+Both tests run through `RouterSolver._solve_v3_batched` (Phase 3) with a
+mocked `batched_v3_quote`. Bipartite / multi-party integration tests are NOT
+included — those strategies require the `edge` submodule (LP solver + ring LP);
+a separate suite should cover them once `edge` is installed in CI.
 
 ### Live verification
-After deploy, query:
-```sql
-SELECT strategy, COUNT(*),
-       ROUND(100.0 * AVG(executed::numeric / signed::numeric), 1) AS avg_pct_filled
-FROM ...  -- see spec for full query
-```
 
-Should see non-zero rows where `executed < signed`. Absence = dead code path.
+Run this query **after** `feat/partial-fills` deploys to production. It scans
+the last 24 hours of shadow data and returns one row per strategy where the
+router emitted a partial fill (`executedAmount < sellAmount / buyAmount`).
+Non-zero `n_partial_emissions` with `avg_pct_filled` in the 50–90 % range
+confirms the code path is alive. Absence of any row means the partial-fill
+emission path is dead — either the deploy failed or the rounding/flag check
+is broken.
+
+```sql
+-- Run AFTER feat/partial-fills deploys to prod. Confirms the partial-fill
+-- emission path is alive in real shadow data. Absence of any row =
+-- dead code path; presence with sensible avg_pct_filled (~50-90%) = working.
+SELECT
+  strategy,
+  COUNT(*) AS n_partial_emissions,
+  MIN(executed_amount) AS min_executed,
+  MAX(executed_amount) AS max_executed
+FROM (
+  SELECT
+    s.strategy,
+    (t->>'executedAmount')::numeric AS executed_amount,
+    (t->>'orderUid') AS uid
+  FROM shadow_solutions s,
+       jsonb_array_elements(s.solution::jsonb->'trades') t
+  WHERE s.created_at > now() - interval '24 hours'
+    AND s.status = 'solved'
+    AND s.strategy IN ('router-v2', 'cow-matching-bipartite', 'cow-matching-multi-party')
+) e
+JOIN (
+  SELECT
+    (o->>'uid') AS uid,
+    (o->>'sellAmount')::numeric AS sell_amount,
+    (o->>'buyAmount')::numeric AS buy_amount,
+    (o->>'kind') AS kind
+  FROM shadow_auctions a,
+       jsonb_array_elements(a.raw_auction::jsonb->'orders') o
+  WHERE a.polled_at > now() - interval '24 hours'
+    AND (o->>'partiallyFillable')::bool = true
+) ord ON ord.uid = e.uid
+WHERE
+  -- For sell-kind orders, executed is the sell side; for buy-kind, the buy side.
+  (ord.kind = 'sell' AND e.executed_amount < ord.sell_amount)
+  OR
+  (ord.kind = 'buy' AND e.executed_amount < ord.buy_amount)
+GROUP BY strategy
+ORDER BY n_partial_emissions DESC;
+```
 
 ## Open questions (carry from spec)
 
