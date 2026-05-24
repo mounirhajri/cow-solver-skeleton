@@ -567,3 +567,113 @@ def test_config_has_v3_only_batched_default() -> None:
     from src.config import Settings
     s = Settings()
     assert s.router_v3_only_batched is True
+
+
+# ── Buy-order support (V3-batched only) ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_router_emits_buy_order_with_quoteexactoutput(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Buy order: quoter returns amount_in=900 ≤ sell_amount=1000 → emit trade
+    with executedAmount=buy_amount and clearing-price ratio matching the AMM.
+
+    Verifies (a) buy orders survive solve()'s sort/cap, (b) exact_output is
+    set on emitted paths, (c) executedAmount equals buy_amount per CoW
+    convention (matches src.shadow.scoring._score_buy_trade which reads
+    executed as the buy-side exact amount).
+    """
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    received_paths: list[V3Path] = []
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        received_paths.extend(paths)
+        # amount_out field carries amountIn for exact_output paths;
+        # return 900 (less than sell_amount=1000) on the first one.
+        return [
+            V3BatchedQuote(path=p, amount_out=900 if i == 0 else 0)
+            for i, p in enumerate(paths)
+        ]
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    order = _make_order(kind="buy", sellAmount=1000, buyAmount=500)
+    result = await router.solve(_make_auction([order], auction_id="42"))
+
+    assert all(p.exact_output for p in received_paths), (
+        "buy order paths must carry exact_output=True"
+    )
+    assert all(p.amount_in == 500 for p in received_paths), (
+        "buy order paths must encode buy_amount as the exact amount"
+    )
+    assert isinstance(result, Solution)
+    assert len(result.trades) == 1
+    assert result.trades[0].order_uid == "o1"
+    assert result.trades[0].executed_amount == 500, (
+        "executedAmount for buy orders is buy_amount (the exact side)"
+    )
+    # Fallback clearing prices (no reference prices in this auction) preserve
+    # the AMM's executed ratio: cp_sell/cp_buy = buy_amount/amount_in.
+    assert result.prices["0xa"] == 500  # buy_amount as price of sell-token
+    assert result.prices["0xb"] == 900  # amount_in as price of buy-token
+
+
+@pytest.mark.asyncio
+async def test_router_skips_buy_when_amount_in_exceeds_sell_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Buy order: quoter says we need 1100 sell-token but user only signed
+    away 1000 → no trade emitted (limit violated)."""
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        return [V3BatchedQuote(path=p, amount_out=1100) for p in paths]
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    order = _make_order(kind="buy", sellAmount=1000, buyAmount=500)
+    result = await router.solve(_make_auction([order]))
+    assert isinstance(result, NoSolution)
+
+
+@pytest.mark.asyncio
+async def test_buy_and_sell_mixed_auction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mixed auction: 1 sell + 1 buy, both quoteable, both emitted with the
+    correct executedAmount semantic per kind."""
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        # Sell paths (exact_output=False): return 1100 (> buy_amount=900) ⇒ fillable.
+        # Buy paths (exact_output=True):   return 800  (< sell_amount=1000) ⇒ fillable.
+        out: list[V3BatchedQuote] = []
+        for p in paths:
+            amt = 800 if p.exact_output else 1100
+            out.append(V3BatchedQuote(path=p, amount_out=amt))
+        return out
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    sell = _make_order(uid="s1", kind="sell", sellAmount=1000, buyAmount=900)
+    buy = _make_order(uid="b1", kind="buy", sellAmount=1000, buyAmount=500)
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    result = await router.solve(_make_auction([sell, buy]))
+
+    assert isinstance(result, Solution)
+    assert len(result.trades) == 2
+    by_uid = {t.order_uid: t for t in result.trades}
+    assert by_uid["s1"].executed_amount == 1000  # sell: sellAmount (exact)
+    assert by_uid["b1"].executed_amount == 500   # buy:  buyAmount  (exact)

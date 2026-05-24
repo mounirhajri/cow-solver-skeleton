@@ -8,6 +8,11 @@ encoding every candidate path's `quoteExactInputSingle` or
 `quoteExactInput` calldata up front and submitting all of them as one
 Multicall3 batch.
 
+Exact-output (buy-order) variants are supported via the ``exact_output``
+flag on ``V3Path``: same multicall machinery, different selector and
+(for multi-hop) reversed path-byte ordering per Uniswap v3-periphery
+``SwapRouter.exactOutput`` convention.
+
 V2 is deliberately omitted from this code path — on Arbitrum the V2 edge
 is negligible and the RPC budget is the bottleneck.
 """
@@ -30,11 +35,25 @@ log = get_logger(__name__)
 
 # keccak256("quoteExactInput(bytes,uint256)")[:4] = cdca1753 (verified)
 QUOTE_EXACT_INPUT_SELECTOR = "cdca1753"
+# keccak256("quoteExactOutputSingle((address,address,uint256,uint24,uint160))")[:4]
+# = bd21704a  (QuoterV2 ABI, exact-output single-hop; verified)
+QUOTE_EXACT_OUTPUT_SINGLE_SELECTOR = "bd21704a"
+# keccak256("quoteExactOutput(bytes,uint256)")[:4] = 2f80bb1d (QuoterV2 ABI; verified)
+QUOTE_EXACT_OUTPUT_SELECTOR = "2f80bb1d"
 
 
 @dataclass(frozen=True)
 class V3Path:
-    """One candidate quote path: direct single-hop, or 2-hop via an intermediate."""
+    """One candidate quote path: direct single-hop, or 2-hop via an intermediate.
+
+    ``token_in`` / ``token_out`` always refer to the swap direction from the
+    user's perspective (sell-token → buy-token).
+
+    When ``exact_output=False`` (default, sell orders), ``amount_in`` is the
+    exact input — passed to ``quoteExactInput[Single]``. When
+    ``exact_output=True`` (buy orders), ``amount_in`` is the exact OUTPUT —
+    passed to ``quoteExactOutput[Single]``; the quoter returns ``amountIn``.
+    """
 
     order_uid: str
     token_in: str
@@ -43,12 +62,15 @@ class V3Path:
     fee_tier_in: int
     intermediate: str | None = None
     fee_tier_out: int | None = None
+    exact_output: bool = False
 
 
 @dataclass(frozen=True)
 class V3BatchedQuote:
     path: V3Path
-    amount_out: int  # 0 on revert / pool-not-found
+    # The quoter's variable-side amount: ``amountOut`` for exact-input paths
+    # and ``amountIn`` for exact-output paths. 0 on revert / pool-not-found.
+    amount_out: int
 
 
 def _strip_0x(addr: str) -> str:
@@ -95,8 +117,45 @@ def _encode_quote_exact_input_single(
     return "0x" + QUOTE_EXACT_INPUT_SINGLE_SELECTOR + encoded.hex()
 
 
+def _encode_quote_exact_output_single(
+    token_in: str,
+    token_out: str,
+    amount_out: int,
+    fee: int,
+    sqrt_price_limit_x96: int = 0,
+) -> str:
+    """Encode QuoteExactOutputSingleParams calldata. Selector bd21704a.
+
+    Tuple layout per QuoterV2 ABI is identical to the exact-input variant —
+    ``(tokenIn, tokenOut, amount, fee, sqrtPriceLimit)`` — only the selector
+    differs. ``amount`` here is the desired ``amountOut`` (buy-token); the
+    call returns ``(amountIn, sqrtPriceX96After, ticksCrossed, gasEstimate)``.
+    """
+    encoded = encode(
+        ["(address,address,uint256,uint24,uint160)"],
+        [(token_in, token_out, amount_out, fee, sqrt_price_limit_x96)],
+    )
+    return "0x" + QUOTE_EXACT_OUTPUT_SINGLE_SELECTOR + encoded.hex()
+
+
+def _encode_quote_exact_output(path_bytes: bytes, amount_out: int) -> str:
+    """Encode quoteExactOutput(bytes,uint256) calldata. Selector 2f80bb1d.
+
+    Returns ``(amountIn, sqrtPriceX96AfterList, ticksCrossedList, gasEstimate)``.
+    Note: ``path_bytes`` MUST be encoded in REVERSE swap order (tokenOut →
+    intermediate → tokenIn), matching Uniswap v3-periphery's exactOutput
+    convention. See ``_build_call`` for how RouterSolver flips field order.
+    """
+    encoded = encode(["bytes", "uint256"], [path_bytes, amount_out])
+    return "0x" + QUOTE_EXACT_OUTPUT_SELECTOR + encoded.hex()
+
+
 def _decode_single_hop_return(data: bytes) -> int:
-    """Decode `(uint256, uint160, uint32, uint256)` and return amount_out, else 0."""
+    """Decode `(uint256, uint160, uint32, uint256)` and return amount_out, else 0.
+
+    Same return-tuple shape for both exactInputSingle (amount_out) and
+    exactOutputSingle (amount_in) — caller distinguishes via ``exact_output``.
+    """
     # 4 static-typed 32-byte fields = 128 bytes minimum.
     if len(data) < 128:
         return 0
@@ -111,7 +170,11 @@ def _decode_single_hop_return(data: bytes) -> int:
 
 
 def _decode_multi_hop_return(data: bytes) -> int:
-    """Decode `(uint256, uint160[], uint32[], uint256)` and return amount_out, else 0."""
+    """Decode `(uint256, uint160[], uint32[], uint256)` and return amount_out, else 0.
+
+    Same return-tuple shape for both quoteExactInput (amount_out) and
+    quoteExactOutput (amount_in).
+    """
     if not data:
         return 0
     try:
@@ -126,18 +189,37 @@ def _decode_multi_hop_return(data: bytes) -> int:
 
 def _build_call(path: V3Path, quoter_address: str) -> Call:
     if path.intermediate is None:
-        call_data = _encode_quote_exact_input_single(
-            path.token_in, path.token_out, path.amount_in, path.fee_tier_in
-        )
+        if path.exact_output:
+            call_data = _encode_quote_exact_output_single(
+                path.token_in, path.token_out, path.amount_in, path.fee_tier_in
+            )
+        else:
+            call_data = _encode_quote_exact_input_single(
+                path.token_in, path.token_out, path.amount_in, path.fee_tier_in
+            )
     else:
-        path_bytes = _encode_path_bytes(
-            path.token_in,
-            path.fee_tier_in,
-            path.intermediate,
-            path.fee_tier_out,
-            path.token_out,
-        )
-        call_data = _encode_quote_exact_input(path_bytes, path.amount_in)
+        if path.exact_output:
+            # Exact-output multi-hop: path is REVERSED vs exact-input. Encode
+            # tokenOut → fee_BC → intermediate → fee_AB → tokenIn so the
+            # quoter walks pools in the same order the eventual exactOutput
+            # swap will. Reference: Uniswap v3-periphery SwapRouter docs.
+            path_bytes = _encode_path_bytes(
+                path.token_out,
+                path.fee_tier_out,  # type: ignore[arg-type]
+                path.intermediate,
+                path.fee_tier_in,
+                path.token_in,
+            )
+            call_data = _encode_quote_exact_output(path_bytes, path.amount_in)
+        else:
+            path_bytes = _encode_path_bytes(
+                path.token_in,
+                path.fee_tier_in,
+                path.intermediate,
+                path.fee_tier_out,
+                path.token_out,
+            )
+            call_data = _encode_quote_exact_input(path_bytes, path.amount_in)
     # allow_failure: pools that don't exist revert; we want amount_out=0 not a crash.
     return Call(target=quoter_address, call_data=call_data, allow_failure=True)
 
