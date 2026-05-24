@@ -13,16 +13,80 @@ because they need their own design step or touch the edge submodule.
 
 ---
 
-## 1. `router._register_prices` setdefault collision (Critical)
+## 1. `router._register_prices` phantom clearing prices (RESOLVED 2026-05-24)
 
-### What's wrong
+**Resolved by PR `fix/router-phantom-clearing-prices`.** Diagnosis moved
+from `setdefault` collision (suspected) to a different, more severe
+issue: registering oracle `reference_price` as the clearing price
+regardless of what the AMM quoted. Setdefault is still in place but
+matters less now that the input is correct AMM-rate.
 
-`src/solver/router.py:382-410` uses `dict.setdefault` to populate
-clearing prices. When two trades touch the same token (e.g. a sell
-and a buy on the same A→B pair) only the FIRST trade's ratio is
-recorded. Subsequent trades on the same token reuse that ratio in
-the composed `Solution.prices`, so their effective `our_buy_amount`
-at scoring time is computed against the wrong ratio.
+### What was wrong
+
+`src/solver/router.py:382-410` (pre-fix) substituted
+`token.reference_price` as `Solution.prices[token]` whenever oracle
+references were available. CIP-14 scoring then computed
+``bought = executed * cp_sell / cp_buy = executed * oracle_ratio``,
+so surplus collapsed to the order's OTM headroom AT ORACLE — surplus
+the AMM never actually realised.
+
+PR #11 (sort-by-margin) made the bug dominant by ranking exactly the
+orders with the largest oracle-headroom to the top of the routing
+queue. Live impact 2026-05-24:
+
+- `router-v2` median score 6.6 ETH per fill (134 fills/24 h), tight
+  cluster (max 6.71, min 0.02) — systematic, not outlier.
+- `composer` median 447 ETH — inherits router-v2's phantom clearing
+  prices via token-disjoint merge. Composer does NOT call
+  `price_refiner`; the contamination flows directly from
+  `_register_prices` into composed solutions.
+- `naive` median 462 ETH (also reference-priced via `naive.py:81-82`,
+  excluded from submission by `test_naive_solution_is_never_submitted`).
+- `estimate_economics.py` projected €67M/Mo net.
+
+Confirmed mathematically against a real auction row: a BUY of 1 WBTC
+with sellAmount=93,262.72 USDC limit and oracle ratio 76,240 USDC/WBTC
+produces surplus_sell ≈ 17,000 USDC → score = 6.65 ETH, exactly the
+persisted value.
+
+### How it was fixed
+
+`_register_prices` always uses the AMM execution ratio
+(`executed_buy / executed_sell`) — no reference-price branch. CIP-14
+scoring then reproduces the user's REALISED surplus only:
+`surplus = signed_sell − amm_amount_in`. Reference prices remain
+correct for the `native_price_buy` numéraire in
+`shadow.scoring._score_*_trade` (oracle conversion to ETH wei), so
+the score is in real ETH-equivalent terms.
+
+### Related places still using reference_price as clearing price
+
+- `src/solver/price_refiner.py:151,177-179` — same pattern. Inline
+  comment (lines 168-179) explicitly cited cross-pair consistency as
+  motivation; that argument has now been falsified by the live data
+  and the comment has been replaced with a KNOWN-BAD warning in this
+  PR. Code path is only safe today because the sole caller is naive,
+  which is excluded from submission and from composer-input. Real fix
+  needs CIP-67-uniform clearing prices (LP over per-pair AMM rates),
+  tracked separately as a partial-fills design dependency — out of
+  scope for this hotfix.
+- `src/solver/naive.py:81-82` — same pattern but harmless: naive is
+  excluded from submission and from composer-input by tests
+  `test_naive_solution_is_never_submitted` and
+  `test_composer_excludes_naive_when_other_strategy_solves`.
+
+### Was-it-setdefault context (kept for archaeology)
+
+The original 2026-05-24 spec hypothesised a setdefault collision on
+sell+buy-on-same-pair as the failure mode. Inspection of the
+actual high-score rows showed single-trade solutions — the surplus
+explosion is entirely in the reference-price-as-clearing-price step,
+not in repeated-token-touch handling. Setdefault is left untouched
+for now; if a future case shows mixed sell+buy emitting inconsistent
+ratios despite both using AMM-rate, revisit Option A (first-ratio
+enforce-or-drop) or Option B (averaged price + re-validate).
+
+
 
 This was always a latent bug — multiple sell orders on the same pair
 could already step on each other — but **PR #20 made it worse** by

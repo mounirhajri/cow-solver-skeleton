@@ -55,6 +55,16 @@ _DEDUP_STRATEGY = "cow-matching-multi-party"
 
 _DAYS_PER_MONTH = 30.44
 
+# Rows persisted before this cutoff used a buggy clearing-price convention in
+# RouterSolver (oracle reference_price instead of AMM execution rate), which
+# overstated CIP-14 surplus systematically — median 6.6 ETH per fill at the
+# height of the contamination. Fix landed in PR #26 (2026-05-24). Rows from
+# router-v2 before this timestamp are dropped to stop the estimator from
+# republishing phantom numbers from historical data. Bipartite/multi-party
+# rows were unaffected by the bug (they don't use _register_prices).
+# Override with --include-pre-cutoff for archaeology.
+_ROUTER_PRICE_BUG_CUTOFF = datetime(2026, 5, 24, 18, 0, tzinfo=UTC)
+
 
 @dataclass(frozen=True)
 class Projection:
@@ -240,6 +250,7 @@ async def collect_wins_per_strategy(
                 ShadowSolution.strategy,
                 ShadowSolution.our_score_wei,
                 ShadowSolution.solution,
+                ShadowSolution.created_at,
                 ShadowWinner.score.label("winner_score"),
             )
             .join(ShadowAuction, ShadowAuction.auction_id == ShadowSolution.auction_id)
@@ -254,11 +265,26 @@ async def collect_wins_per_strategy(
 
     # Bucket (score, sig) per strategy first — sig only needed for dedup
     # but cheap to compute up-front and lets _dedupe_by_ring stay pure.
+    n_contaminated = 0
     wins_with_sigs: dict[str, list[tuple[int, str | None]]] = defaultdict(list)
     for r in rows:
+        if (
+            r.strategy == "router-v2"
+            and r.created_at is not None
+            and r.created_at < _ROUTER_PRICE_BUG_CUTOFF
+        ):
+            n_contaminated += 1
+            continue
         if int(r.our_score_wei) > int(r.winner_score):
             sig = _ring_signature(r.solution) if r.strategy == _DEDUP_STRATEGY else None
             wins_with_sigs[r.strategy].append((int(r.our_score_wei), sig))
+
+    if n_contaminated:
+        print(
+            f"  [data-quality] dropped {n_contaminated} router-v2 row(s) "
+            f"persisted before {_ROUTER_PRICE_BUG_CUTOFF.isoformat()} "
+            f"(phantom clearing-price era — see scripts/estimate_economics.py)"
+        )
 
     out: dict[str, list[int]] = {}
     for strategy, paired in wins_with_sigs.items():

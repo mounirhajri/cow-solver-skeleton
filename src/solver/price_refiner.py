@@ -165,12 +165,22 @@ async def refine_solution_prices(
             continue
 
         refined_trades.append(trade)
-        # Use oracle/reference prices for the clearing-price dict so that all
-        # tokens share one consistent unit system (ETH wei per 10^18 atoms).
-        # Mixing DEX swap-amounts with oracle prices across different token
-        # pairs produces astronomically wrong cross-pair exchange rates and
-        # therefore astronomically inflated CIP-14 surplus.  The DEX check
-        # above already ensures the trade is executable at real market prices.
+        # KNOWN-BAD: assigning reference_price as clearing_price produces
+        # phantom CIP-14 surplus equal to the order's OTM-headroom at oracle —
+        # the exact bug fixed for RouterSolver in PR #26 (2026-05-24, see
+        # docs/superpowers/specs/2026-05-26-router-and-logging-followups.md §1).
+        # The earlier argument that oracle prices were needed for cross-pair
+        # consistency was falsified by live data showing 462 ETH median scores
+        # on naive solutions persisted from this exact code path.
+        #
+        # This branch remains in place because (a) the only caller is
+        # NaiveSolver, which is excluded from submission by
+        # test_naive_solution_is_never_submitted, and (b) the real fix needs
+        # CIP-67-uniform clearing prices via an LP over per-pair AMM rates —
+        # tracked as a partial-fills design dependency.
+        #
+        # DO NOT enable this code path for any submitted strategy without
+        # solving the CIP-67-uniform price problem first.
         sell_info = auction.tokens.get(order.sell_token)
         buy_info = auction.tokens.get(order.buy_token)
         if sell_info and sell_info.reference_price:

@@ -677,3 +677,177 @@ async def test_buy_and_sell_mixed_auction(monkeypatch: pytest.MonkeyPatch) -> No
     by_uid = {t.order_uid: t for t in result.trades}
     assert by_uid["s1"].executed_amount == 1000  # sell: sellAmount (exact)
     assert by_uid["b1"].executed_amount == 500   # buy:  buyAmount  (exact)
+
+
+@pytest.mark.asyncio
+async def test_clearing_prices_track_amm_ratio_not_oracle_for_otm_buy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the phantom-surplus bug observed 2026-05-24.
+
+    A partiallyFillable BUY order signs willingness to pay 93,262 USDC for
+    1 WBTC.  Oracle reference price implies WBTC = 76,240 USDC at market.
+    The AMM actually delivers 1 WBTC for ~80,000 USDC (above oracle once
+    slippage on a single-trade 1-WBTC swap is included).
+
+    Before the fix: clearing prices were set to reference prices when
+    available → CIP-14 scoring computed surplus as
+    (signed_sell − executed × oracle_ratio) = order's OTM headroom at
+    oracle (~17,000 USDC = ~6.6 ETH), regardless of the AMM's real rate.
+    134 such fills in 24 h drove an €67M/Mo phantom projection.
+
+    After the fix: clearing prices track the AMM execution ratio so
+    surplus = (signed_sell − amm_amount_in) is what the user really
+    captures, bounded by 13,262 USDC instead of the phantom 17,022 USDC.
+
+    Asserts the end-to-end score via compute_solution_score — assertions
+    on result.prices alone could be satisfied by a future regression that
+    routes oracle-derived prices through a different transform. The score
+    is the ground truth and must reflect realised surplus only.
+    """
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+    from src.shadow.scoring import compute_solution_score
+
+    sell_token = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"  # USDC.e (6 dec)
+    buy_token = "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f"   # WBTC   (8 dec)
+
+    amm_amount_in = 80_000 * 10**6  # 80k USDC the AMM charges for 1 WBTC
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        return [V3BatchedQuote(path=p, amount_out=amm_amount_in) for p in paths]
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    # Oracle reference prices implying 76,240 USDC per WBTC at market.
+    usdc_ref = 476_878_487_995_865_217_881_866_240
+    wbtc_ref = 363_471_992_112_697_727_091_939_999_744
+    tokens = {
+        sell_token: Token(decimals=6, reference_price=usdc_ref),
+        buy_token: Token(decimals=8, reference_price=wbtc_ref),
+    }
+
+    order = _make_order(
+        kind="buy",
+        sellToken=sell_token,
+        buyToken=buy_token,
+        sellAmount=93_262_719_916,  # 93,262.72 USDC limit
+        buyAmount=100_000_000,      # 1 WBTC exact
+        partiallyFillable=True,
+    )
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    result = await router.solve(_make_auction([order], tokens=tokens))
+
+    assert isinstance(result, Solution)
+    assert result.prices[sell_token] == 100_000_000          # buy_amount
+    assert result.prices[buy_token] == amm_amount_in         # amount_in
+    assert result.prices[sell_token] != tokens[sell_token].reference_price
+    assert result.prices[buy_token] != tokens[buy_token].reference_price
+
+    # End-to-end check: score must reflect realised surplus only.
+    # Realised surplus_sell = signed_sell − amm_amount_in
+    #                       = 93,262,719,916 − 80,000,000,000 = 13,262,719,916 atom-USDC
+    # In ETH-equiv via native_price_buy=wbtc_ref scaled by 1e18 numéraire,
+    # this stays in the milliETH-to-low-ETH band, NOT 6.6 ETH.
+    orders_by_uid = {order.uid: order.model_dump(by_alias=True)}
+    native_prices = {sell_token: usdc_ref, buy_token: wbtc_ref}
+    sol_dict = {
+        "prices": {k: str(v) for k, v in result.prices.items()},
+        "trades": [
+            {
+                "kind": "fulfillment",
+                "orderUid": order.uid,
+                "executedAmount": str(result.trades[0].executed_amount),
+            }
+        ],
+    }
+    score_wei = compute_solution_score(sol_dict, orders_by_uid, native_prices)
+    # Compute the score the OLD (buggy) reference-price-as-clearing-price
+    # code would have persisted, against the SAME auction inputs.
+    phantom_sol_dict = {
+        "prices": {sell_token: str(usdc_ref), buy_token: str(wbtc_ref)},
+        "trades": sol_dict["trades"],
+    }
+    phantom_score = compute_solution_score(
+        phantom_sol_dict, orders_by_uid, native_prices
+    )
+    # Phantom in this exact scenario ≈ 6.65 ETH (matches live id=6229 row).
+    # Real at AMM-rate ≈ 5.17 ETH (AMM 80k > oracle 76,240 → less surplus
+    # captured than oracle would have implied). Both are non-trivial because
+    # the order has 22 % slack vs market — that slack is realistically
+    # reduced to what the AMM actually leaves on the table.
+    assert phantom_score > 6 * 10**18, (
+        "sanity: oracle-clearing-price scoring on this scenario should "
+        f"reproduce the ~6.6 ETH phantom, got {phantom_score}"
+    )
+    assert score_wei < phantom_score, (
+        f"AMM-rate clearing prices must produce STRICTLY LESS surplus than "
+        f"oracle-rate would: got {score_wei} vs phantom {phantom_score}"
+    )
+    # Belt-and-braces: realised score should reflect the AMM gap exactly.
+    # signed_sell − amm_amount_in = 13,262,719,916 atom-USDC of realised
+    # buy-order surplus. The CIP-14 conversion then translates that to the
+    # WBTC-numéraire equivalent. The exact figure depends on integer
+    # divisions in _score_buy_trade — we pin it loose to avoid brittle math.
+    assert 4 * 10**18 < score_wei < 6 * 10**18, (
+        f"realised score expected in 4-6 ETH band for this synthetic, "
+        f"got {score_wei}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_clearing_prices_zero_surplus_when_amm_at_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AMM rate exactly equals the order's limit → score must be 0.
+
+    Guards against a sign-flip in _score_buy_trade after the clearing-price
+    convention change. With cp = AMM rate and AMM rate = limit rate, the
+    surplus expression collapses to 0 by construction.
+    """
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+    from src.shadow.scoring import compute_solution_score
+
+    sell_token = "0xa"
+    buy_token = "0xb"
+
+    # AMM charges exactly the full signed_sell → zero surplus
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        return [V3BatchedQuote(path=p, amount_out=1000) for p in paths]
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    order = _make_order(
+        kind="buy",
+        sellToken=sell_token,
+        buyToken=buy_token,
+        sellAmount=1000,
+        buyAmount=500,
+    )
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    result = await router.solve(_make_auction([order]))
+
+    assert isinstance(result, Solution)
+    orders_by_uid = {order.uid: order.model_dump(by_alias=True)}
+    native_prices = {sell_token: 10**18, buy_token: 10**18}
+    sol_dict = {
+        "prices": {k: str(v) for k, v in result.prices.items()},
+        "trades": [
+            {
+                "kind": "fulfillment",
+                "orderUid": order.uid,
+                "executedAmount": str(result.trades[0].executed_amount),
+            }
+        ],
+    }
+    score_wei = compute_solution_score(sol_dict, orders_by_uid, native_prices)
+    assert score_wei == 0, (
+        f"AMM-rate == limit-rate must score 0, got {score_wei}"
+    )

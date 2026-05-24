@@ -13,7 +13,6 @@ Behaviour the tests lock in:
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -22,7 +21,6 @@ from src.models.order import Order
 from src.models.solution import Solution, Trade
 from src.solver.ebbo import (
     DEFAULT_TOLERANCE_BPS,
-    EBBOResult,
     validate_solution_ebbo,
 )
 

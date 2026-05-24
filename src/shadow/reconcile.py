@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import Any
 
 from src.log import get_logger
 from src.shadow.cow_api import CowApiClient
@@ -7,14 +8,14 @@ from src.shadow.cow_api import CowApiClient
 log = get_logger(__name__)
 
 
-def _parse_jsonl_resilient(log_path: Path) -> tuple[list[dict], int]:
+def _parse_jsonl_resilient(log_path: Path) -> tuple[list[dict[str, Any]], int]:
     """Parse a JSONL file, skipping (and logging) any malformed lines.
 
     A truncated or otherwise corrupted line — e.g. half-written from a
     container kill or disk-full event — must NOT kill the reconcile loop.
     Returns (parsed_records, n_skipped).
     """
-    parsed: list[dict] = []
+    parsed: list[dict[str, Any]] = []
     n_skipped = 0
     for lineno, raw in enumerate(log_path.read_text().splitlines(), start=1):
         if not raw:
