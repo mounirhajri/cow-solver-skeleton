@@ -142,12 +142,12 @@ class RouterSolver:
         # orders that survived the top-N cap.  Logged after filtering so the
         # count reflects what the strategy actually quotes, not the raw
         # auction.  Driver validates the signatures.
-        n_eip1271 = sum(1 for o in sell_orders if o.is_smart_wallet_signed)
+        n_eip1271 = sum(1 for o in orders if o.is_smart_wallet_signed)
         log.info(
             "smart_wallet_orders_observed",
             auction_id=auction.id,
             n_eip1271=n_eip1271,
-            n_eoa=len(sell_orders) - n_eip1271,
+            n_eoa=len(orders) - n_eip1271,
         )
 
         if self._v3_only_batched:
