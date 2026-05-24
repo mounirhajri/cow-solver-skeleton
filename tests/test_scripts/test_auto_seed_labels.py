@@ -442,7 +442,9 @@ async def test_auth_token_sent_when_env_vars_set(session_factory, monkeypatch) -
     )
 
     assert result.n_legit == 1
-    assert captured.get("authorization") == "Bearer ACCESS-XYZ"
+    # GoPlus expects the raw token — NO "Bearer " prefix. See production note
+    # in auto_seed_labels.py for the verification incident.
+    assert captured.get("authorization") == "ACCESS-XYZ"
     # Body must contain the SHA1 sign derived from key + time + secret.
     import json as _json
     body = _json.loads(captured["token_body"])
