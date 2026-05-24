@@ -11,19 +11,23 @@ present. Public clones fall back to the naive + router strategies only.
 
 ## Strategy chain
 
-The orchestrator runs strategies in this order, with a CIP-67 composer
-merging non-conflicting solutions:
+The orchestrator runs strategies in parallel and a token-disjoint
+composer merges non-overlapping solutions:
 
 | # | Strategy | Module | Purpose |
 |---|----------|--------|---------|
-| 1 | NaiveSolver | `src/solver/naive.py` | 1inch wrapper with on-chain price refinement (Multicall3 + V2/V3) |
+| 1 | NaiveSolver | `src/solver/naive.py` | 1inch wrapper with on-chain price refinement (Multicall3 + V2/V3). **Never submitted** — its oracle-derived clearing prices over-state real settlement prices; lives in the chain as a shadow baseline only |
 | 2 | BipartiteMatcher | `edge/matching/bipartite.py` | Two-party CoW direct matching |
-| 3 | CoWMatchingSolver | `edge/matching/multi_party.py` | Johnson cycle finder (rustworkx) + quantity-space LP (scipy HiGHS) for 3-4 party rings |
+| 3 | CoWMatchingSolver | `edge/matching/multi_party.py` | Johnson cycle finder (rustworkx) + quantity-space LP (scipy HiGHS) for 3-4 party rings, with per-UID cooldown so a persistent TWAP doesn't re-emit every auction |
 | 4 | LongTailRouter | `edge/pool_indexer/long_tail_router.py` | UniV2-style routing via Redis-cached pool index (gated, off by default in prod) |
-| 5 | RouterSolver | `src/solver/router.py` | Top-N orders by ETH-value × V3 QuoterV2 across 4 fee tiers, batched in one Multicall3 round-trip |
+| 5 | RouterSolver | `src/solver/router.py` | Top-N orders by **expected surplus** (sell_value − buy_value at reference prices) × V3 QuoterV2 across 4 fee tiers, batched in one Multicall3 round-trip |
 
-Composer (`edge/matching/composer.py`) enforces uniform clearing prices
-per directed token pair (±2 % tolerance) when merging multiple winners.
+Composer (`edge/matching/composer.py`) enforces **strict token-disjoint
+composition**: a candidate whose `solution.prices` overlap any
+already-claimed token is rejected wholesale. No price averaging — every
+token's price in the composed solution comes from exactly one solver,
+which is the only way to keep mixed (e.g. ring-anchor-relative vs
+market) price regimes from producing fantasy CIP-14 scores.
 
 ## Design rationale
 
@@ -92,6 +96,16 @@ Environment variables (see `src/config.py` for full list + defaults):
 | `ROUTER_V3_ONLY_BATCHED` | `true` | RouterSolver uses V3-batched mode (1 RPC/auction); set false for legacy V2+V3 fan-out |
 | `LONG_TAIL_ENABLED` | `true` | Set `false` to disable LongTailRouter (recommended on tight RPC tiers) |
 | `MULTI_PARTY_OTM_TOLERANCE_BPS` | `100` | Widens ring-candidate graph beyond strict reference-price-ITM (0 = legacy strict) |
+| `MULTI_PARTY_RING_COOLDOWN_SECONDS` | `600` | After emitting a ring, every involved order UID is excluded from the candidate graph for this many seconds. Mirrors on-chain TWAP behaviour. 0 disables |
+| `GOPLUS_APP_KEY` / `GOPLUS_APP_SECRET` | unset | Optional GoPlus Security auth tier for `scripts/auto_seed_labels.py` — exchanges to a short-lived access token via SHA1-signed token request. Falls back to anonymous mode (much lower rate limit) when either is missing |
+
+The cold-start IsolationForest behind the RF-filter has two non-obvious
+defaults (in `edge/`):
+
+| Knob | Default | Effect |
+|------|---------|--------|
+| `DEFAULT_ANOMALY_CONTAMINATION` | `0.01` | IsolationForest contamination at training time. `auto` (sklearn's default 0.10) hard-codes a 10 % anomaly fraction into the decision boundary and produces ~80 % live filter rate; 0.01 trusts a near-zero scam rate which is the real situation on Arbitrum |
+| `_DEFAULT_THRESHOLD` (rf_filter) | `0.05` | Minimum legit-probability for an order's tokens to pass the filter. AnomalyScorer normalises raw IF scores by the train-set 1st/99th percentile, so 0.05 ≈ "above the bottom 5 % of training inliers". A hard-coded core-Arbitrum-token whitelist (WETH/USDC/USDC.e/USDT/DAI/WBTC/ARB/native-ETH placeholder) bypasses the model entirely |
 
 ## Edge submodule
 
