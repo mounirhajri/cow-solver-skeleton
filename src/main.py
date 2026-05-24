@@ -14,7 +14,7 @@ from src.models.solution import Solution
 from src.shadow.logger import SolutionLogger
 from src.shadow.persist import persist_shadow_attempt_safe
 from src.solver.base import NoSolution
-from src.solver.orchestrator import SolverOrchestrator, load_default_strategies
+from src.solver.orchestrator import SolverOrchestrator, load_default_orchestrator
 
 log = get_logger(__name__)
 
@@ -98,10 +98,9 @@ def build_default_app() -> FastAPI:
     does not trigger filesystem and network side-effects.
     """
     configure_logging(level=settings.log_level)
-    strategies = load_default_strategies()
-    orchestrator = SolverOrchestrator(
-        strategies=strategies,
-        per_strategy_timeout=settings.solve_timeout_seconds / max(1, len(strategies)),
-    )
+    # load_default_orchestrator wires EBBO + the multicall shared across
+    # naive/router into a single SolverOrchestrator. Tests construct
+    # SolverOrchestrator directly with mock strategies + no EBBO.
+    orchestrator = load_default_orchestrator()
     shadow_logger = SolutionLogger(path=settings.shadow_log_path)
     return create_app(orchestrator=orchestrator, shadow_logger=shadow_logger)
