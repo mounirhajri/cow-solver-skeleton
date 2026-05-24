@@ -139,3 +139,60 @@ async def test_orchestrator_run_all_strategies_collects_all_attempts(auction: Au
     assert len(attempts) == 2
     assert attempts[0].status == "solved"
     assert attempts[1].status == "no_solution"
+
+
+async def test_naive_solution_is_never_submitted(auction: Auction) -> None:
+    """The orchestrator must not return a naive solution — naive's clearingPrices
+    come from oracle data, not realised market prices.  If naive is the only
+    strategy that solved, fall through to NoSolution rather than ship a fantasy
+    trade.  Verified live 2026-05-24: composer was emitting naive at ~481 ETH
+    per win because its executed_amounts dwarfed every real solver."""
+    sol = _solution()
+    naive = AsyncMock(name="naive")
+    naive.name = "naive"
+    naive.solve.return_value = sol
+
+    orch = SolverOrchestrator(
+        strategies=[naive], per_strategy_timeout=1.0, run_all_strategies=False,
+    )
+    result, attempts = await orch.solve(auction)
+
+    # The naive ATTEMPT is recorded — we still want shadow data — but the
+    # final return must be NoSolution, not the naive solution itself.
+    assert isinstance(result, NoSolution)
+    assert any(a.strategy == "naive" and a.status == "solved" for a in attempts)
+
+
+async def test_composer_excludes_naive_when_other_strategy_solves(auction: Auction) -> None:
+    """When naive and a real strategy both solve, composer must merge only the
+    real strategy (naive's oracle prices would dwarf the real surplus)."""
+    sol_real = _solution()
+    sol_naive = _solution()
+
+    naive = AsyncMock(name="naive")
+    naive.name = "naive"
+    naive.solve.return_value = sol_naive
+    real = AsyncMock(name="router-v2")
+    real.name = "router-v2"
+    real.solve.return_value = sol_real
+
+    orch = SolverOrchestrator(
+        strategies=[naive, real],
+        per_strategy_timeout=1.0,
+        run_all_strategies=True,
+        compose=True,
+    )
+    result, attempts = await orch.solve(auction)
+
+    # We get *some* Solution back — either the real solver's or a composed
+    # one — but never the naive Solution object.
+    assert isinstance(result, Solution)
+    assert result is not sol_naive
+    # If composer ran, it appears in attempts.
+    composer_attempts = [a for a in attempts if a.strategy == "composer"]
+    if composer_attempts:
+        # n_candidates in the composer log will reflect the post-filter count.
+        # Here both strategies solved, but naive should be excluded → composer
+        # falls back (only 1 composable candidate left, threshold is "> 1").
+        # So we expect NO composer attempt at all in this 2-strategy case.
+        pytest.fail("Composer should not run with a single non-naive solver")
