@@ -53,11 +53,15 @@ import hashlib
 import os
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from src.log import get_logger
 from src.persistence.db import get_session_factory
@@ -86,6 +90,29 @@ class SeedResult:
     n_legit: int = 0
     n_skipped: int = 0
     n_errors: int = 0
+    n_features_written: int = 0
+
+
+# GoPlus security fields we persist into `token_features`.  Keep in sync with
+# RAW_FEATURE_COLUMNS in edge/classifier/feature_engineering.py and the
+# 3b9f1c2e0a8e Alembic migration.
+_GOPLUS_BOOL_FEATURES: tuple[str, ...] = (
+    "is_proxy",
+    "is_mintable",
+    "can_take_back_ownership",
+    "hidden_owner",
+    "slippage_modifiable",
+    "transfer_pausable",
+    "owner_change_balance",
+    "external_call",
+    "honeypot_with_same_creator",
+    "anti_whale_modifiable",
+)
+_GOPLUS_FRACTION_FEATURES: tuple[str, ...] = (
+    "creator_percent",
+    "buy_tax",
+    "sell_tax",
+)
 
 
 @dataclass
@@ -109,6 +136,56 @@ def _parse_float(value: Any) -> float:
         # Malformed taxes are an unknown signal — treat as 0 and let other
         # fields (is_honeypot, is_open_source) drive the verdict.
         return 0.0
+
+
+def _extract_security_features(entry: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Extract the GoPlus security features we persist into token_features.
+
+    Returns None when the entry has no usable signal at all — in that case
+    we skip the UPSERT entirely so we don't blank out previously-collected
+    data for the token.
+
+    Each boolean field is normalised to True/False/None (None when missing
+    or non-"0"/"1").  Each fractional field is normalised to a float clipped
+    to [0, 1]; >1 values are GoPlus parser glitches and the model's clip
+    handles them defensively anyway.
+    """
+    if not isinstance(entry, dict):
+        return None
+
+    out: dict[str, Any] = {}
+
+    def _as_bool(v: Any) -> bool | None:
+        if v == "1":
+            return True
+        if v == "0":
+            return False
+        return None
+
+    def _as_fraction(v: Any) -> float | None:
+        if v is None or v == "":
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        if f < 0.0:
+            return 0.0
+        if f > 1.0:
+            return 1.0
+        return f
+
+    for col in _GOPLUS_BOOL_FEATURES:
+        out[col] = _as_bool(entry.get(col))
+    for col in _GOPLUS_FRACTION_FEATURES:
+        out[col] = _as_fraction(entry.get(col))
+
+    # If literally every field is None, there's nothing worth UPSERTing —
+    # the response had only an outer "code/result" shell with no actual
+    # security analysis (typical for tokens GoPlus doesn't know).
+    if all(v is None for v in out.values()):
+        return None
+    return out
 
 
 def _classify_one(token_address: str, entry: dict[str, Any] | None) -> TokenVerdict:
@@ -159,8 +236,13 @@ def _classify_one(token_address: str, entry: dict[str, Any] | None) -> TokenVerd
 
 def _classify_batch(
     addresses: list[str], data: dict[str, Any]
-) -> list[TokenVerdict]:
+) -> tuple[list[TokenVerdict], dict[str, dict[str, Any]]]:
     """Classify all tokens in a batch from one GoPlus response.
+
+    Returns ``(verdicts, features_by_addr)``.  ``features_by_addr`` only
+    contains entries for tokens where GoPlus returned usable security
+    signals — caller uses that to UPSERT the per-token `token_features`
+    rows alongside writing the outcome label.
 
     Addresses missing from `result` are returned as "skip" — GoPlus
     couldn't analyze them this run; a future run will retry.
@@ -168,23 +250,27 @@ def _classify_batch(
     if data.get("code") != 1:
         log.warning("goplus_response_not_ok", code=data.get("code"),
                     message=data.get("message"))
-        return [TokenVerdict(a, "skip") for a in addresses]
+        return [TokenVerdict(a, "skip") for a in addresses], {}
 
     result_map = data.get("result") or {}
     if not isinstance(result_map, dict):
-        return [TokenVerdict(a, "skip") for a in addresses]
+        return [TokenVerdict(a, "skip") for a in addresses], {}
 
     # GoPlus lower-cases the address keys in the response — normalize ours
     # to match so we can look up by either input casing.
     lower_map = {k.lower(): v for k, v in result_map.items()}
 
     verdicts: list[TokenVerdict] = []
+    features: dict[str, dict[str, Any]] = {}
     for addr in addresses:
         entry = lower_map.get(addr.lower())
         v = _classify_one(addr, entry if isinstance(entry, dict) else None)
         log.info("goplus_verdict", token_address=addr, verdict=v.kind)
         verdicts.append(v)
-    return verdicts
+        sec = _extract_security_features(entry if isinstance(entry, dict) else None)
+        if sec is not None:
+            features[addr] = sec
+    return verdicts, features
 
 
 async def _fetch_access_token(
@@ -238,16 +324,20 @@ async def _fetch_access_token(
 
 async def _fetch_goplus_batch(
     client: httpx.AsyncClient, addresses: list[str], chain_id: int
-) -> list[TokenVerdict]:
+) -> tuple[list[TokenVerdict], dict[str, dict[str, Any]]]:
     """Call GoPlus for a batch of tokens with exponential backoff on 429/5xx.
 
-    Never raises — converts any failure into a list of "error" verdicts.
+    Returns ``(verdicts, features_by_addr)``.  Never raises — converts any
+    failure into a list of "error" verdicts (empty features dict).
     """
     if not addresses:
-        return []
+        return [], {}
 
     url = GOPLUS_URL.format(chain_id=chain_id)
     params = {"contract_addresses": ",".join(addresses)}
+    err_pair: tuple[list[TokenVerdict], dict[str, dict[str, Any]]] = (
+        [TokenVerdict(a, "error") for a in addresses], {}
+    )
 
     # GoPlus signals rate-limit as HTTP 200 + JSON `code=4029` (verified live
     # 2026-05-24 — free tier blocks aggressively at ~3 req/s). Treat that
@@ -259,10 +349,10 @@ async def _fetch_goplus_batch(
             resp = await client.get(url, params=params)
         except httpx.TimeoutException:
             log.debug("goplus_timeout", n=len(addresses), attempt=attempt)
-            return [TokenVerdict(a, "error") for a in addresses]
+            return err_pair
         except httpx.HTTPError as exc:
             log.warning("goplus_network_error", n=len(addresses), error=str(exc))
-            return [TokenVerdict(a, "error") for a in addresses]
+            return err_pair
 
         is_rate_limited = (
             resp.status_code == 429
@@ -286,7 +376,7 @@ async def _fetch_goplus_batch(
                     http_status=resp.status_code,
                     json_code=json_code,
                 )
-                return [TokenVerdict(a, "error") for a in addresses]
+                return err_pair
             await asyncio.sleep(backoff)
             backoff *= 3
             continue
@@ -297,17 +387,17 @@ async def _fetch_goplus_batch(
                 n=len(addresses),
                 status=resp.status_code,
             )
-            return [TokenVerdict(a, "error") for a in addresses]
+            return err_pair
 
         try:
             data: dict[str, Any] = resp.json()
         except ValueError as exc:
             log.warning("goplus_bad_json", n=len(addresses), error=str(exc))
-            return [TokenVerdict(a, "error") for a in addresses]
+            return err_pair
 
         return _classify_batch(addresses, data)
 
-    return [TokenVerdict(a, "error") for a in addresses]
+    return err_pair
 
 
 async def _fetch_unlabeled_tokens(
@@ -361,7 +451,7 @@ async def _process_chunk(
     semaphore: asyncio.Semaphore,
     chunk: list[str],
     chain_id: int,
-) -> list[TokenVerdict]:
+) -> tuple[list[TokenVerdict], dict[str, dict[str, Any]]]:
     async with semaphore:
         return await _fetch_goplus_batch(client, chunk, chain_id)
 
@@ -423,8 +513,10 @@ async def _seed(
         chunk_results = await asyncio.gather(*tasks)
 
     verdicts: list[TokenVerdict] = []
-    for cr in chunk_results:
-        verdicts.extend(cr)
+    features_by_addr: dict[str, dict[str, Any]] = {}
+    for verdict_list, feature_map in chunk_results:
+        verdicts.extend(verdict_list)
+        features_by_addr.update(feature_map)
 
     to_insert: list[TokenOutcome] = []
     for v in verdicts:
@@ -461,6 +553,13 @@ async def _seed(
             session.add_all(to_insert)
             await session.commit()
 
+    # Persist security features via UPSERT.  Distinct from the outcome write
+    # so feature collection survives the rare case where the outcome row hits
+    # a unique-key conflict (it shouldn't, but if it does we keep the data).
+    if features_by_addr and not dry_run:
+        await _upsert_security_features(factory, features_by_addr)
+        result.n_features_written = len(features_by_addr)
+
     elapsed_s = round(time.monotonic() - started, 2)
     log.info(
         "goplus_seed_done",
@@ -469,11 +568,57 @@ async def _seed(
         n_legit=result.n_legit,
         n_skipped=result.n_skipped,
         n_errors=result.n_errors,
+        n_features_written=result.n_features_written,
         n_chunks=len(chunks),
         elapsed_s=elapsed_s,
         dry_run=dry_run,
     )
     return result
+
+
+async def _upsert_security_features(
+    factory: async_sessionmaker[AsyncSession],
+    features_by_addr: dict[str, dict[str, Any]],
+) -> None:
+    """UPSERT GoPlus security features into token_features.
+
+    On conflict (token_address PK), each non-null field overwrites the
+    existing column.  Null fields in the new data are NOT used to wipe
+    existing values — preserves info from earlier runs / other feature
+    sources.  Also bumps ``last_refreshed`` so we know when a token was
+    last touched by the GoPlus seeder.
+
+    Uses dialect-specific INSERT … ON CONFLICT for Postgres in prod and
+    SQLite in tests; both have an equivalent ``on_conflict_do_update``
+    syntax via the dialect-specific ``insert`` helpers.
+    """
+    now = datetime.now(UTC)
+    async with factory() as session:
+        dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+        insert_helper = sqlite_insert if dialect_name == "sqlite" else pg_insert
+        for addr, sec in features_by_addr.items():
+            insert_payload: dict[str, Any] = {
+                "token_address": addr.lower(),
+                "last_refreshed": now,
+            }
+            # Only carry non-null fields into the insert/update so
+            # missing values don't blank out existing data.
+            for k, v in sec.items():
+                if v is not None:
+                    insert_payload[k] = v
+
+            stmt = insert_helper(TokenFeatures).values(**insert_payload)
+            update_fields = {
+                k: stmt.excluded[k]
+                for k in insert_payload
+                if k != "token_address"
+            }
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[TokenFeatures.token_address],
+                set_=update_fields,
+            )
+            await session.execute(stmt)
+        await session.commit()
 
 
 async def main_async(

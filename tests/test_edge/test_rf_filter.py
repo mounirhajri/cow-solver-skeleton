@@ -75,6 +75,19 @@ async def feature_session_factory():
                     age_blocks INTEGER,
                     on_arbitrum_token_list INTEGER,
                     on_coingecko INTEGER,
+                    is_proxy INTEGER,
+                    is_mintable INTEGER,
+                    can_take_back_ownership INTEGER,
+                    hidden_owner INTEGER,
+                    slippage_modifiable INTEGER,
+                    transfer_pausable INTEGER,
+                    owner_change_balance INTEGER,
+                    external_call INTEGER,
+                    honeypot_with_same_creator INTEGER,
+                    anti_whale_modifiable INTEGER,
+                    creator_percent NUMERIC,
+                    buy_tax NUMERIC,
+                    sell_tax NUMERIC,
                     last_refreshed TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
