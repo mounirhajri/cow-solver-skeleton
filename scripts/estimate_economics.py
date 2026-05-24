@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
@@ -43,6 +44,15 @@ _REVENUE_STRATEGIES = (
     "router-v2",
 )
 
+# Strategy whose wins are subject to ring-signature dedup.  A persistent TWAP
+# order produces the same 3-4-UID ring in every auction it appears in, so the
+# raw count overstates settlements by ~50–400×.  On-chain only one settlement
+# per TWAP interval is possible, so dedup'ing by sig gives a conservative,
+# realistic count.  Bipartite (2-trade) and router-v2 (1-trade) rings rarely
+# repeat across distinct auctions because the order pairs differ, so they are
+# left alone.
+_DEDUP_STRATEGY = "cow-matching-multi-party"
+
 _DAYS_PER_MONTH = 30.44
 
 
@@ -54,7 +64,10 @@ class Projection:
     wins_per_month_point: float
     wins_per_month_low: float
     wins_per_month_high: float
-    avg_surplus_eth: float
+    # `median_surplus_eth` drives projections (robust to outliers).  `mean_*`
+    # is shown alongside for transparency so a hidden inflation isn't hiding.
+    median_surplus_eth: float
+    mean_surplus_eth: float
     reward_eur_month: float
     surplus_eur_month: float
     reward_after_fee_eur: float
@@ -62,6 +75,71 @@ class Projection:
     net_eur_month_point: float
     net_eur_month_low: float
     net_eur_month_high: float
+
+
+def _ring_signature(solution: dict | None) -> str | None:
+    """Stable hash of a ring's order-UID set.
+
+    Same orders in any order → same sig; missing trades → None.  Falls back
+    cleanly on malformed solutions so a single bad row doesn't poison the
+    whole projection.
+    """
+    if not isinstance(solution, dict):
+        return None
+    trades = solution.get("trades") or []
+    uids = sorted(
+        t.get("orderUid") for t in trades if isinstance(t, dict) and t.get("orderUid")
+    )
+    if not uids:
+        return None
+    return hashlib.md5(",".join(uids).encode("utf-8")).hexdigest()
+
+
+def _dedupe_by_ring(
+    rows: list[tuple[int, str | None]],
+) -> list[int]:
+    """Collapse rows with the same ring signature into one representative.
+
+    Each unique signature contributes ONE win whose surplus is the median
+    surplus observed for that ring across the window.  Rows with sig=None
+    (no extractable trades) pass through untouched — better to leave them
+    than silently drop revenue.
+    """
+    by_sig: dict[str, list[int]] = defaultdict(list)
+    out: list[int] = []
+    for score, sig in rows:
+        if sig is None:
+            out.append(score)
+        else:
+            by_sig[sig].append(score)
+    for scores in by_sig.values():
+        out.append(int(statistics.median(scores)))
+    return out
+
+
+def _cap_outliers(values: list[int], percentile: float) -> list[int]:
+    """Clip each value at the (window-local) percentile.
+
+    Replaces a tail of inflated rows (e.g. an old code-path bug that scored
+    a route at 50× the typical value) with the percentile cap, rather than
+    deleting them — keeps the win count honest while neutralising the inflation.
+
+    Uses a hard "nearest-rank" percentile rather than statistics.quantiles
+    (which linearly interpolates between samples and would not hard-clip a
+    lone outlier — the cap drifts toward the outlier value).
+
+    No-op when percentile >= 100 or sample size < 10.
+    """
+    if percentile >= 100.0 or len(values) < 10:
+        return values
+    sorted_vals = sorted(values)
+    # Nearest-rank: cap = sorted[ceil(N * p/100) - 1], 1-indexed.
+    # For N=100, p=99: cap = sorted[98] = second-largest. A single outlier
+    # at position 100 gets clipped down to that.
+    n = len(sorted_vals)
+    rank = max(1, -(-int(n * percentile) // 100))  # ceil(n*p/100), 1-indexed
+    cap = sorted_vals[rank - 1]
+    return [min(v, cap) for v in values]
 
 
 def project_monthly(
@@ -72,14 +150,23 @@ def project_monthly(
     bonding_fee_pct: float,
     win_rate_confidence: float,
 ) -> Projection:
-    """Pure math — separated so it is unit-testable without a DB."""
+    """Pure math — separated so it is unit-testable without a DB.
+
+    Uses MEDIAN surplus per win, not mean.  Median is robust against the
+    kind of outliers shadow data is prone to: an old-code bug logging an
+    impossible-to-execute 0.498 ETH route inflates the mean by ~70× while
+    barely moving the median.  Mean is still reported alongside.
+    """
     months_per_window = window_days / _DAYS_PER_MONTH
 
     all_surplus_wei = [s for wins in wins_by_strategy.values() for s in wins]
     total_wins = len(all_surplus_wei)
-    avg_surplus_eth = (
-        (statistics.mean(all_surplus_wei) / 1e18) if all_surplus_wei else 0.0
-    )
+    if all_surplus_wei:
+        median_surplus_eth = statistics.median(all_surplus_wei) / 1e18
+        mean_surplus_eth = statistics.mean(all_surplus_wei) / 1e18
+    else:
+        median_surplus_eth = 0.0
+        mean_surplus_eth = 0.0
 
     wins_per_month = total_wins / months_per_window if months_per_window > 0 else 0.0
     wins_low = wins_per_month * (1 - win_rate_confidence)
@@ -87,7 +174,7 @@ def project_monthly(
 
     def _net_at(wins_pm: float) -> tuple[float, float, float]:
         reward_eth = wins_pm * _ARBITRUM_MIN_REWARD_ETH
-        surplus_eth = wins_pm * avg_surplus_eth
+        surplus_eth = wins_pm * median_surplus_eth
         reward_eur = reward_eth * eth_price_eur
         surplus_eur = surplus_eth * eth_price_eur
         # CIP-48 service fee applies to COW-denominated performance rewards.
@@ -109,7 +196,8 @@ def project_monthly(
         wins_per_month_point=wins_per_month,
         wins_per_month_low=wins_low,
         wins_per_month_high=wins_high,
-        avg_surplus_eth=avg_surplus_eth,
+        median_surplus_eth=median_surplus_eth,
+        mean_surplus_eth=mean_surplus_eth,
         reward_eur_month=reward_eur,
         surplus_eur_month=surplus_eur,
         reward_after_fee_eur=reward_after_fee,
@@ -120,8 +208,29 @@ def project_monthly(
     )
 
 
-async def collect_wins_per_strategy(days: int) -> dict[str, list[int]]:
-    """Per-strategy list of our_score_wei for auctions we'd have won."""
+async def collect_wins_per_strategy(
+    days: int,
+    *,
+    dedup_rings: bool = True,
+    outlier_cap_percentile: float = 99.0,
+) -> dict[str, list[int]]:
+    """Per-strategy list of our_score_wei for auctions we'd have won.
+
+    Two debiasing steps applied before returning:
+
+    1.  ``dedup_rings=True`` (default):  for the multi-party strategy, rows
+        with the same ring-signature collapse to a single representative
+        whose surplus is the median of the group.  Without this, a persistent
+        TWAP order produces the same 4-UID ring in every auction → raw counts
+        overstate settlements by 50–400×.
+    2.  ``outlier_cap_percentile=99`` (default):  values above the p99 of
+        each per-strategy distribution are clipped to that cap.  Neutralises
+        old-code-bug rows (e.g. router-v2 logging 0.498 ETH on auctions where
+        the realistic margin is ~0.001 ETH) without dropping the win itself.
+
+    Set ``dedup_rings=False`` or ``outlier_cap_percentile=100`` to disable
+    each step independently; useful when validating raw shadow numbers.
+    """
     since = datetime.now(UTC) - timedelta(days=days)
     Session = get_session_factory()
 
@@ -130,6 +239,7 @@ async def collect_wins_per_strategy(days: int) -> dict[str, list[int]]:
             select(
                 ShadowSolution.strategy,
                 ShadowSolution.our_score_wei,
+                ShadowSolution.solution,
                 ShadowWinner.score.label("winner_score"),
             )
             .join(ShadowAuction, ShadowAuction.auction_id == ShadowSolution.auction_id)
@@ -142,11 +252,23 @@ async def collect_wins_per_strategy(days: int) -> dict[str, list[int]]:
         )
         rows = q.all()
 
-    wins: dict[str, list[int]] = defaultdict(list)
+    # Bucket (score, sig) per strategy first — sig only needed for dedup
+    # but cheap to compute up-front and lets _dedupe_by_ring stay pure.
+    wins_with_sigs: dict[str, list[tuple[int, str | None]]] = defaultdict(list)
     for r in rows:
         if int(r.our_score_wei) > int(r.winner_score):
-            wins[r.strategy].append(int(r.our_score_wei))
-    return dict(wins)
+            sig = _ring_signature(r.solution) if r.strategy == _DEDUP_STRATEGY else None
+            wins_with_sigs[r.strategy].append((int(r.our_score_wei), sig))
+
+    out: dict[str, list[int]] = {}
+    for strategy, paired in wins_with_sigs.items():
+        if dedup_rings and strategy == _DEDUP_STRATEGY:
+            values = _dedupe_by_ring(paired)
+        else:
+            values = [s for s, _ in paired]
+        values = _cap_outliers(values, outlier_cap_percentile)
+        out[strategy] = values
+    return out
 
 
 def print_report(p: Projection, eth_price_eur: float, bonding_fee_pct: float) -> None:
@@ -154,10 +276,14 @@ def print_report(p: Projection, eth_price_eur: float, bonding_fee_pct: float) ->
     print(f"\n{bar}")
     print(f"Economics Projection — last {p.window_days} day(s)")
     print(bar)
-    print(f"Hypothetical wins observed: {p.wins_total}")
+    print(f"Hypothetical wins observed: {p.wins_total} (after dedup + outlier-cap)")
     for strat, n in sorted(p.wins_per_strategy.items()):
         print(f"  {strat:30s} {n:4d}")
-    print(f"\nAvg solver surplus per win:    {p.avg_surplus_eth:+.6f} ETH")
+    print(f"\nSurplus per win (drives projection): median {p.median_surplus_eth:+.6f} ETH")
+    print(f"                                     mean   {p.mean_surplus_eth:+.6f} ETH")
+    if p.mean_surplus_eth > 2 * max(p.median_surplus_eth, 1e-9):
+        # >2× spread is the canary for a stray outlier still hiding in the tail.
+        print("  (mean ≫ median → outlier tail; check raw distribution before trusting)")
     print(
         f"Projected wins / month:        {p.wins_per_month_point:5.1f} "
         f"(±{(p.wins_per_month_high - p.wins_per_month_point):4.1f})"
@@ -201,9 +327,22 @@ def main() -> None:
     parser.add_argument("--server-cost-eur", type=float, default=60.0)
     parser.add_argument("--bonding-fee-pct", type=float, default=15.0)
     parser.add_argument("--win-rate-confidence", type=float, default=0.2)
+    parser.add_argument(
+        "--no-dedup-rings", action="store_true",
+        help="Disable multi-party ring-signature dedup (shows raw inflated wins).",
+    )
+    parser.add_argument(
+        "--outlier-cap-percentile", type=float, default=99.0,
+        help="Clip surplus values above this percentile per strategy (default 99). "
+             "Set to 100 to disable.",
+    )
     args = parser.parse_args()
 
-    wins = asyncio.run(collect_wins_per_strategy(days=args.days))
+    wins = asyncio.run(collect_wins_per_strategy(
+        days=args.days,
+        dedup_rings=not args.no_dedup_rings,
+        outlier_cap_percentile=args.outlier_cap_percentile,
+    ))
     projection = project_monthly(
         wins_by_strategy=wins,
         window_days=args.days,
