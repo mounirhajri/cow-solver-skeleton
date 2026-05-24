@@ -225,7 +225,7 @@ class RouterSolver:
     def _select_best_quote_per_order(
         quotes: list[V3BatchedQuote],
         *,
-        only_amount_in: int | None = None,
+        filter_amount_in: int | None = None,
     ) -> dict[str, V3BatchedQuote]:
         """Select the best quote per order_uid.
 
@@ -240,7 +240,7 @@ class RouterSolver:
         the de-facto tie-break is "lower fee tier wins, then direct over
         2-hop". Swap for an explicit sort key if that order matters.
 
-        ``only_amount_in``: when set, only consider quotes whose path has
+        ``filter_amount_in``: when set, only consider quotes whose path has
         exactly this ``amount_in`` value. Used to select the best quote
         among a specific fraction (e.g. the best 0.75× route).
         """
@@ -248,7 +248,7 @@ class RouterSolver:
         for q in quotes:
             if q.amount_out == 0:
                 continue
-            if only_amount_in is not None and q.path.amount_in != only_amount_in:
+            if filter_amount_in is not None and q.path.amount_in != filter_amount_in:
                 continue
             current = best.get(q.path.order_uid)
             if current is None:
@@ -336,6 +336,17 @@ class RouterSolver:
                     # at least ``f × buy_amount`` (pro-rata).
                     # All fraction paths were included in the original batch
                     # (see _build_v3_candidate_paths), so no extra RPC calls.
+                    #
+                    # Spec-deviation: probe descending (0.75x → 0.5x) instead
+                    # of the spec's "if 0.5x clears, midpoint search".
+                    # Descending order is strictly better: it emits the larger
+                    # feasible fill in EVERY case the spec would emit, AND it
+                    # also emits when 0.5x misses but 0.75x clears (an
+                    # asymmetric AMM pricing curve can produce this — common
+                    # with concentrated liquidity).  Same RPC budget (2 extra
+                    # batched quotes), strictly more user fills.
+                    # Floor is intentional: pro-rata limits always favour
+                    # the user (CoW convention).
                     partial_fractions = [
                         (3 * order.sell_amount // 4, 3 * order.buy_amount // 4),
                         (order.sell_amount // 2, order.buy_amount // 2),
@@ -343,7 +354,7 @@ class RouterSolver:
                     emitted = False
                     for partial_sell, partial_buy_limit in partial_fractions:
                         frac_best = self._select_best_quote_per_order(
-                            quotes, only_amount_in=partial_sell
+                            quotes, filter_amount_in=partial_sell
                         ).get(order.uid)
                         if frac_best is not None and frac_best.amount_out >= partial_buy_limit:
                             trades.append(
@@ -357,6 +368,14 @@ class RouterSolver:
                                 prices, order,
                                 executed_buy=frac_best.amount_out,
                                 executed_sell=partial_sell,
+                            )
+                            log.info(
+                                "router_partial_fill_emitted",
+                                auction_id=auction.id,
+                                order_uid=order.uid,
+                                fraction=partial_sell / order.sell_amount,
+                                partial_sell=partial_sell,
+                                amm_output=frac_best.amount_out,
                             )
                             emitted = True
                             break

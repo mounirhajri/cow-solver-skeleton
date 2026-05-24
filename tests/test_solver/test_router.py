@@ -1193,3 +1193,55 @@ async def test_partial_quote_search_path_count_check(
         f"non-partial order must only have full-amount (2000) paths, "
         f"got amounts: {sorted({p.amount_in for p in non_partial_paths_all})}"
     )
+
+
+@pytest.mark.asyncio
+async def test_partial_quote_search_emits_at_75pct_when_50pct_misses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Asymmetric AMM curve: 0.75x clears the pro-rata limit, 0.5x does not.
+    Documents the deviation from the spec's literal `if 0.5x clears` gate.
+    A concentrated-liquidity tick boundary can produce this.
+
+    full(1000) -> 800, miss (limit 900)
+    0.75x(750) -> 690, clears (limit 675)
+    0.5x(500) -> 400, MISS (limit 450)
+    Expected: emit at 0.75x, executed_amount=750.
+    """
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        out = []
+        for p in paths:
+            if p.amount_in == 1000:
+                amt = 800   # full: misses 900
+            elif p.amount_in == 750:
+                amt = 690   # 0.75x: clears 675
+            elif p.amount_in == 500:
+                amt = 400   # 0.5x: MISSES 450 (asymmetric AMM curve)
+            else:
+                amt = 0
+            out.append(V3BatchedQuote(path=p, amount_out=amt))
+        return out
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    order = _make_order(
+        uid="pf_asym",
+        sellAmount=1000,
+        buyAmount=900,
+        partiallyFillable=True,
+    )
+    result = await router.solve(_make_auction([order]))
+
+    assert isinstance(result, Solution), (
+        "spec-deviation case: 0.75x clears, 0.5x misses → should still emit at 0.75x"
+    )
+    trade = result.trades[0]
+    assert trade.executed_amount == 750, (
+        f"expected executed_amount=750 (0.75x), got {trade.executed_amount}"
+    )
