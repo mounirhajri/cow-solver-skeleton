@@ -917,3 +917,279 @@ async def test_clearing_prices_zero_surplus_when_amm_at_limit(
     assert score_wei == 0, (
         f"AMM-rate == limit-rate must score 0, got {score_wei}"
     )
+
+
+# ── Phase 3: partial-fill router partial-quote search ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_partial_quote_search_emits_at_75pct_when_full_misses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sell partial order: full(1000)→800 misses limit 900; 0.75x(750)→700
+    clears 0.75×900=675; 0.5x(500)→500 clears 0.5×900=450.
+    Expected: emit at 0.75x (largest feasible), executed_amount=750.
+    """
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    def _mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        out = []
+        for p in paths:
+            if p.amount_in == 1000:
+                amt = 800   # full: misses limit 900
+            elif p.amount_in == 750:
+                amt = 700   # 0.75x: clears 675 (0.75×900)
+            elif p.amount_in == 500:
+                amt = 500   # 0.5x: clears 450 (0.5×900)
+            else:
+                amt = 0
+            out.append(V3BatchedQuote(path=p, amount_out=amt))
+        return out
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        return _mock_batched(_mc, paths)
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    order = _make_order(
+        uid="pf1",
+        sellAmount=1000,
+        buyAmount=900,
+        partiallyFillable=True,
+    )
+    result = await router.solve(_make_auction([order]))
+
+    assert isinstance(result, Solution), "expected a Solution, got NoSolution"
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.order_uid == "pf1"
+    # Emitted at 0.75x — executed sell amount is 750 (not full 1000)
+    assert trade.executed_amount == 750, (
+        f"expected executed_amount=750 (0.75x), got {trade.executed_amount}"
+    )
+    # Clearing prices reflect AMM output at partial amount
+    assert result.prices["0xa"] == 700, (
+        f"expected cp[sell_token]=700 (amm output at 0.75x), got {result.prices['0xa']}"
+    )
+    assert result.prices["0xb"] == 750, (
+        f"expected cp[buy_token]=750 (partial sell), got {result.prices['0xb']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_quote_search_emits_at_75pct_when_50_clears_75_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both partial fractions clear; pick the larger (0.75x).
+    full(1000)→800 miss, 0.75x(750)→690 clears (≥675), 0.5x(500)→460 clears (≥450).
+    Expected: emit at 0.75x, executed_amount=750.
+    """
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        out = []
+        for p in paths:
+            if p.amount_in == 1000:
+                amt = 800   # full: misses 900
+            elif p.amount_in == 750:
+                amt = 690   # 0.75x: clears 675
+            elif p.amount_in == 500:
+                amt = 460   # 0.5x: clears 450
+            else:
+                amt = 0
+            out.append(V3BatchedQuote(path=p, amount_out=amt))
+        return out
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    order = _make_order(
+        uid="pf2",
+        sellAmount=1000,
+        buyAmount=900,
+        partiallyFillable=True,
+    )
+    result = await router.solve(_make_auction([order]))
+
+    assert isinstance(result, Solution)
+    trade = result.trades[0]
+    assert trade.executed_amount == 750, (
+        f"should pick 0.75x (larger feasible), got {trade.executed_amount}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_quote_search_no_op_when_full_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full-amount quote clears: emit at full amount, partial paths requested
+    in batch but their output is unused.
+    """
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    received_paths: list[V3Path] = []
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        received_paths.extend(paths)
+        out = []
+        for p in paths:
+            # Full (1000) clears; partials would also clear but should be unused
+            amt = 1000 if p.amount_in == 1000 else 700
+            out.append(V3BatchedQuote(path=p, amount_out=amt))
+        return out
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    order = _make_order(
+        uid="pf3",
+        sellAmount=1000,
+        buyAmount=900,
+        partiallyFillable=True,
+    )
+    result = await router.solve(_make_auction([order]))
+
+    assert isinstance(result, Solution)
+    trade = result.trades[0]
+    # Must emit at FULL amount, not partial
+    assert trade.executed_amount == 1000, (
+        f"expected full executed_amount=1000, got {trade.executed_amount}"
+    )
+    # Verify partial paths WERE sent in the batch (batched-upfront design)
+    half_amount_paths = [p for p in received_paths if p.amount_in == 500]
+    assert len(half_amount_paths) > 0, (
+        "partial (0.5x) paths should still be included in the batch for partial orders"
+    )
+    three_quarter_paths = [p for p in received_paths if p.amount_in == 750]
+    assert len(three_quarter_paths) > 0, (
+        "partial (0.75x) paths should still be included in the batch for partial orders"
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_quote_search_does_not_search_for_non_partial_orders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-partial sell order misses limit: emit NoSolution; no partial paths
+    are added to the batch for this order.
+    """
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    received_paths: list[V3Path] = []
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        received_paths.extend(paths)
+        return [V3BatchedQuote(path=p, amount_out=800) for p in paths]
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    order = _make_order(
+        uid="np1",
+        sellAmount=1000,
+        buyAmount=900,
+        partiallyFillable=False,  # NOT partial
+    )
+    result = await router.solve(_make_auction([order]))
+
+    # Full amount misses limit → NoSolution (existing behaviour preserved)
+    assert isinstance(result, NoSolution), (
+        "non-partial order that misses limit must still yield NoSolution"
+    )
+    # No partial paths should have been added to the batch for this order
+    half_paths = [p for p in received_paths if p.amount_in == 500]
+    assert len(half_paths) == 0, (
+        f"partial 0.5x paths must NOT be generated for non-partial orders, "
+        f"got {len(half_paths)}"
+    )
+    three_quarter_paths = [p for p in received_paths if p.amount_in == 750]
+    assert len(three_quarter_paths) == 0, (
+        f"partial 0.75x paths must NOT be generated for non-partial orders, "
+        f"got {len(three_quarter_paths)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_quote_search_path_count_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One partial sell + one non-partial sell.
+    Partial order: 3 × FEE_TIERS paths (full + 0.5x + 0.75x).
+    Non-partial order: 1 × FEE_TIERS paths (full only).
+    Verifies that amount_in == sell_amount//2 appears exactly len(FEE_TIERS)
+    times in the batch (once per fee tier for the partial order only).
+    """
+    from src.routing.amm_v3 import FEE_TIERS
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    received_paths: list[V3Path] = []
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        received_paths.extend(paths)
+        return [V3BatchedQuote(path=p, amount_out=0) for p in paths]
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    multicall = AsyncMock()
+    # No intermediates: only direct paths (1 path per fee tier per fraction)
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+
+    partial_order = _make_order(
+        uid="partial",
+        sellAmount=1000,
+        buyAmount=900,
+        partiallyFillable=True,
+    )
+    non_partial_order = _make_order(
+        uid="nonpartial",
+        sellAmount=2000,
+        buyAmount=1800,
+        partiallyFillable=False,
+    )
+    await router.solve(_make_auction([partial_order, non_partial_order]))
+
+    n_fee_tiers = len(FEE_TIERS)
+
+    # partial order: sell_amount // 2 = 500
+    half_paths_partial = [
+        p for p in received_paths
+        if p.order_uid == "partial" and p.amount_in == 500
+    ]
+    assert len(half_paths_partial) == n_fee_tiers, (
+        f"partial order must produce {n_fee_tiers} paths at 0.5x, "
+        f"got {len(half_paths_partial)}"
+    )
+
+    # non-partial order must have zero 0.5x paths
+    half_paths_non_partial = [
+        p for p in received_paths
+        if p.order_uid == "nonpartial" and p.amount_in == 1000  # 2000 // 2
+    ]
+    assert len(half_paths_non_partial) == 0, (
+        "non-partial order must produce 0 paths at 0.5x (sell_amount//2=1000), "
+        "but amount_in=1000 also equals full-amount for a 1000-sell order... "
+        "checking by uid: non-partial order full paths only"
+    )
+    # More precisely: non-partial uid should only have amount_in == 2000 paths
+    non_partial_paths_all = [p for p in received_paths if p.order_uid == "nonpartial"]
+    assert all(p.amount_in == 2000 for p in non_partial_paths_all), (
+        f"non-partial order must only have full-amount (2000) paths, "
+        f"got amounts: {sorted({p.amount_in for p in non_partial_paths_all})}"
+    )
