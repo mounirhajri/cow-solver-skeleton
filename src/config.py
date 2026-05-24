@@ -66,6 +66,15 @@ class Settings(BaseSettings):
     # the LP. 0 = strict ITM (legacy behaviour).
     multi_party_otm_tolerance_bps: int = 100
 
+    # Multi-Party CoW Matching: after emitting a ring, the order UIDs in that
+    # ring are excluded from candidate-graph for this many seconds.  Without
+    # this, a persistent TWAP order whose ring is feasible in every auction
+    # gets re-emitted hundreds of times in shadow even though on-chain the
+    # next chunk wouldn't be available until the TWAP interval elapses.
+    # 600 s (10 min) is conservative for typical TWAP intervals on Arbitrum.
+    # 0 disables the cooldown (legacy behaviour).
+    multi_party_ring_cooldown_seconds: int = 600
+
     # LongTailRouter (Pool-Indexer). Bursts ~60 RPC calls per auction on top of
     # RouterSolver's load. On a tight Alchemy free-tier concurrent-connection
     # quota that pushes RouterSolver into "Authentication required" rejections.

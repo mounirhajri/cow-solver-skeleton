@@ -362,3 +362,110 @@ async def test_ring_at_exact_limit_price_is_feasible() -> None:
     solver = CoWMatchingSolver()
     result = await solver.solve(_mk_auction(orders, tokens))
     assert isinstance(result, (Solution, NoSolution))
+
+
+# ── Ring-cooldown ────────────────────────────────────────────────────────────
+
+
+class _FakeClock:
+    """Monotonic clock stub with an explicit `advance()` for cooldown tests."""
+
+    def __init__(self) -> None:
+        self._t = 1_000.0
+
+    def __call__(self) -> float:
+        return self._t
+
+    def advance(self, seconds: float) -> None:
+        self._t += seconds
+
+
+def _ring_3() -> tuple[list[Order], dict[str, Token]]:
+    """A→B→C→A ring with simple in-money orders."""
+    orders = [
+        _mk_order("o1", "0xA", "0xB"),
+        _mk_order("o2", "0xB", "0xC"),
+        _mk_order("o3", "0xC", "0xA"),
+    ]
+    tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
+    return orders, tokens
+
+
+@pytest.mark.asyncio
+async def test_cooldown_zero_disabled_emits_every_call() -> None:
+    """With cooldown_seconds=0 the legacy behaviour is preserved."""
+    orders, tokens = _ring_3()
+    solver = CoWMatchingSolver(ring_cooldown_seconds=0)
+    r1 = await solver.solve(_mk_auction(orders, tokens, auction_id="1"))
+    r2 = await solver.solve(_mk_auction(orders, tokens, auction_id="2"))
+    assert isinstance(r1, Solution) and isinstance(r2, Solution)
+    assert len(r2.trades) == 3  # second auction still emits
+
+
+@pytest.mark.asyncio
+async def test_cooldown_suppresses_repeat_emission() -> None:
+    """An emitted ring's UIDs go into cooldown — subsequent auction returns NoSolution."""
+    orders, tokens = _ring_3()
+    clock = _FakeClock()
+    solver = CoWMatchingSolver(ring_cooldown_seconds=600, clock=clock)
+
+    r1 = await solver.solve(_mk_auction(orders, tokens, auction_id="1"))
+    assert isinstance(r1, Solution)
+    assert {t.order_uid for t in r1.trades} == {"o1", "o2", "o3"}
+
+    # Same orders in next auction — all three UIDs are in cooldown.
+    r2 = await solver.solve(_mk_auction(orders, tokens, auction_id="2"))
+    assert isinstance(r2, NoSolution)
+
+
+@pytest.mark.asyncio
+async def test_cooldown_expires_after_window() -> None:
+    """After the configured window the same UIDs become eligible again."""
+    orders, tokens = _ring_3()
+    clock = _FakeClock()
+    solver = CoWMatchingSolver(ring_cooldown_seconds=600, clock=clock)
+
+    await solver.solve(_mk_auction(orders, tokens, auction_id="1"))
+    clock.advance(700.0)  # past the 600 s window
+    r2 = await solver.solve(_mk_auction(orders, tokens, auction_id="2"))
+    assert isinstance(r2, Solution)
+    assert {t.order_uid for t in r2.trades} == {"o1", "o2", "o3"}
+
+
+@pytest.mark.asyncio
+async def test_cooldown_only_blocks_emitted_uids() -> None:
+    """A fresh ring sharing no UIDs with the cooled set must still emit."""
+    clock = _FakeClock()
+    solver = CoWMatchingSolver(ring_cooldown_seconds=600, clock=clock)
+
+    # First auction emits ring1 = {o1, o2, o3} on tokens A/B/C.
+    orders1, tokens1 = _ring_3()
+    r1 = await solver.solve(_mk_auction(orders1, tokens1, auction_id="1"))
+    assert isinstance(r1, Solution)
+
+    # Second auction has a DIFFERENT ring on tokens D/E/F with fresh UIDs.
+    orders2 = [
+        _mk_order("p1", "0xD", "0xE"),
+        _mk_order("p2", "0xE", "0xF"),
+        _mk_order("p3", "0xF", "0xD"),
+    ]
+    tokens2 = {"0xD": _mk_token(), "0xE": _mk_token(), "0xF": _mk_token()}
+    r2 = await solver.solve(_mk_auction(orders2, tokens2, auction_id="2"))
+    assert isinstance(r2, Solution)
+    assert {t.order_uid for t in r2.trades} == {"p1", "p2", "p3"}
+
+
+@pytest.mark.asyncio
+async def test_cooldown_not_set_on_no_solution_path() -> None:
+    """An auction that yields NoSolution must NOT poison the cooldown set —
+    otherwise a single infeasible candidate would lock out future legit rings."""
+    orders, tokens = _ring_3()
+    # Make the ring infeasible by pricing one token far OTM.
+    tokens["0xA"] = Token(decimals=18, referencePrice=1)  # extreme imbalance
+    clock = _FakeClock()
+    solver = CoWMatchingSolver(ring_cooldown_seconds=600, clock=clock)
+
+    r1 = await solver.solve(_mk_auction(orders, tokens, auction_id="1"))
+    # Whether feasible or not depends on filter; assert state is empty if NoSolution.
+    if isinstance(r1, NoSolution):
+        assert solver._uid_cooldown == {}
