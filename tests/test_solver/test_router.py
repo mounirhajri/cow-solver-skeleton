@@ -765,13 +765,36 @@ async def test_clearing_prices_track_amm_ratio_not_oracle_for_otm_buy(
         ],
     }
     score_wei = compute_solution_score(sol_dict, orders_by_uid, native_prices)
-    # Phantom would have been ~6.6e18 wei. Realised surplus on this scenario,
-    # when scored at AMM-rate clearing prices, is dominated by integer-division
-    # rounding noise — the order is at AMM-rate exactly per the clearing prices.
-    # Allow a generous 2 ETH ceiling; under the bug we'd see 6+ ETH.
-    assert score_wei < 2 * 10**18, (
-        f"score must reflect realised surplus only, got {score_wei} wei "
-        f"({score_wei / 10**18:.4f} ETH) — phantom bug regression?"
+    # Compute the score the OLD (buggy) reference-price-as-clearing-price
+    # code would have persisted, against the SAME auction inputs.
+    phantom_sol_dict = {
+        "prices": {sell_token: str(usdc_ref), buy_token: str(wbtc_ref)},
+        "trades": sol_dict["trades"],
+    }
+    phantom_score = compute_solution_score(
+        phantom_sol_dict, orders_by_uid, native_prices
+    )
+    # Phantom in this exact scenario ≈ 6.65 ETH (matches live id=6229 row).
+    # Real at AMM-rate ≈ 5.17 ETH (AMM 80k > oracle 76,240 → less surplus
+    # captured than oracle would have implied). Both are non-trivial because
+    # the order has 22 % slack vs market — that slack is realistically
+    # reduced to what the AMM actually leaves on the table.
+    assert phantom_score > 6 * 10**18, (
+        "sanity: oracle-clearing-price scoring on this scenario should "
+        f"reproduce the ~6.6 ETH phantom, got {phantom_score}"
+    )
+    assert score_wei < phantom_score, (
+        f"AMM-rate clearing prices must produce STRICTLY LESS surplus than "
+        f"oracle-rate would: got {score_wei} vs phantom {phantom_score}"
+    )
+    # Belt-and-braces: realised score should reflect the AMM gap exactly.
+    # signed_sell − amm_amount_in = 13,262,719,916 atom-USDC of realised
+    # buy-order surplus. The CIP-14 conversion then translates that to the
+    # WBTC-numéraire equivalent. The exact figure depends on integer
+    # divisions in _score_buy_trade — we pin it loose to avoid brittle math.
+    assert 4 * 10**18 < score_wei < 6 * 10**18, (
+        f"realised score expected in 4-6 ETH band for this synthetic, "
+        f"got {score_wei}"
     )
 
 
