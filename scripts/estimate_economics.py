@@ -58,12 +58,13 @@ _DAYS_PER_MONTH = 30.44
 # Rows persisted before this cutoff used a buggy clearing-price convention in
 # RouterSolver (oracle reference_price instead of AMM execution rate), which
 # overstated CIP-14 surplus systematically — median 6.6 ETH per fill at the
-# height of the contamination. Fix landed in PR #26 (2026-05-24). Rows from
+# height of the contamination. Fix landed in PR #26 (merged 2026-05-24 20:34
+# UTC, deploy completed 20:37 UTC). Cutoff is set 3 minutes later as a safety
+# margin so any in-flight auctions caught mid-deploy are excluded. Rows from
 # router-v2 before this timestamp are dropped to stop the estimator from
 # republishing phantom numbers from historical data. Bipartite/multi-party
 # rows were unaffected by the bug (they don't use _register_prices).
-# Override with --include-pre-cutoff for archaeology.
-_ROUTER_PRICE_BUG_CUTOFF = datetime(2026, 5, 24, 18, 0, tzinfo=UTC)
+_ROUTER_PRICE_BUG_CUTOFF = datetime(2026, 5, 24, 20, 40, tzinfo=UTC)
 
 
 @dataclass(frozen=True)
