@@ -105,6 +105,38 @@ def test_anomaly_path_taken_when_no_scam_labels(monkeypatch):
     assert "mean_legit_score" in metrics
 
 
+def test_contamination_default_is_low():
+    """Default contamination must trust the training corpus is almost entirely
+    legit.  contamination='auto' (sklearn ~0.10) baked a 10 % anomaly fraction
+    into the decision boundary, which under-classified ~80 % of inference
+    orders as anomalies — verified live 2026-05-24."""
+    from edge.classifier.train import DEFAULT_ANOMALY_CONTAMINATION
+
+    assert 0.0 < DEFAULT_ANOMALY_CONTAMINATION <= 0.05, (
+        f"DEFAULT_ANOMALY_CONTAMINATION={DEFAULT_ANOMALY_CONTAMINATION} is too "
+        f"aggressive; values >0.05 produce overly tight filters on cold-start "
+        f"data sets where confirmed scams are rare."
+    )
+
+
+def test_contamination_override_is_propagated():
+    """A caller passing contamination=0.2 must actually train with that value —
+    not silently fall back to the default.  Guards against a future refactor
+    that drops the kwarg from the AnomalyScorer constructor."""
+    from edge.classifier.feature_engineering import RAW_FEATURE_COLUMNS
+    from edge.classifier.train import _train_model
+
+    rng = np.random.default_rng(123)
+    n = 50
+    df = pd.DataFrame({col: rng.uniform(0, 1, n) for col in RAW_FEATURE_COLUMNS})
+    df["y"] = 1
+    df["first_seen"] = pd.date_range("2025-01-01", periods=n, freq="1h")
+
+    model, _, model_type = _train_model(df, n_samples=n, contamination=0.2)
+    assert model_type == "isolation_forest"
+    assert model._clf.contamination == 0.2
+
+
 def test_binary_path_taken_when_enough_scam_labels():
     """_train_model must return a binary model when scam labels >= MIN_SCAM_SAMPLES."""
     from edge.classifier.feature_engineering import RAW_FEATURE_COLUMNS
