@@ -186,10 +186,11 @@ async def _fetch_goplus_batch(
     url = GOPLUS_URL.format(chain_id=chain_id)
     params = {"contract_addresses": ",".join(addresses)}
 
-    # Exponential backoff: 1s, 2s, 4s. We retry only on 429 / 5xx — other
-    # errors (timeouts, transport) are short-circuited because the API is
-    # cheap to skip; a future run will pick the tokens up again.
-    backoff = 1.0
+    # GoPlus signals rate-limit as HTTP 200 + JSON `code=4029` (verified live
+    # 2026-05-24 — free tier blocks aggressively at ~3 req/s). Treat that
+    # JSON-level code identically to a 429 / 5xx for retry purposes.
+    # Backoff is generous (5s/15s/45s) because the free-tier block lasts ~30-60s.
+    backoff = 5.0
     for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
         try:
             resp = await client.get(url, params=params)
@@ -200,16 +201,31 @@ async def _fetch_goplus_batch(
             log.warning("goplus_network_error", n=len(addresses), error=str(exc))
             return [TokenVerdict(a, "error") for a in addresses]
 
-        if resp.status_code == 429 or 500 <= resp.status_code < 600:
+        is_rate_limited = (
+            resp.status_code == 429
+            or 500 <= resp.status_code < 600
+        )
+        json_code: int | None = None
+        if not is_rate_limited and resp.status_code == 200:
+            try:
+                data_peek: dict[str, Any] = resp.json()
+                json_code = data_peek.get("code")
+                if json_code == 4029:
+                    is_rate_limited = True
+            except ValueError:
+                pass  # fall through to the regular JSON-parsing path
+
+        if is_rate_limited:
             if attempt == MAX_RETRY_ATTEMPTS:
                 log.warning(
                     "goplus_retry_exhausted",
                     n=len(addresses),
-                    status=resp.status_code,
+                    http_status=resp.status_code,
+                    json_code=json_code,
                 )
                 return [TokenVerdict(a, "error") for a in addresses]
             await asyncio.sleep(backoff)
-            backoff *= 2
+            backoff *= 3
             continue
 
         if resp.status_code != 200:
@@ -409,10 +425,11 @@ def main() -> None:
     )
     parser.add_argument("--batch-size", type=int, default=100,
                         help="Number of tokens to process this run (default: 100).")
-    parser.add_argument("--max-concurrent", type=int, default=3,
-                        help="Max parallel GoPlus batched calls (default: 3).")
+    parser.add_argument("--max-concurrent", type=int, default=1,
+                        help="Max parallel GoPlus calls (default: 1). "
+                             "Free tier blocks at ~3 req/s; sequential is the safe default.")
     parser.add_argument("--api-batch-size", type=int, default=DEFAULT_API_BATCH_SIZE,
-                        help="Addresses per GoPlus call (default: 50).")
+                        help="Addresses per GoPlus call (default: 1, batching not supported).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print verdicts but skip DB writes.")
     parser.add_argument("--chain-id", type=int, default=42161,

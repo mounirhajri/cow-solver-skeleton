@@ -192,10 +192,14 @@ async def test_clean_classified_as_legit(session_factory) -> None:
 
 @respx.mock
 async def test_response_code_not_ok_skipped(session_factory) -> None:
-    """code != 1 → GoPlus couldn't analyze → skip, no DB writes."""
+    """code != 1 and != 4029 → GoPlus couldn't analyze → skip, no DB writes.
+
+    code=4029 is treated as rate-limit (retried), so use a different non-OK
+    code here to test the "non-retryable, just skip" path.
+    """
     await _seed_db(session_factory, tokens=[TOKEN_A])
     respx.get(GOPLUS_URL_RE).mock(
-        return_value=httpx.Response(200, json=_gp_response(None, code=4029))
+        return_value=httpx.Response(200, json=_gp_response(None, code=4023))
     )
 
     result = await _seed(
