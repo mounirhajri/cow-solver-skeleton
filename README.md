@@ -20,7 +20,7 @@ composer merges non-overlapping solutions:
 | 2 | BipartiteMatcher | `edge/matching/bipartite.py` | Two-party CoW direct matching |
 | 3 | CoWMatchingSolver | `edge/matching/multi_party.py` | Johnson cycle finder (rustworkx) + quantity-space LP (scipy HiGHS) for 3-4 party rings, with per-UID cooldown so a persistent TWAP doesn't re-emit every auction |
 | 4 | LongTailRouter | `edge/pool_indexer/long_tail_router.py` | UniV2-style routing via Redis-cached pool index (gated, off by default in prod) |
-| 5 | RouterSolver | `src/solver/router.py` | Top-N orders by **expected surplus** (sell_value − buy_value at reference prices) × V3 QuoterV2 across 4 fee tiers, batched in one Multicall3 round-trip |
+| 5 | RouterSolver | `src/solver/router.py` | Top-N orders by **expected surplus** (sell_value − buy_value at reference prices) × V3 QuoterV2 across 4 fee tiers, batched in one Multicall3 round-trip. Supports **both sell and buy kinds** — sell uses `quoteExactInputSingle`, buy uses `quoteExactOutputSingle` |
 
 Composer (`edge/matching/composer.py`) enforces **strict token-disjoint
 composition**: a candidate whose `solution.prices` overlap any
@@ -28,6 +28,21 @@ already-claimed token is rejected wholesale. No price averaging — every
 token's price in the composed solution comes from exactly one solver,
 which is the only way to keep mixed (e.g. ring-anchor-relative vs
 market) price regimes from producing fantasy CIP-14 scores.
+
+Before submission the orchestrator runs an **EBBO check**
+(`src/solver/ebbo.py`): for each emitted sell trade, fetch an external
+V3 quote at the same input size and reject the whole composed Solution
+if our claimed user output falls below external by more than
+`ebbo_tolerance_bps` (default 50 bps). Multi-party rings derive
+ring-internal prices that need not beat external on every hop —
+without this check we'd ship EBBO-violating solutions and risk driver
+rejection or bond slashing on Barn/Production.
+
+Order objects carry `is_smart_wallet_signed` (true for
+`signingScheme ∈ {presign, eip1271, erc1271}`) — used as an
+observability + routing hint for downstream strategies. The driver
+owns actual signature validation; we don't make on-chain
+`isValidSignature` calls.
 
 ## Design rationale
 
@@ -97,6 +112,8 @@ Environment variables (see `src/config.py` for full list + defaults):
 | `LONG_TAIL_ENABLED` | `true` | Set `false` to disable LongTailRouter (recommended on tight RPC tiers) |
 | `MULTI_PARTY_OTM_TOLERANCE_BPS` | `100` | Widens ring-candidate graph beyond strict reference-price-ITM (0 = legacy strict) |
 | `MULTI_PARTY_RING_COOLDOWN_SECONDS` | `600` | After emitting a ring, every involved order UID is excluded from the candidate graph for this many seconds. Mirrors on-chain TWAP behaviour. 0 disables |
+| `EBBO_ENABLED` | `true` | Run External-Best-Bid-Offer pre-submission validator on every composed Solution. Disable for shadow-mode soak to observe violations without rejecting |
+| `EBBO_TOLERANCE_BPS` | `50` | Maximum shortfall vs external V3 quote (basis points) before EBBO rejects the solution. 50 bps = 0.5 % — absorbs sub-second pool drift |
 | `GOPLUS_APP_KEY` / `GOPLUS_APP_SECRET` | unset | Optional GoPlus Security auth tier for `scripts/auto_seed_labels.py` — exchanges to a short-lived access token via SHA1-signed token request. Falls back to anonymous mode (much lower rate limit) when either is missing |
 
 The cold-start IsolationForest behind the RF-filter has two non-obvious

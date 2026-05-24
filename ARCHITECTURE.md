@@ -25,6 +25,11 @@ CoW Driver  ──POST /solve──▶  FastAPI app  ──▶  SolverOrchestrat
                                     any overlap → reject candidate)
                                           │
                                           ▼
+                                  EBBO pre-submission check
+                                   (V3 quote vs our clearing
+                                    price, ±50 bps tolerance)
+                                          │
+                                          ▼
                                   Solution + attempts
                                           │
                           ┌───────────────┼───────────────┐
@@ -98,7 +103,7 @@ RPC tier — its concurrent multicalls compete with RouterSolver for the
 provider's connection budget).
 
 ### 5. RouterSolver (`src/solver/router.py`)
-For top-N sell orders by **expected surplus** (`sell_value − buy_value`
+For top-N orders by **expected surplus** (`sell_value − buy_value`
 at reference prices — the absolute capture opportunity each limit-order
 leaves on the table), requests V3 QuoterV2 quotes across 4 fee tiers
 (direct + 2-hop via configured intermediates) and picks the best per
@@ -107,6 +112,13 @@ of 0 so they sort to the back rather than dominating with a large
 absolute value. Falls back to ETH-value when either token of the order
 lacks a reference price.
 
+Handles both order kinds: sell orders use `quoteExactInputSingle`
+(profitable if `amount_out ≥ buy_amount`); buy orders use
+`quoteExactOutputSingle` with reversed path encoding for multi-hop
+(profitable if `amount_in ≤ sell_amount`). Trade emission follows the
+CoW convention — `executedAmount` is always the order's exact side
+(buyAmount for buys, sellAmount for sells).
+
 Two modes via `ROUTER_V3_ONLY_BATCHED`:
 
 - **Batched** (default, `true`): all candidate paths for the whole
@@ -114,6 +126,31 @@ Two modes via `ROUTER_V3_ONLY_BATCHED`:
   ~80× RPC reduction vs the legacy per-order fan-out
 - **Legacy**: per-order `asyncio.gather` over `quote_best_path`
   (kept for the public clone case where V3 quoters might be unavailable)
+
+## EBBO pre-submission validator (`src/solver/ebbo.py`)
+
+Before returning a Solution to the driver, the orchestrator verifies
+each emitted sell trade against a fresh Uniswap V3 quote of the same
+swap at the same input size. If our effective user output
+(executed_sell × clearing_price_sell / clearing_price_buy) falls below
+the external quote by more than `EBBO_TOLERANCE_BPS` (default 50 bps),
+we reject the whole composed Solution and fall through to NoSolution.
+
+Why this matters: multi-party rings derive ring-internal anchor-
+relative prices that are mathematically consistent within the ring but
+not directly compared to external market prices. A ring whose internal
+rates underprice a hop will silently produce an EBBO-violating
+composed solution if we don't check. Shipping that to mainnet risks
+driver rejection or bond slashing.
+
+Skipped (not failed) cases: buy-kind orders (router-v2 supports
+quoteExactOutput but the validator wiring is follow-up work), trades
+missing clearing prices, trades whose tokens have no external V3
+route, and quoter exceptions (RPC blips should not deny revenue).
+Solution is rejected only on a TRUE shortfall.
+
+The validator shares the orchestrator's Multicall3 instance — no
+extra RPC connection budget.
 
 ## CIP-67 composer (`edge/matching/composer.py`)
 
