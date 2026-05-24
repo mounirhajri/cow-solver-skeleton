@@ -127,6 +127,18 @@ class RouterSolver:
         if not sell_orders:
             return NoSolution()
 
+        # Observability: ratio of smart-wallet (Safe / EIP-1271 / pre-sign)
+        # orders that survived the top-N cap.  Logged after filtering so the
+        # count reflects what the strategy actually quotes, not the raw
+        # auction.  Driver validates the signatures.
+        n_eip1271 = sum(1 for o in sell_orders if o.is_smart_wallet_signed)
+        log.info(
+            "smart_wallet_orders_observed",
+            auction_id=auction.id,
+            n_eip1271=n_eip1271,
+            n_eoa=len(sell_orders) - n_eip1271,
+        )
+
         if self._v3_only_batched:
             return await self._solve_v3_batched(auction, sell_orders)
         return await self._solve_legacy(auction, sell_orders)
