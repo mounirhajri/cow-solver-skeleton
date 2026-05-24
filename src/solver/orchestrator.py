@@ -197,6 +197,7 @@ def load_default_strategies() -> list[SolverStrategy]:
             classifier=classifier,
             session_factory=session_factory,
             otm_tolerance_bps=settings.multi_party_otm_tolerance_bps,
+            ring_cooldown_seconds=settings.multi_party_ring_cooldown_seconds,
         ))
         # Long-tail router shares the multicall instance with NaiveSolver/RouterSolver
         # and is backed by a Redis cache (pool addresses ~7d, reserves ~60s).
