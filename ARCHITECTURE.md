@@ -16,9 +16,13 @@ CoW Driver  ──POST /solve──▶  FastAPI app  ──▶  SolverOrchestrat
                                 │                   │
                                 └─────────┬─────────┘
                                           ▼
+                                Naive excluded from submission
+                                  (oracle-priced, shadow-only)
+                                          │
+                                          ▼
                                   CIP-67 Composer
-                                   (token-disjoint,
-                                    ±2% price tolerance)
+                                   (strict token-disjoint:
+                                    any overlap → reject candidate)
                                           │
                                           ▼
                                   Solution + attempts
@@ -42,6 +46,13 @@ Wraps 1inch quotes for individual orders. Then `price_refiner` issues
 Multicall3-batched on-chain quotes (V2 + V3 via `routing/multihop.py`)
 to replace oracle reference prices with real DEX-execution prices in the
 final clearing-price vector. This is the always-on baseline.
+
+**Important: naive is never the submitted solution.** Its clearing
+prices still over-state realised settlement (oracle prices and spot
+quotes are not the same as final batch-cleared prices). The orchestrator
+filters naive out of composer candidates and the first-winner fallback,
+so naive only ever appears in `shadow_solutions` for analysis — never
+in the driver response.
 
 ### 2. BipartiteMatcher (`edge/matching/bipartite.py`)
 Groups sell orders by directed token pair. For each pair `(A→B, B→A)`,
@@ -68,6 +79,15 @@ solves a quantity-space LP (scipy HiGHS):
 The composer in `multi_party.py` then greedy-picks non-overlapping rings
 (token-disjoint to keep CIP-67 trivially satisfied across rings).
 
+**Ring cooldown**: after emitting a ring, every involved order UID
+goes into a per-solver cooldown cache with a `MULTI_PARTY_RING_COOLDOWN_SECONDS`
+expiry (default 600 s). On subsequent auctions those UIDs are filtered
+out of the candidate set BEFORE Johnson runs. This mirrors on-chain
+TWAP behaviour: after a TWAP chunk is filled, the next chunk is not
+available until the interval elapses. Without the cooldown, a single
+persistent TWAP order produced the same ring in 400+ consecutive
+auctions during shadow runs.
+
 ### 4. LongTailRouter (`edge/pool_indexer/long_tail_router.py`)
 Lazy-indexed UniV2-style router. Per order, looks up cached pool
 addresses (Sushi/Camelot V2) for the sell→buy pair via a Redis-backed
@@ -78,9 +98,16 @@ RPC tier — its concurrent multicalls compete with RouterSolver for the
 provider's connection budget).
 
 ### 5. RouterSolver (`src/solver/router.py`)
-For top-N sell orders by ETH-equivalent value, requests V3 QuoterV2
-quotes across 4 fee tiers (direct + 2-hop via configured intermediates)
-and picks the best per order. Two modes via `ROUTER_V3_ONLY_BATCHED`:
+For top-N sell orders by **expected surplus** (`sell_value − buy_value`
+at reference prices — the absolute capture opportunity each limit-order
+leaves on the table), requests V3 QuoterV2 quotes across 4 fee tiers
+(direct + 2-hop via configured intermediates) and picks the best per
+order. OTM orders (negative margin at reference) clamp to a sort key
+of 0 so they sort to the back rather than dominating with a large
+absolute value. Falls back to ETH-value when either token of the order
+lacks a reference price.
+
+Two modes via `ROUTER_V3_ONLY_BATCHED`:
 
 - **Batched** (default, `true`): all candidate paths for the whole
   auction are batched into one Multicall3 round-trip (`routing/v3_batched.py`).
@@ -93,14 +120,25 @@ and picks the best per order. Two modes via `ROUTER_V3_ONLY_BATCHED`:
 When multiple strategies return non-empty solutions, the composer
 merges them subject to:
 
+- **Naive is filtered out at the orchestrator level** before reaching the
+  composer; its oracle-derived prices are not submission-grade
 - **Per-order disjointness**: an order can appear in at most one trade
-- **Per-token uniform clearing price**: if two strategies claim the same
-  token at different prices, accept only if within ±2 % tolerance;
-  otherwise drop the conflicting trade
+- **Strict token-disjoint composition**: a candidate whose
+  `solution.prices` overlap **any** already-claimed token is rejected
+  wholesale — no averaging, no partial trade leakage. Every token in
+  the composed `Solution.prices` comes from exactly one solver
+
+The "average prices within ±2 % tolerance" variant of this composer
+previously produced ~480 ETH per-win fantasy CIP-14 scores in shadow
+when it mixed multi-party's anchor-relative ring prices with router-v2's
+market prices. Strict disjointness leaves marginal surplus on the table
+but is provably CIP-67-compliant; the alternative shipped unexecutable
+solutions.
 
 The Multi-Party solver additionally enforces *ring-level* token
-disjointness (see `multi_party.py` composer block) because each ring
-derives its own anchor-relative clearing prices.
+disjointness internally (see `multi_party.py` composer block) because
+each ring derives its own anchor-relative clearing prices and those are
+not interchangeable across rings.
 
 ## Persistence
 
@@ -132,10 +170,18 @@ Migrations via Alembic. Run automatically on container restart.
 - Strategies are isolated (per-strategy timeout + try/except in orchestrator)
 - BackgroundTask persistence is never-raising (`persist_*_safe` wrappers)
 - The edge submodule is optional at runtime; missing submodule degrades
-  gracefully (only naive + router-v2 run)
+  gracefully (only naive + router-v2 run; naive is still excluded from
+  submission, so a public clone with no edge submodule and a working
+  router-v2 still produces submission-grade output, but a clone with
+  *only* naive falls through to NoSolution rather than submit fantasy
+  trades)
 - All clearing-price logic respects user limits at the prices we claim
   (LP enforces `s_i × x_{i+1} ≥ b_i × x_i` in atoms; clearing prices are
   derived such that the rate equals or exceeds each user's limit rate)
+- The reconcile loop tolerates corrupted JSONL lines: each line is
+  parsed in its own try/except and corrupt lines are dropped on the
+  next rewrite, so a single bad record from a crash or disk-full event
+  cannot tear down the loop forever
 - RPC client retries 429 / -32005 with exponential back-off
 
 ## Observability
