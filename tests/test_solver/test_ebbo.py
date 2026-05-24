@@ -252,7 +252,7 @@ def test_default_tolerance_is_documented() -> None:
 @pytest.mark.asyncio
 async def test_truncates_at_max_trades(quoter, monkeypatch) -> None:
     """Pathological composer output > _MAX_TRADES_PER_CHECK is truncated and
-    logged, not iterated through unbounded."""
+    counted in n_truncated, not silently dropped."""
     from src.solver import ebbo as _ebbo
     monkeypatch.setattr(_ebbo, "_MAX_TRADES_PER_CHECK", 3)
     orders = [_order(uid=f"0x{i:0112x}") for i in range(5)]
@@ -262,9 +262,28 @@ async def test_truncates_at_max_trades(quoter, monkeypatch) -> None:
         for i in range(5)
     ]
     solution = _solution(trades, prices={"0xa": 1, "0xb": 1})
-    for i in range(5):
-        quoter[("0xa", "0xb", 1000)] = 1000
+    quoter[("0xa", "0xb", 1000)] = 1000
 
     r = await validate_solution_ebbo(solution, auction, multicall=None, intermediates=[])
     assert r.passes
-    assert r.n_checked == 3  # truncated to _MAX_TRADES_PER_CHECK
+    assert r.n_checked == 3      # _MAX_TRADES_PER_CHECK
+    assert r.n_truncated == 2    # 5 trades − 3 checked
+
+
+@pytest.mark.asyncio
+async def test_uses_ceil_div_to_mirror_scoring(quoter) -> None:
+    """`our_buy_amount` rounding must match `_score_sell_trade`'s _ceil_div,
+    otherwise EBBO could reject a solution by 1 wei that scoring would accept.
+
+    With executed=7, cp_sell=10, cp_buy=3: floor((7*10)/3)=23, ceil=24.
+    External returns 24 → with tolerance=0 we should PASS at 24, not fail."""
+    o = _order(sell_amount=7, buy_amount=20)
+    auction = _auction([o])
+    trade = Trade(kind="fulfillment", orderUid=UID, executedAmount=7)
+    solution = _solution([trade], prices={"0xa": 10, "0xb": 3})
+    quoter[("0xa", "0xb", 7)] = 24
+
+    r = await validate_solution_ebbo(
+        solution, auction, multicall=None, intermediates=[], tolerance_bps=0
+    )
+    assert r.passes, "ceil_div must round up so our_buy=24 matches ext=24 at tolerance=0"

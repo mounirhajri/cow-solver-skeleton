@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -105,6 +105,19 @@ class Settings(BaseSettings):
     # Observability
     log_level: str = "INFO"
     prometheus_port: int = 8001
+
+    @field_validator("ebbo_tolerance_bps")
+    @classmethod
+    def _check_ebbo_tolerance(cls, v: int) -> int:
+        # Out-of-range values would silently disable EBBO (>=10000 → all
+        # solutions pass) or over-strict (negative → all solutions fail).
+        # Both are dangerous: the former ships fantasy prices, the latter
+        # denies revenue. Reject the config at startup instead.
+        if not (0 <= v < 10_000):
+            raise ValueError(
+                f"ebbo_tolerance_bps must be in [0, 10000); got {v}"
+            )
+        return v
 
 
 settings = Settings()

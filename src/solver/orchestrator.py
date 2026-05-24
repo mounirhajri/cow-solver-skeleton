@@ -7,6 +7,7 @@ from src.log import get_logger
 from src.models.auction import Auction
 from src.models.solution import Solution
 from src.solver.base import NoSolution, SolverStrategy
+from src.solver.ebbo import DEFAULT_TOLERANCE_BPS
 
 log = get_logger(__name__)
 
@@ -39,7 +40,7 @@ class SolverOrchestrator:
         compose: bool = True,
         ebbo_multicall: object = None,
         ebbo_intermediates: list[str] | None = None,
-        ebbo_tolerance_bps: int = 50,
+        ebbo_tolerance_bps: int = DEFAULT_TOLERANCE_BPS,
     ) -> None:
         if not strategies:
             raise ValueError("at least one strategy required")
@@ -164,11 +165,12 @@ class SolverOrchestrator:
             except ImportError:
                 pass  # edge not present — fall through to first-winner
 
-        # First-winner fallback — also skips naive so we never submit it as
-        # the chosen solution. If only naive solved, we fall through to
-        # NoSolution rather than ship oracle-priced fantasy trades.
-        if composable_solutions:
-            candidate = composable_solutions[0][1]
+        # Fallback chain — try each non-naive candidate in order; ship the
+        # first one EBBO accepts.  Without iteration, an EBBO-rejected
+        # composed solution would silently fall through to a known-untested
+        # first-candidate solution that EBBO might also reject, and a
+        # second candidate that WOULD pass never gets a chance.
+        for _name, candidate in composable_solutions:
             final = await self._ebbo_validate(candidate, auction, attempts)
             if final is not None:
                 return final, attempts

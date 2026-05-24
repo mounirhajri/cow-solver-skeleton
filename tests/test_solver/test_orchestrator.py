@@ -196,3 +196,66 @@ async def test_composer_excludes_naive_when_other_strategy_solves(auction: Aucti
         # falls back (only 1 composable candidate left, threshold is "> 1").
         # So we expect NO composer attempt at all in this 2-strategy case.
         pytest.fail("Composer should not run with a single non-naive solver")
+
+
+async def test_ebbo_rejection_falls_through_to_next_candidate(auction: Auction) -> None:
+    """When EBBO rejects the composed solution (or first candidate), the
+    orchestrator must try the NEXT candidate rather than ship NoSolution.
+
+    Reviewer-flagged bug in PR #22's first-winner fallback: only the FIRST
+    composable candidate was EBBO-checked; if rejected we shipped NoSolution
+    even when a later candidate would have passed.
+    """
+    # Two strategies both solve; we'll configure ebbo to reject the FIRST one.
+    sol_first = _solution()
+    sol_second = _solution()
+    sol_second.trades = [Trade(kind="fulfillment", order_uid="0x" + "c" * 112,
+                                executed_amount=10**18)]
+
+    s1 = AsyncMock(name="s1")
+    s1.name = "s1"
+    s1.solve.return_value = sol_first
+    s2 = AsyncMock(name="s2")
+    s2.name = "s2"
+    s2.solve.return_value = sol_second
+
+    # Inject an EBBO stub that rejects sol_first and accepts sol_second.
+    from src.solver import ebbo as ebbo_mod
+    from src.solver.ebbo import EBBOResult
+    call_count = {"n": 0}
+
+    async def fake_validate(solution, *_a, **_kw):
+        call_count["n"] += 1
+        if solution is sol_first:
+            return EBBOResult(passes=False, violations=["mocked rejection"],
+                              n_checked=1, n_skipped=0)
+        return EBBOResult(passes=True, violations=[], n_checked=1, n_skipped=0)
+
+    import src.solver.orchestrator as orch_mod
+    orch_mod.validate_solution_ebbo = fake_validate  # type: ignore[attr-defined]
+    # Composer needs >1 candidate to fire; with only 2 strategies it builds a
+    # composed solution which itself goes through EBBO first.  For this test we
+    # set compose=False so the iteration over composable_solutions is exercised.
+    orch = SolverOrchestrator(
+        strategies=[s1, s2],
+        per_strategy_timeout=1.0,
+        run_all_strategies=True,
+        compose=False,
+        ebbo_multicall=object(),  # non-None enables _ebbo_validate
+    )
+    # Re-import the symbol the orchestrator's _ebbo_validate looks up at call-time.
+    import src.solver.orchestrator
+    src.solver.orchestrator.validate_solution_ebbo = fake_validate  # type: ignore[attr-defined]
+    # The _ebbo_validate method imports validate_solution_ebbo INSIDE the
+    # function body, so monkeypatch ebbo module-level instead.
+    ebbo_mod.validate_solution_ebbo = fake_validate  # type: ignore[attr-defined]
+
+    result, attempts = await orch.solve(auction)
+
+    # Second candidate must have been chosen since first was EBBO-rejected.
+    assert result is sol_second
+    # Both candidates were EBBO-checked (rejection on first, pass on second).
+    assert call_count["n"] == 2
+    # A rejection AttemptRecord was logged for the first candidate.
+    rejected = [a for a in attempts if a.strategy == "ebbo-rejected"]
+    assert len(rejected) == 1

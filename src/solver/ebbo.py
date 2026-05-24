@@ -38,6 +38,7 @@ from src.models.auction import Auction
 from src.models.solution import Solution
 from src.routing.multicall import Multicall3
 from src.routing.multihop import quote_best_path
+from src.shadow.scoring import _ceil_div
 
 log = get_logger(__name__)
 
@@ -60,6 +61,11 @@ class EBBOResult:
     violations: list[str]
     n_checked: int
     n_skipped: int
+    # Trades that exceeded _MAX_TRADES_PER_CHECK and were dropped from the
+    # iteration entirely.  Distinct from n_skipped (which is "checked-and-
+    # waived") so callers can monitor the truncation rate separately and
+    # tune _MAX_TRADES_PER_CHECK if it starts firing.
+    n_truncated: int = 0
 
 
 async def validate_solution_ebbo(
@@ -82,12 +88,14 @@ async def validate_solution_ebbo(
     n_skipped = 0
 
     trades = solution.trades[:_MAX_TRADES_PER_CHECK]
-    if len(solution.trades) > _MAX_TRADES_PER_CHECK:
+    n_truncated = max(0, len(solution.trades) - _MAX_TRADES_PER_CHECK)
+    if n_truncated:
         log.warning(
             "ebbo_trade_count_truncated",
             auction_id=auction.id,
             total=len(solution.trades),
             checked=_MAX_TRADES_PER_CHECK,
+            truncated=n_truncated,
         )
 
     for trade in trades:
@@ -117,8 +125,13 @@ async def validate_solution_ebbo(
             continue
 
         # What the user actually receives at our clearing prices.
-        # CoW pricing convention: amount_buy = executed × price_sell / price_buy.
-        our_buy_amount = (int(trade.executed_amount) * int(cp_sell)) // int(cp_buy)
+        # Use _ceil_div to mirror src/shadow/scoring._score_sell_trade — the
+        # CIP-14 canonical rounding direction.  Without this the validator
+        # could reject a solution by 1 wei that the scoring path would
+        # accept, producing inconsistent rejection counts.
+        our_buy_amount = _ceil_div(
+            int(trade.executed_amount) * int(cp_sell), int(cp_buy)
+        )
 
         # External quote for the same swap, same size.  None means "no V3
         # route at all" — in which case our internal trade is by definition
@@ -170,4 +183,5 @@ async def validate_solution_ebbo(
         violations=violations,
         n_checked=n_checked,
         n_skipped=n_skipped,
+        n_truncated=n_truncated,
     )
