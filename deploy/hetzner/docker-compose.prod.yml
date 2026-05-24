@@ -21,6 +21,10 @@ services:
       LOG_LEVEL: INFO
       PROMETHEUS_PORT: 8001
       DATABASE_URL: postgresql+asyncpg://solver:${SOLVER_DB_PASSWORD}@postgres:5432/solver
+      # GoPlus authenticated tier for scripts/auto_seed_labels.py. Both must
+      # be set or the script falls back to anonymous mode (~3 req/s ceiling).
+      GOPLUS_APP_KEY: ${GOPLUS_APP_KEY:-}
+      GOPLUS_APP_SECRET: ${GOPLUS_APP_SECRET:-}
     volumes:
       - ./data:/data
     networks: [stack]
