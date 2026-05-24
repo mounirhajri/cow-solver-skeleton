@@ -36,9 +36,12 @@ queue. Live impact 2026-05-24:
 
 - `router-v2` median score 6.6 ETH per fill (134 fills/24 h), tight
   cluster (max 6.71, min 0.02) — systematic, not outlier.
-- `composer` median 447 ETH (composes router-v2's phantom prices).
-- `naive` median 462 ETH (also reference-priced, but excluded from
-  submission by `test_naive_solution_is_never_submitted`).
+- `composer` median 447 ETH — inherits router-v2's phantom clearing
+  prices via token-disjoint merge. Composer does NOT call
+  `price_refiner`; the contamination flows directly from
+  `_register_prices` into composed solutions.
+- `naive` median 462 ETH (also reference-priced via `naive.py:81-82`,
+  excluded from submission by `test_naive_solution_is_never_submitted`).
 - `estimate_economics.py` projected €67M/Mo net.
 
 Confirmed mathematically against a real auction row: a BUY of 1 WBTC
@@ -59,10 +62,14 @@ the score is in real ETH-equivalent terms.
 ### Related places still using reference_price as clearing price
 
 - `src/solver/price_refiner.py:151,177-179` — same pattern. Inline
-  comment explicitly cites cross-pair consistency as motivation, but
-  the surplus overstatement is identical. Composer's 447 ETH median
-  comes from here. Fix needs CIP-67-uniform clearing prices (LP over
-  AMM rates), tracked separately — out of scope for the hotfix.
+  comment (lines 168-179) explicitly cited cross-pair consistency as
+  motivation; that argument has now been falsified by the live data
+  and the comment has been replaced with a KNOWN-BAD warning in this
+  PR. Code path is only safe today because the sole caller is naive,
+  which is excluded from submission and from composer-input. Real fix
+  needs CIP-67-uniform clearing prices (LP over per-pair AMM rates),
+  tracked separately as a partial-fills design dependency — out of
+  scope for this hotfix.
 - `src/solver/naive.py:81-82` — same pattern but harmless: naive is
   excluded from submission and from composer-input by tests
   `test_naive_solution_is_never_submitted` and

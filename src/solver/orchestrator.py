@@ -2,6 +2,7 @@ import asyncio
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from src.log import get_logger
 from src.models.auction import Auction
@@ -356,7 +357,7 @@ def load_default_orchestrator() -> SolverOrchestrator:
     )
 
 
-def _load_default_strategies_with_multicall(multicall: object) -> list[SolverStrategy]:
+def _load_default_strategies_with_multicall(multicall: Any) -> list[SolverStrategy]:
     """Identical to ``load_default_strategies`` but reuses an injected multicall.
 
     Internal helper for ``load_default_orchestrator`` — keeps the public

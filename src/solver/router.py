@@ -268,7 +268,7 @@ class RouterSolver:
                     )
                 )
                 self._register_prices(
-                    prices, order, auction,
+                    prices, order,
                     executed_buy=order.buy_amount,
                     executed_sell=amount_in,
                 )
@@ -283,7 +283,7 @@ class RouterSolver:
                     )
                 )
                 self._register_prices(
-                    prices, order, auction,
+                    prices, order,
                     executed_buy=best.amount_out,
                     executed_sell=order.sell_amount,
                 )
@@ -354,7 +354,7 @@ class RouterSolver:
                 )
             )
             self._register_prices(
-                prices, order, auction,  # type: ignore[arg-type]
+                prices, order,  # type: ignore[arg-type]
                 executed_buy=executed_buy,
                 executed_sell=order.sell_amount,  # type: ignore[attr-defined]
             )
@@ -382,7 +382,6 @@ class RouterSolver:
     def _register_prices(
         prices: dict[str, int],
         order: Order,
-        auction: Auction,
         *,
         executed_buy: int,
         executed_sell: int,
