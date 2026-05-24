@@ -274,10 +274,10 @@ async def test_bipartite_partial_pair_matches_at_min_volume():
     Current (pre-Phase-2) logic after clamping b_gives to 600:
       b_gives(600) < a.buy_amount(900) → would reject.
     Phase-2 fix: A is partial, so downscale A's executed sell proportionally.
-      executed_a_sell = b_gives * b.buy_amount // b.sell_amount
-                      = 600 * 500 // 600 = 500
-      Check A's limit: A sells 500 X and receives 600 Y >= 900*(500/1000)=450  ✓
-      Check B's limit: B sells 600 Y and receives 500 X >= 500  ✓
+      executed_a_sell = b_gives * a.sell_amount // a.buy_amount
+                      = 600 * 1000 // 900 = 666
+      Check A's limit: A sells 666 X and receives 600 Y >= 900*(666/1000)=599.4  ✓
+      Check B's limit: B sells 600 Y and receives 666 X >= 500  ✓
     """
     m = BipartiteMatcher()
     oA = mk_partial_order(
