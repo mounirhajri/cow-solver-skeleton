@@ -144,7 +144,12 @@ class _PerTokenClassifier:
 
 @pytest.mark.asyncio
 async def test_filters_out_low_sell_token(feature_session_factory, monkeypatch):
-    """Order whose sell_token scores < threshold is dropped."""
+    """Order whose sell_token scores < threshold is dropped.
+
+    Uses explicit threshold=0.4 — the production default is now 0.05 to
+    accommodate cold-start IsolationForest scoring, so the original 0.1 vs
+    0.4 contrast had to be specified manually.
+    """
     cls = _PerTokenClassifier(scores={"0xa": 0.1, "0xb": 0.9})
 
     # Patch _fetch_token_features to inject the address into the feature dict
@@ -158,7 +163,9 @@ async def test_filters_out_low_sell_token(feature_session_factory, monkeypatch):
         _mk_order("o1", "0xa", "0xb"),  # sell=0.1 → drop
         _mk_order("o2", "0xb", "0xa"),  # buy=0.1  → drop
     ]
-    out = await filter_orders_by_token_quality(orders, feature_session_factory, cls)
+    out = await filter_orders_by_token_quality(
+        orders, feature_session_factory, cls, threshold=0.4
+    )
     assert out == []
 
 
@@ -172,7 +179,9 @@ async def test_filters_out_low_buy_token(feature_session_factory, monkeypatch):
     monkeypatch.setattr("edge.matching.rf_filter._fetch_token_features", fake_fetch)
 
     orders = [_mk_order("o1", "0xa", "0xb")]
-    out = await filter_orders_by_token_quality(orders, feature_session_factory, cls)
+    out = await filter_orders_by_token_quality(
+        orders, feature_session_factory, cls, threshold=0.4
+    )
     assert out == []
 
 
@@ -251,3 +260,69 @@ async def test_fetch_token_features_lowercases(feature_session_factory):
 async def test_fetch_token_features_empty_input(feature_session_factory):
     out = await _fetch_token_features(feature_session_factory, [])
     assert out == {}
+
+
+@pytest.mark.asyncio
+async def test_core_arbitrum_tokens_bypass_classifier(feature_session_factory, monkeypatch):
+    """USDC/USDC.e/DAI/WETH/WBTC/ARB/USDT and native-ETH MUST pass even when
+    the classifier would score them as anomalies.  Verified live 2026-05-24:
+    cold-start IsolationForest scored these majors at 0.0–0.02 because their
+    feature values are extreme relative to the auction-touched training set."""
+
+    # Classifier that would FAIL every token (defensive — should be bypassed)
+    cls = _FakeClassifier(scores_by_token={}, default=0.0)
+    cls.model = object()  # non-None so the no-op short-circuit doesn't trigger
+
+    weth = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+    dai = "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1"
+    usdc_e = "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8"
+    native_eth = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    arb = "0x912ce59144191c1204e64559fe8253a0e49e6548"
+
+    pairs = [
+        ("o1", weth, dai),
+        ("o2", usdc_e, arb),
+        ("o3", native_eth, weth),
+    ]
+    orders = [_mk_order(uid, s, b) for uid, s, b in pairs]
+
+    out = await filter_orders_by_token_quality(orders, feature_session_factory, cls)
+    assert len(out) == 3, (
+        "Core Arbitrum pairs must bypass the classifier "
+        f"(got {[o.uid for o in out]})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_whitelisted_mixed_with_filtered(feature_session_factory, monkeypatch):
+    """When one side is a whitelisted core token and the other scores low,
+    the order STILL filters out — both sides must pass."""
+    cls = _PerTokenClassifier(scores={
+        "0xunknown": 0.0,  # would fail at any threshold
+    })
+    cls.model = object()
+
+    async def fake_fetch(_factory, addrs):
+        return {a.lower(): {"__test_addr__": a.lower()} for a in addrs}
+    monkeypatch.setattr("edge.matching.rf_filter._fetch_token_features", fake_fetch)
+
+    weth = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+    unknown = "0xunknown"
+    # weth side = whitelisted (1.0), unknown side scores 0.0 → reject
+    orders = [_mk_order("o1", weth, unknown)]
+    out = await filter_orders_by_token_quality(orders, feature_session_factory, cls)
+    assert out == [], "Filter must reject orders where the non-whitelisted side fails"
+
+
+def test_default_threshold_is_permissive_enough_for_cold_start():
+    """Pre-fix default was 0.4, which dropped 82 % of orders on live
+    auctions because cold-start IsolationForest scores cluster low.
+    Anchor the new default below the lowest live-observed major-token
+    score (DAI=0.015) with margin."""
+    from edge.matching.rf_filter import _DEFAULT_THRESHOLD
+
+    assert _DEFAULT_THRESHOLD <= 0.1, (
+        f"_DEFAULT_THRESHOLD={_DEFAULT_THRESHOLD} too strict for cold-start "
+        f"IsolationForest scores — anchors at p1 of the training set, so "
+        f"anything above ~0.05 should pass."
+    )
