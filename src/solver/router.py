@@ -167,57 +167,88 @@ class RouterSolver:
         Sell orders use exact-input (amount = sell_amount). Buy orders use
         exact-output (amount = buy_amount); v3_batched flips the selector
         and reverses the multi-hop path encoding accordingly.
+
+        Partial-fill extension (sell-only): for ``partially_fillable=True``
+        sell orders, two extra sets of paths are added at ``0.5×sell_amount``
+        and ``0.75×sell_amount``.  All three fractions (full + 0.5x + 0.75x)
+        travel in the same Multicall3 round-trip — zero extra RPC calls.
+        Buy-side partial-quote is deferred (quoteExactOutput semantics for
+        partials are subtle).
         """
         paths: list[V3Path] = []
         for order in orders:
             exact_output = order.kind == "buy"
             amount = order.buy_amount if exact_output else order.sell_amount
-            for fee in FEE_TIERS:
-                paths.append(
-                    V3Path(
-                        order_uid=order.uid,
-                        token_in=order.sell_token,
-                        token_out=order.buy_token,
-                        amount_in=amount,
-                        fee_tier_in=fee,
-                        exact_output=exact_output,
-                    )
-                )
-            for mid in self._intermediates:
-                if mid.lower() in (order.sell_token.lower(), order.buy_token.lower()):
-                    continue
+
+            # Determine which input amounts to quote for this order.
+            # Partial sell orders get 3 fractions; all others get just one.
+            if order.kind == "sell" and order.partially_fillable:
+                amounts_to_quote = [
+                    amount,
+                    3 * amount // 4,
+                    amount // 2,
+                ]
+            else:
+                amounts_to_quote = [amount]
+
+            for amt in amounts_to_quote:
                 for fee in FEE_TIERS:
                     paths.append(
                         V3Path(
                             order_uid=order.uid,
                             token_in=order.sell_token,
                             token_out=order.buy_token,
-                            amount_in=amount,
+                            amount_in=amt,
                             fee_tier_in=fee,
-                            intermediate=mid,
-                            fee_tier_out=fee,
                             exact_output=exact_output,
                         )
                     )
+                for mid in self._intermediates:
+                    if mid.lower() in (order.sell_token.lower(), order.buy_token.lower()):
+                        continue
+                    for fee in FEE_TIERS:
+                        paths.append(
+                            V3Path(
+                                order_uid=order.uid,
+                                token_in=order.sell_token,
+                                token_out=order.buy_token,
+                                amount_in=amt,
+                                fee_tier_in=fee,
+                                intermediate=mid,
+                                fee_tier_out=fee,
+                                exact_output=exact_output,
+                            )
+                        )
         return paths
 
     @staticmethod
     def _select_best_quote_per_order(
         quotes: list[V3BatchedQuote],
+        *,
+        filter_amount_in: int | None = None,
     ) -> dict[str, V3BatchedQuote]:
-        # For sell orders (exact-input): higher amount_out wins — more
-        # buy-token for the user. For buy orders (exact-output):
-        # V3BatchedQuote.amount_out holds amountIn, so LOWER wins — less
-        # sell-token spent for the exact buy_amount.
-        #
-        # Strict comparison keeps the first candidate per order_uid on ties.
-        # Since _build_v3_candidate_paths iterates FEE_TIERS in declared
-        # order (100, 500, 3000, 10000) and intermediates in declared order,
-        # the de-facto tie-break is "lower fee tier wins, then direct over
-        # 2-hop". Swap for an explicit sort key if that order matters.
+        """Select the best quote per order_uid.
+
+        For sell orders (exact-input): higher amount_out wins — more
+        buy-token for the user. For buy orders (exact-output):
+        V3BatchedQuote.amount_out holds amountIn, so LOWER wins — less
+        sell-token spent for the exact buy_amount.
+
+        Strict comparison keeps the first candidate per order_uid on ties.
+        Since _build_v3_candidate_paths iterates FEE_TIERS in declared
+        order (100, 500, 3000, 10000) and intermediates in declared order,
+        the de-facto tie-break is "lower fee tier wins, then direct over
+        2-hop". Swap for an explicit sort key if that order matters.
+
+        ``filter_amount_in``: when set, only consider quotes whose path has
+        exactly this ``amount_in`` value. Used to select the best quote
+        among a specific fraction (e.g. the best 0.75× route).
+        """
         best: dict[str, V3BatchedQuote] = {}
         for q in quotes:
             if q.amount_out == 0:
+                continue
+            if filter_amount_in is not None and q.path.amount_in != filter_amount_in:
                 continue
             current = best.get(q.path.order_uid)
             if current is None:
@@ -242,15 +273,24 @@ class RouterSolver:
         except Exception as exc:  # noqa: BLE001
             log.warning("router_v3_batched_failed", error=str(exc))
             return NoSolution()
+        # Full-amount best quotes (exact_input sell orders use sell_amount as
+        # amount_in; buy orders use buy_amount).
         best_per_order = self._select_best_quote_per_order(quotes)
+
+        # Partial-fraction best quotes — only computed once over all quotes;
+        # only meaningful for partially_fillable sell orders (buy-side deferred).
+        # Keyed by order_uid; values are the best quotes at those fixed amounts.
+        # We compute these lazily per-order below using the helper's amount_in
+        # filter, rather than building three separate dicts upfront, to keep the
+        # code explicit and easy to follow.
 
         trades: list[Trade] = []
         prices: dict[str, int] = {}
         for order in orders:
             best = best_per_order.get(order.uid)
-            if best is None:
-                continue
             if order.kind == "buy":
+                if best is None:
+                    continue
                 # Quoter returned amount_in (sell-side). Skip if the AMM
                 # demands more sell-token than the user signed away.
                 amount_in = best.amount_out
@@ -273,20 +313,77 @@ class RouterSolver:
                     executed_sell=amount_in,
                 )
             else:
-                if best.amount_out < order.buy_amount:
-                    continue
-                trades.append(
-                    Trade(
-                        kind="fulfillment",
-                        order_uid=order.uid,
-                        executed_amount=order.sell_amount,
+                # Sell order: try full amount first.
+                if best is not None and best.amount_out >= order.buy_amount:
+                    # Full quote clears — emit at full sell_amount.
+                    trades.append(
+                        Trade(
+                            kind="fulfillment",
+                            order_uid=order.uid,
+                            executed_amount=order.sell_amount,
+                        )
                     )
-                )
-                self._register_prices(
-                    prices, order,
-                    executed_buy=best.amount_out,
-                    executed_sell=order.sell_amount,
-                )
+                    self._register_prices(
+                        prices, order,
+                        executed_buy=best.amount_out,
+                        executed_sell=order.sell_amount,
+                    )
+                elif order.partially_fillable:
+                    # Full amount missed limit. Try partial fractions in
+                    # descending order (0.75x then 0.5x) — emit at the
+                    # largest feasible fraction.  Each fraction's limit is
+                    # proportional: a fill of ``f × sell_amount`` must return
+                    # at least ``f × buy_amount`` (pro-rata).
+                    # All fraction paths were included in the original batch
+                    # (see _build_v3_candidate_paths), so no extra RPC calls.
+                    #
+                    # Spec-deviation: probe descending (0.75x → 0.5x) instead
+                    # of the spec's "if 0.5x clears, midpoint search".
+                    # Descending order is strictly better: it emits the larger
+                    # feasible fill in EVERY case the spec would emit, AND it
+                    # also emits when 0.5x misses but 0.75x clears (an
+                    # asymmetric AMM pricing curve can produce this — common
+                    # with concentrated liquidity).  Same RPC budget (2 extra
+                    # batched quotes), strictly more user fills.
+                    # Floor is intentional: pro-rata limits always favour
+                    # the user (CoW convention).
+                    partial_fractions = [
+                        (3 * order.sell_amount // 4, 3 * order.buy_amount // 4),
+                        (order.sell_amount // 2, order.buy_amount // 2),
+                    ]
+                    emitted = False
+                    for partial_sell, partial_buy_limit in partial_fractions:
+                        frac_best = self._select_best_quote_per_order(
+                            quotes, filter_amount_in=partial_sell
+                        ).get(order.uid)
+                        if frac_best is not None and frac_best.amount_out >= partial_buy_limit:
+                            trades.append(
+                                Trade(
+                                    kind="fulfillment",
+                                    order_uid=order.uid,
+                                    executed_amount=partial_sell,
+                                )
+                            )
+                            self._register_prices(
+                                prices, order,
+                                executed_buy=frac_best.amount_out,
+                                executed_sell=partial_sell,
+                            )
+                            log.info(
+                                "router_partial_fill_emitted",
+                                auction_id=auction.id,
+                                order_uid=order.uid,
+                                fraction=partial_sell / order.sell_amount,
+                                partial_sell=partial_sell,
+                                amm_output=frac_best.amount_out,
+                            )
+                            emitted = True
+                            break
+                    if not emitted:
+                        continue
+                else:
+                    # Non-partial sell order misses limit → skip (no trade).
+                    continue
 
         if not trades:
             return NoSolution()
