@@ -5,7 +5,9 @@ from edge.matching.bipartite import BipartiteMatcher
 from src.models.auction import Auction
 from src.models.order import Order
 from src.models.solution import Solution
+from src.shadow.scoring import _score_sell_trade
 from src.solver.base import NoSolution
+from tests.test_edge._helpers import mk_partial_order
 
 
 def _mk_order(
@@ -254,3 +256,122 @@ async def test_exact_match_symmetric():
     result = await m.solve(auction)
     assert isinstance(result, Solution)
     assert len(result.trades) == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: partial-fill downscale tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bipartite_partial_pair_matches_at_min_volume():
+    """Both sides partial, volumes mismatched — should downscale to B's capacity.
+
+    A: sells 1000 X, wants >=900 Y  (partial=True)
+    B: sells  600 Y, wants >=500 X  (partial=True)
+
+    Feasibility: 1000*600=600000 >= 900*500=450000  ✓
+    Current (pre-Phase-2) logic after clamping b_gives to 600:
+      b_gives(600) < a.buy_amount(900) → would reject.
+    Phase-2 fix: A is partial, so downscale A's executed sell proportionally.
+      executed_a_sell = b_gives * b.buy_amount // b.sell_amount
+                      = 600 * 500 // 600 = 500
+      Check A's limit: A sells 500 X and receives 600 Y >= 900*(500/1000)=450  ✓
+      Check B's limit: B sells 600 Y and receives 500 X >= 500  ✓
+    """
+    m = BipartiteMatcher()
+    oA = mk_partial_order(
+        "oA", "0xa", "0xb", sell_amount=1000, buy_amount=900, partially_fillable=True
+    )
+    oB = mk_partial_order(
+        "oB", "0xb", "0xa", sell_amount=600, buy_amount=500, partially_fillable=True
+    )
+    auction = _mk_auction([oA, oB])
+    result = await m.solve(auction)
+    assert isinstance(result, Solution), "Expected a match but got NoSolution"
+    assert len(result.trades) == 2
+
+    trade_a = next(t for t in result.trades if t.order_uid == "oA")
+    trade_b = next(t for t in result.trades if t.order_uid == "oB")
+
+    # B sells its full capacity (600 Y), A sells <= 1000 X
+    assert trade_b.executed_amount == 600, (
+        f"B should sell full 600, got {trade_b.executed_amount}"
+    )
+    assert 0 < trade_a.executed_amount <= 1000, (
+        f"A executed_sell out of range: {trade_a.executed_amount}"
+    )
+
+    # Both fills must satisfy limit prices
+    # A: executed_a_sell / trade_b.executed_amount >= a.buy_amount / a.sell_amount
+    #    i.e. A gets enough Y relative to what A sold
+    assert trade_b.executed_amount * oA.sell_amount >= oA.buy_amount * trade_a.executed_amount, (
+        "A's limit price violated"
+    )
+    # B: trade_a.executed_amount / trade_b.executed_amount >= b.buy_amount / b.sell_amount
+    assert trade_a.executed_amount * oB.sell_amount >= oB.buy_amount * trade_b.executed_amount, (
+        "B's limit price violated"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bipartite_skips_pair_when_both_non_partial_and_volumes_differ():
+    """Same volume mismatch as above, but both partial=False → must be rejected.
+
+    A: sells 1000 X, wants >=900 Y  (partial=False)
+    B: sells  600 Y, wants >=500 X  (partial=False)
+
+    B cannot fully meet A's minimum buy (900 Y), so no full fill is possible.
+    Non-partial orders cannot be partially filled → NoSolution.
+    """
+    m = BipartiteMatcher()
+    oA = mk_partial_order(
+        "oA", "0xa", "0xb", sell_amount=1000, buy_amount=900, partially_fillable=False
+    )
+    oB = mk_partial_order(
+        "oB", "0xb", "0xa", sell_amount=600, buy_amount=500, partially_fillable=False
+    )
+    auction = _mk_auction([oA, oB])
+    result = await m.solve(auction)
+    assert isinstance(result, NoSolution), (
+        "Expected NoSolution for non-partial volume mismatch, got a match"
+    )
+
+
+def test_bipartite_score_proportional_to_executed():
+    """Surplus from _score_sell_trade scales linearly with executed amount.
+
+    At half the executed volume, surplus should be half (±1 due to integer rounding).
+    Uses a simple 1:1 clearing price so the arithmetic is exact.
+    """
+    # Order: sells 1000, wants >=800 (20% surplus margin)
+    signed_sell = 1000
+    signed_buy = 800
+    # Clearing prices: 1:1 ratio (sell and buy token equally valued)
+    cp_sell = 1000
+    cp_buy = 1000
+    native_price_buy = 10**18  # 1 ETH per buy-token (simplifies score = surplus)
+
+    score_full = _score_sell_trade(
+        executed=1000,
+        signed_sell=signed_sell,
+        signed_buy=signed_buy,
+        cp_sell=cp_sell,
+        cp_buy=cp_buy,
+        native_price_buy=native_price_buy,
+    )
+    score_half = _score_sell_trade(
+        executed=500,
+        signed_sell=signed_sell,
+        signed_buy=signed_buy,
+        cp_sell=cp_sell,
+        cp_buy=cp_buy,
+        native_price_buy=native_price_buy,
+    )
+
+    assert score_full > 0, "Full fill should produce positive surplus"
+    assert score_half > 0, "Half fill should produce positive surplus"
+    # Linear scaling: half executed → half surplus (allow ±1 for integer rounding)
+    assert abs(score_half * 2 - score_full) <= 1, (
+        f"Surplus not proportional: full={score_full}, half={score_half}, 2*half={score_half * 2}"
+    )
