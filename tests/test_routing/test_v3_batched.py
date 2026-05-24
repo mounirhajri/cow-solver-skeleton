@@ -8,10 +8,15 @@ from eth_utils import keccak
 from src.routing.multicall import Call, CallResult, Multicall3
 from src.routing.v3_batched import (
     QUOTE_EXACT_INPUT_SELECTOR,
+    QUOTE_EXACT_OUTPUT_SELECTOR,
+    QUOTE_EXACT_OUTPUT_SINGLE_SELECTOR,
     V3BatchedQuote,
     V3Path,
+    _build_call,
     _encode_path_bytes,
     _encode_quote_exact_input,
+    _encode_quote_exact_output,
+    _encode_quote_exact_output_single,
     batched_v3_quote,
 )
 
@@ -19,6 +24,63 @@ from src.routing.v3_batched import (
 def test_quote_exact_input_selector_matches_keccak() -> None:
     expected = keccak(b"quoteExactInput(bytes,uint256)")[:4].hex()
     assert expected == QUOTE_EXACT_INPUT_SELECTOR
+
+
+def test_quote_exact_output_selectors_match_keccak() -> None:
+    """Selectors for QuoterV2's exact-output entry points. Mismatched
+    selectors would silently route to the wrong function on-chain and
+    revert — pin them against keccak to catch typos at unit-test time."""
+    assert (
+        keccak(b"quoteExactOutput(bytes,uint256)")[:4].hex()
+        == QUOTE_EXACT_OUTPUT_SELECTOR
+    )
+    assert (
+        keccak(
+            b"quoteExactOutputSingle((address,address,uint256,uint24,uint160))"
+        )[:4].hex()
+        == QUOTE_EXACT_OUTPUT_SINGLE_SELECTOR
+    )
+
+
+def test_encode_quote_exact_output_single_calldata_prefix() -> None:
+    cd = _encode_quote_exact_output_single("0x" + "11" * 20, "0x" + "22" * 20, 500, 3000)
+    assert cd.startswith("0x" + QUOTE_EXACT_OUTPUT_SINGLE_SELECTOR)
+
+
+def test_encode_quote_exact_output_calldata_prefix() -> None:
+    path_bytes = bytes.fromhex("22" * 20 + "000bb8" + "11" * 20)  # reversed!
+    cd = _encode_quote_exact_output(path_bytes, 500)
+    assert cd.startswith("0x" + QUOTE_EXACT_OUTPUT_SELECTOR)
+
+
+def test_build_call_exact_output_multihop_reverses_path() -> None:
+    """For exact-output multi-hop, path bytes must be encoded
+    tokenOut → fee_BC → intermediate → fee_AB → tokenIn (reverse of input).
+    Verify by comparing calldata to a path-bytes call we encode manually."""
+    token_in = "0x" + "11" * 20    # A (sell)
+    intermediate = "0x" + "22" * 20  # B
+    token_out = "0x" + "33" * 20   # C (buy)
+    fee_ab = 500
+    fee_bc = 3000
+    amount_out = 7777
+
+    path = V3Path(
+        order_uid="o1",
+        token_in=token_in,
+        token_out=token_out,
+        amount_in=amount_out,
+        fee_tier_in=fee_ab,
+        intermediate=intermediate,
+        fee_tier_out=fee_bc,
+        exact_output=True,
+    )
+    call = _build_call(path, "0x" + "9" * 40)
+    # Build the expected reversed-path calldata directly.
+    expected_path_bytes = _encode_path_bytes(
+        token_out, fee_bc, intermediate, fee_ab, token_in
+    )
+    expected = _encode_quote_exact_output(expected_path_bytes, amount_out)
+    assert call.call_data == expected
 
 
 def test_encode_quote_exact_input_path() -> None:
