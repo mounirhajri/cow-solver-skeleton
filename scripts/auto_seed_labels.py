@@ -56,7 +56,13 @@ GOPLUS_URL = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
 USER_AGENT = "cow-solver-classifier/1.0"
 HTTP_TIMEOUT_S = 5.0
 MAX_RETRY_ATTEMPTS = 3
-DEFAULT_API_BATCH_SIZE = 50
+# GoPlus's `contract_addresses=A,B,C` syntax LOOKS like it should batch but
+# empirically returns only the first address's result (verified 2026-05-24 with
+# a 5-address batch on Arbitrum: code=1, but only result_map[A] populated).
+# So we keep the chunking infrastructure but default to single-address calls.
+# `--max-concurrent` is what gives us throughput now — at 3 concurrent + ~200 ms
+# per call, 129 tokens process in ~9 s, well within free-tier rate limits.
+DEFAULT_API_BATCH_SIZE = 1
 
 
 @dataclass
