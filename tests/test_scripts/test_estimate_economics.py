@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from scripts.estimate_economics import (
     _ARBITRUM_MIN_REWARD_ETH,
+    _DEDUP_STRATEGIES,
     _cap_outliers,
     _dedupe_by_ring,
     _ring_signature,
@@ -173,3 +174,49 @@ def test_cap_outliers_no_op_when_sample_too_small() -> None:
 def test_cap_outliers_no_op_at_100_percentile() -> None:
     values = [int(1e14)] * 50 + [int(5e17)]
     assert _cap_outliers(values, percentile=100.0) == values
+
+
+def test_dedup_strategies_includes_router_and_bipartite() -> None:
+    """Regression: 2026-05-24 live data showed router-v2 hitting the same
+    1-WBTC OTM order in 134/24h auctions (10-15 distinct UIDs, dozens of
+    repeats each).  Bipartite has the same exposure when both sides of a
+    pair are persistent (e.g. two TWAPs).  Both must be in _DEDUP_STRATEGIES."""
+    assert "router-v2" in _DEDUP_STRATEGIES
+    assert "cow-matching-bipartite" in _DEDUP_STRATEGIES
+    assert "cow-matching-multi-party" in _DEDUP_STRATEGIES
+
+
+def test_single_uid_signature_collapses_router_v2_repeats() -> None:
+    """Router-v2 single-trade 'ring' = one UID. The same UID matched 50
+    times in 24h must collapse to 1 representative.  Median = single value."""
+    sig = _ring_signature({"trades": [{"orderUid": "0xdeadbeef" * 14}]})
+    assert sig is not None
+    rows = [(int(6.6e18), sig)] * 50  # 50× phantom-era router-v2 wins
+    out = _dedupe_by_ring(rows)
+    assert out == [int(6.6e18)], (
+        f"50 repeats of same UID must collapse to 1 row; got {len(out)}"
+    )
+
+
+def test_bipartite_pair_signature_collapses_recurring_match() -> None:
+    """Bipartite emits 2-trade solutions. A (uid_a, uid_b) pair appearing
+    in N consecutive auctions (e.g. two long-lived TWAPs on opposite sides
+    of one pair) must collapse to 1 representative across the window."""
+    a = "0xaaaa" + "0" * 108
+    b = "0xbbbb" + "0" * 108
+    sig = _ring_signature({"trades": [
+        {"orderUid": a}, {"orderUid": b}
+    ]})
+    other_sig = _ring_signature({"trades": [
+        {"orderUid": a}, {"orderUid": "0xcccc" + "0" * 108}
+    ]})
+    rows = [
+        # 25 hits on the (a,b) match
+        *[(int(5e14), sig) for _ in range(25)],
+        # 3 hits on a different (a,c) match
+        *[(int(8e14), other_sig) for _ in range(3)],
+    ]
+    out = sorted(_dedupe_by_ring(rows))
+    assert out == sorted([int(5e14), int(8e14)]), (
+        f"distinct UID-sets must each contribute 1 row; got {out}"
+    )

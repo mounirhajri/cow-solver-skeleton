@@ -1,10 +1,10 @@
 # Router + Logging Follow-ups
 
-**Status:** draft, not started.
+**Status:** §1 RESOLVED (skeleton PR #26 + edge PR #9). §2–§4 still open.
 **Authored:** 2026-05-24, after the post-merge code-review pass that
 produced PR #24 (which fixed the iter-EBBO + ceil_div + bounds-check
 issues).
-**Estimated effort:** 1–2 days total.
+**Estimated effort:** 1–2 days total for remaining items.
 **Priority:** these go in BEFORE Barn-readiness sign-off — items 1 and 2
 have real production-correctness consequences.
 
@@ -85,6 +85,48 @@ not in repeated-token-touch handling. Setdefault is left untouched
 for now; if a future case shows mixed sell+buy emitting inconsistent
 ratios despite both using AMM-rate, revisit Option A (first-ratio
 enforce-or-drop) or Option B (averaged price + re-validate).
+
+### Post-PR-#26 audit (2026-05-24 evening, parallel reviewer agent)
+
+Goal: find every other place that could produce the same bug class.
+
+**Resolved here:**
+- `edge/pool_indexer/long_tail_router.py:125-130` — same exact pattern,
+  closed in edge PR #9. Currently disabled in prod via
+  `LONG_TAIL_ENABLED=false`, but the composer would pick up its output
+  if re-enabled. Fix now closes the door.
+
+**Estimator over-counting (separately):**
+- Multi-party already had ring-signature dedup. Router-v2 and bipartite
+  did not. Live router-v2 data 2026-05-24 showed 134 wins/24h from
+  ~10–15 distinct order UIDs (10× dup factor). Bipartite has the same
+  exposure when both sides of a pair are persistent (e.g. two TWAPs).
+  Both added to `_DEDUP_STRATEGIES` in `scripts/estimate_economics.py`.
+  Dedup is now uniform: `frozenset({multi-party, bipartite, router-v2})`.
+
+**Clean code paths verified (no fix needed):**
+- `edge/matching/bipartite.py:235-236` — uses executed-amount ratio
+  (AMM-realised). Correct.
+- `edge/matching/multi_party.py:228,279` and `edge/matching/surplus.py:198-229`
+  — LP-derived clearing prices anchored on `ring[0].sell_token`'s
+  reference_price as numéraire ONLY; ratios are LP-achieved internal
+  rates. Correct usage of reference_price (anchor, not clearing).
+- `edge/matching/composer.py:88-91` — token-disjoint, inherits prices
+  wholesale, no oracle injection. Clean once long-tail is fixed.
+- `src/shadow/persist.py:74,251` — `reference_price` used as
+  `native_prices` for ETH-numéraire conversion in CIP-14 scoring.
+  This is the CORRECT use of oracle (numéraire, not clearing).
+- `src/solver/router.py:47-58,84-94` — `reference_price` only used as
+  sort-key / ITM-filter, never written to clearing prices.
+
+**Known harmless (per existing guards):**
+- `src/solver/naive.py:81-82` — oracle as clearing, but naive is
+  excluded from submission (`test_naive_solution_is_never_submitted`)
+  and from composer-input (`test_composer_excludes_naive_when_other_strategy_solves`).
+- `src/solver/price_refiner.py:174-179` — same pattern, KNOWN-BAD
+  comment added in PR #26. Only called by NaiveSolver. Real fix needs
+  CIP-67-uniform clearing prices (LP over per-pair AMM rates) — tracked
+  as partial-fills design dependency.
 
 
 
