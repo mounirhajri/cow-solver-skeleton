@@ -81,6 +81,21 @@ class Settings(BaseSettings):
     # Disable in prod until paid RPC tier is provisioned.
     long_tail_enabled: bool = True
 
+    # EBBO (External Best Bid/Offer) pre-submission validator.
+    # Checks every emitted sell trade against a fresh V3 quote; rejects the
+    # whole composed solution when our effective clearing-price output falls
+    # below external by more than `ebbo_tolerance_bps`.  Critical safety net
+    # for Barn/Production — multi-party rings derive ring-internal prices
+    # that may not beat external on every hop, and shipping EBBO-violating
+    # solutions risks rejection or bond slashing.
+    # Set false to disable (shadow-mode soak with EBBO observation only).
+    ebbo_enabled: bool = True
+    # Slack between our claimed user output and the external V3 quote, in
+    # basis points.  50 bps = 0.5 %.  Tight enough to catch genuinely
+    # uncompetitive solutions; loose enough to absorb pool drift between
+    # the EBBO call and the production settlement window.
+    ebbo_tolerance_bps: int = 50
+
     # Postgres
     database_url: str = "postgresql+asyncpg://solver:solver@localhost:5432/solver"
 

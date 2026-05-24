@@ -37,6 +37,9 @@ class SolverOrchestrator:
         per_strategy_timeout: float = 5.0,
         run_all_strategies: bool = True,
         compose: bool = True,
+        ebbo_multicall: object = None,
+        ebbo_intermediates: list[str] | None = None,
+        ebbo_tolerance_bps: int = 50,
     ) -> None:
         if not strategies:
             raise ValueError("at least one strategy required")
@@ -44,6 +47,14 @@ class SolverOrchestrator:
         self._timeout = per_strategy_timeout
         self._run_all = run_all_strategies
         self._compose = compose
+        # EBBO pre-submission validator.  None for ebbo_multicall disables the
+        # check — used in tests and in the public-clone path where multicall
+        # plumbing might not be wired up.  See src/solver/ebbo.py for the
+        # external-quote logic; the check runs on the FINAL Solution we are
+        # about to return, after composition + naive-exclusion.
+        self._ebbo_multicall = ebbo_multicall
+        self._ebbo_intermediates = ebbo_intermediates or []
+        self._ebbo_tolerance_bps = ebbo_tolerance_bps
 
     async def solve(self, auction: Auction) -> tuple[Solution | NoSolution, list[AttemptRecord]]:
         attempts: list[AttemptRecord] = []
@@ -146,7 +157,10 @@ class SolverOrchestrator:
                         solution=composed.model_dump(mode="json", by_alias=True),
                         error=None,
                     ))
-                    return composed, attempts
+                    final = await self._ebbo_validate(composed, auction, attempts)
+                    if final is not None:
+                        return final, attempts
+                    # EBBO violated → drop composed, try first-winner fallback
             except ImportError:
                 pass  # edge not present — fall through to first-winner
 
@@ -154,8 +168,71 @@ class SolverOrchestrator:
         # the chosen solution. If only naive solved, we fall through to
         # NoSolution rather than ship oracle-priced fantasy trades.
         if composable_solutions:
-            return composable_solutions[0][1], attempts
+            candidate = composable_solutions[0][1]
+            final = await self._ebbo_validate(candidate, auction, attempts)
+            if final is not None:
+                return final, attempts
         return NoSolution(), attempts
+
+    async def _ebbo_validate(
+        self,
+        solution: Solution,
+        auction: Auction,
+        attempts: list[AttemptRecord],
+    ) -> Solution | None:
+        """Run EBBO check on a candidate solution.
+
+        Returns the solution untouched if EBBO passes or the validator is
+        disabled (no multicall plumbed).  Returns None if EBBO rejects it —
+        caller treats that as "fall through to next candidate or NoSolution".
+
+        Records an ``AttemptRecord`` for the rejection either way so shadow
+        data captures the violation rate over time.
+        """
+        if self._ebbo_multicall is None:
+            return solution
+
+        from src.solver.ebbo import validate_solution_ebbo
+        try:
+            result = await validate_solution_ebbo(
+                solution,
+                auction,
+                self._ebbo_multicall,  # type: ignore[arg-type]
+                self._ebbo_intermediates,
+                tolerance_bps=self._ebbo_tolerance_bps,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # EBBO is a safety net — its failure must NOT block solver output.
+            # Log loudly and pass through so we don't deny ourselves revenue
+            # over an RPC blip in the validator itself.
+            log.warning(
+                "ebbo_validator_failed", auction_id=auction.id, error=str(exc)
+            )
+            return solution
+
+        log.info(
+            "ebbo_check_done",
+            auction_id=auction.id,
+            passes=result.passes,
+            n_checked=result.n_checked,
+            n_skipped=result.n_skipped,
+            n_violations=len(result.violations),
+        )
+        if not result.passes:
+            log.warning(
+                "ebbo_solution_rejected",
+                auction_id=auction.id,
+                violations=result.violations[:5],
+            )
+            attempts.append(AttemptRecord(
+                strategy="ebbo-rejected",
+                status="rejected",
+                latency_ms=None,
+                solution=solution.model_dump(mode="json", by_alias=True),
+                error="; ".join(result.violations[:5]),
+            ))
+            return None
+        return solution
 
 
 def load_default_strategies() -> list[SolverStrategy]:
@@ -248,4 +325,100 @@ def load_default_strategies() -> list[SolverStrategy]:
         strategy_timeout=settings.router_strategy_timeout,
     ))
 
+    return strategies
+
+
+def load_default_orchestrator() -> SolverOrchestrator:
+    """Build the production orchestrator with strategies + EBBO wired.
+
+    Splits out the multicall instance so the EBBO validator can reuse the
+    same RPC connection budget as NaiveSolver / RouterSolver — no extra
+    concurrent slots.  Used by ``src/main.py``; unit tests still construct
+    ``SolverOrchestrator`` directly with mock strategies + no EBBO.
+    """
+    from src.config import settings
+    from src.routing.multicall import Multicall3
+    from src.routing.rpc import RpcClient
+
+    rpc = RpcClient(settings.rpc_arbitrum)
+    multicall = Multicall3(rpc)
+    strategies = _load_default_strategies_with_multicall(multicall)
+
+    ebbo_multicall = multicall if settings.ebbo_enabled else None
+    return SolverOrchestrator(
+        strategies=strategies,
+        per_strategy_timeout=settings.solve_timeout_seconds / max(1, len(strategies)),
+        ebbo_multicall=ebbo_multicall,
+        ebbo_intermediates=settings.router_intermediate_tokens,
+        ebbo_tolerance_bps=settings.ebbo_tolerance_bps,
+    )
+
+
+def _load_default_strategies_with_multicall(multicall: object) -> list[SolverStrategy]:
+    """Identical to ``load_default_strategies`` but reuses an injected multicall.
+
+    Internal helper for ``load_default_orchestrator`` — keeps the public
+    ``load_default_strategies`` signature unchanged for tests and docs that
+    still reference it.
+    """
+    from src.config import settings
+    from src.solver.naive import NaiveSolver
+    from src.solver.router import RouterSolver
+
+    strategies: list[SolverStrategy] = []
+    strategies.append(NaiveSolver(
+        multicall=multicall,
+        intermediates=settings.intermediate_tokens,
+        refine_timeout=3.0,
+    ))
+
+    try:
+        import redis.asyncio as aioredis
+
+        from edge.classifier.predict import TokenClassifier
+        from edge.matching import BipartiteMatcher, CoWMatchingSolver
+        from edge.pool_indexer import LongTailRouter
+        from edge.pool_indexer.pool_cache import PoolCache
+        from src.persistence.db import get_session_factory
+
+        classifier = TokenClassifier.load()
+        session_factory = get_session_factory()
+        strategies.append(BipartiteMatcher(
+            classifier=classifier,
+            session_factory=session_factory,
+        ))
+        strategies.append(CoWMatchingSolver(
+            classifier=classifier,
+            session_factory=session_factory,
+            otm_tolerance_bps=settings.multi_party_otm_tolerance_bps,
+            ring_cooldown_seconds=settings.multi_party_ring_cooldown_seconds,
+        ))
+        if settings.long_tail_enabled:
+            redis_client = aioredis.Redis.from_url(
+                settings.redis_url, decode_responses=False
+            )
+            pool_cache = PoolCache(
+                redis=redis_client,
+                key_prefix=settings.redis_key_prefix,
+                reserves_ttl=settings.pool_cache_ttl_seconds,
+            )
+            strategies.append(LongTailRouter(
+                multicall=multicall,
+                pool_cache=pool_cache,
+            ))
+        log.info(
+            "edge_strategies_loaded",
+            rf_model_loaded=classifier.model is not None,
+            long_tail_enabled=settings.long_tail_enabled,
+        )
+    except ImportError:
+        log.info("edge_strategies_not_present", reason="public_clone_or_phase0")
+
+    strategies.append(RouterSolver(
+        multicall=multicall,
+        intermediates=settings.router_intermediate_tokens,
+        max_orders=settings.router_max_orders,
+        max_concurrent=settings.router_max_concurrent,
+        strategy_timeout=settings.router_strategy_timeout,
+    ))
     return strategies
