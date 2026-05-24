@@ -677,3 +677,66 @@ async def test_buy_and_sell_mixed_auction(monkeypatch: pytest.MonkeyPatch) -> No
     by_uid = {t.order_uid: t for t in result.trades}
     assert by_uid["s1"].executed_amount == 1000  # sell: sellAmount (exact)
     assert by_uid["b1"].executed_amount == 500   # buy:  buyAmount  (exact)
+
+
+@pytest.mark.asyncio
+async def test_clearing_prices_track_amm_ratio_not_oracle_for_otm_buy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the phantom-surplus bug observed 2026-05-24.
+
+    A partiallyFillable BUY order signs willingness to pay 93,262 USDC for
+    1 WBTC.  Oracle reference price implies WBTC = 76,240 USDC at market.
+    The AMM actually delivers 1 WBTC for ~80,000 USDC (a realistic figure
+    above oracle once slippage on a single-trade 1-WBTC swap is included).
+
+    Before the fix: clearing prices were set to reference prices when
+    available → CIP-14 scoring computed surplus as
+    (signed_sell - executed × oracle_ratio) = order's OTM headroom at
+    oracle (~17,000 USDC = ~6.6 ETH), regardless of the AMM's real rate.
+    134 such fills in 24 h drove an €67M/Mo phantom projection.
+
+    After the fix: clearing prices track the AMM execution ratio so
+    surplus = (signed_sell − amm_amount_in) = realised surplus only
+    (~13,000 USDC in this synthetic, well below the phantom 17,000).
+    """
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    sell_token = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"  # USDC.e
+    buy_token = "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f"   # WBTC
+
+    amm_amount_in = 80_000 * 10**6  # 80k USDC the AMM charges for 1 WBTC
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        return [V3BatchedQuote(path=p, amount_out=amm_amount_in) for p in paths]
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    # Oracle reference prices implying 76,240 USDC per WBTC at market.
+    tokens = {
+        sell_token: Token(decimals=6, reference_price=476_878_487_995_865_217_881_866_240),
+        buy_token: Token(decimals=8, reference_price=363_471_992_112_697_727_091_939_999_744),
+    }
+
+    order = _make_order(
+        kind="buy",
+        sellToken=sell_token,
+        buyToken=buy_token,
+        sellAmount=93_262_719_916,  # 93,262.72 USDC limit
+        buyAmount=100_000_000,      # 1 WBTC exact
+        partiallyFillable=True,
+    )
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    result = await router.solve(_make_auction([order], tokens=tokens))
+
+    assert isinstance(result, Solution)
+    # Clearing prices must reflect the AMM rate (executed_buy / executed_sell),
+    # NOT the oracle reference prices — even though references are available.
+    assert result.prices[sell_token] == 100_000_000          # buy_amount
+    assert result.prices[buy_token] == amm_amount_in          # amount_in
+    assert result.prices[sell_token] != tokens[sell_token].reference_price
+    assert result.prices[buy_token] != tokens[buy_token].reference_price

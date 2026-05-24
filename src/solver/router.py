@@ -387,24 +387,21 @@ class RouterSolver:
         executed_buy: int,
         executed_sell: int,
     ) -> None:
-        """Clearing prices must be ETH-denominated (wei per token unit, scaled
-        1e18) so CIP-14 scoring produces correct ETH surplus values. Prefer
-        oracle-backed reference prices; fall back to execution ratio only when
-        missing (cross-pair scoring then becomes approximate).
+        """Register clearing prices reflecting the AMM-realised execution ratio.
 
-        Fallback uses (executed_buy, executed_sell) so the ratio
-        ``cp_sell / cp_buy = executed_buy / executed_sell`` matches what
-        actually moved through the AMM — works identically for sell and buy
-        orders (caller passes the respective filled-side amounts).
+        Uses ``cp_sell / cp_buy = executed_buy / executed_sell`` (the rate the
+        AMM actually quoted) so that CIP-14 scoring's ``bought = executed *
+        cp_sell / cp_buy`` reproduces what the user really receives.
+
+        DO NOT substitute ``token.reference_price`` here even when available:
+        reference prices are oracle snapshots, and for orders with limits far
+        from oracle (e.g. partiallyFillable BUY at +10% slack) the surplus
+        formula collapses to ``signed_buy_at_oracle_rate − signed_buy_limit``,
+        which is the order's OTM-headroom — surplus the AMM never realised.
+        Bug observed 2026-05-24: a 1-WBTC BUY with USDC limit 22 % above
+        oracle persisted score=6.6 ETH per fill, dominated by 134 fills in
+        24 h, driving an €67M/Mo phantom projection. See
+        ``docs/superpowers/specs/2026-05-26-router-and-logging-followups.md``.
         """
-        sell_info = auction.tokens.get(order.sell_token)
-        buy_info = auction.tokens.get(order.buy_token)
-        if (
-            sell_info and sell_info.reference_price
-            and buy_info and buy_info.reference_price
-        ):
-            prices.setdefault(order.sell_token, sell_info.reference_price)
-            prices.setdefault(order.buy_token, buy_info.reference_price)
-        else:
-            prices.setdefault(order.sell_token, executed_buy)
-            prices.setdefault(order.buy_token, executed_sell)
+        prices.setdefault(order.sell_token, executed_buy)
+        prices.setdefault(order.buy_token, executed_sell)
