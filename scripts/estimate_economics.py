@@ -44,14 +44,26 @@ _REVENUE_STRATEGIES = (
     "router-v2",
 )
 
-# Strategy whose wins are subject to ring-signature dedup.  A persistent TWAP
-# order produces the same 3-4-UID ring in every auction it appears in, so the
-# raw count overstates settlements by ~50–400×.  On-chain only one settlement
-# per TWAP interval is possible, so dedup'ing by sig gives a conservative,
-# realistic count.  Bipartite (2-trade) and router-v2 (1-trade) rings rarely
-# repeat across distinct auctions because the order pairs differ, so they are
-# left alone.
-_DEDUP_STRATEGY = "cow-matching-multi-party"
+# Strategies whose wins are subject to UID-set dedup.  A long-lived limit
+# order (e.g. a TWAP, a 22 %-slack partial-fillable BUY, or a slow-fill SELL)
+# produces the SAME trade-UID set across consecutive auctions until it's
+# fully settled.  Without dedup the raw count overstates achievable
+# settlements by 10–400×.
+#
+# Initially only multi-party was deduped on the grounds that "1- and 2-trade
+# rings rarely repeat" (old comment).  That was wrong: live 2026-05-24 data
+# showed router-v2 hitting the SAME 1-WBTC BUY in 134 of 24 h auctions
+# (10–15 distinct UIDs, dozens of repeats each).  Bipartite has the same
+# exposure when both sides of a pair are persistent (e.g. two TWAPs).
+#
+# Treatment is uniform via _ring_signature: dedup by sorted-uid hash, take
+# the median score per unique signature.  Single-uid 'rings' (router-v2)
+# collapse cleanly because the sig is just the one uid.
+_DEDUP_STRATEGIES = frozenset({
+    "cow-matching-multi-party",
+    "cow-matching-bipartite",
+    "router-v2",
+})
 
 _DAYS_PER_MONTH = 30.44
 
@@ -229,15 +241,17 @@ async def collect_wins_per_strategy(
 
     Two debiasing steps applied before returning:
 
-    1.  ``dedup_rings=True`` (default):  for the multi-party strategy, rows
-        with the same ring-signature collapse to a single representative
-        whose surplus is the median of the group.  Without this, a persistent
-        TWAP order produces the same 4-UID ring in every auction → raw counts
-        overstate settlements by 50–400×.
+    1.  ``dedup_rings=True`` (default):  for every strategy in
+        ``_DEDUP_STRATEGIES`` (multi-party, bipartite, router-v2), rows
+        with the same sorted-UID signature collapse to a single
+        representative whose surplus is the median of the group.  Without
+        this, a long-lived order produces the same trade-UID set in every
+        auction it appears in → raw counts overstate achievable settlements
+        by 10–400×.  Single-trade strategies (router-v2) dedup by single uid.
     2.  ``outlier_cap_percentile=99`` (default):  values above the p99 of
         each per-strategy distribution are clipped to that cap.  Neutralises
-        old-code-bug rows (e.g. router-v2 logging 0.498 ETH on auctions where
-        the realistic margin is ~0.001 ETH) without dropping the win itself.
+        old-code-bug rows (e.g. pre-PR-#26 router-v2 at 6 ETH where realistic
+        margin was milliETH) without dropping the win itself.
 
     Set ``dedup_rings=False`` or ``outlier_cap_percentile=100`` to disable
     each step independently; useful when validating raw shadow numbers.
@@ -277,7 +291,7 @@ async def collect_wins_per_strategy(
             n_contaminated += 1
             continue
         if int(r.our_score_wei) > int(r.winner_score):
-            sig = _ring_signature(r.solution) if r.strategy == _DEDUP_STRATEGY else None
+            sig = _ring_signature(r.solution) if r.strategy in _DEDUP_STRATEGIES else None
             wins_with_sigs[r.strategy].append((int(r.our_score_wei), sig))
 
     if n_contaminated:
@@ -289,8 +303,14 @@ async def collect_wins_per_strategy(
 
     out: dict[str, list[int]] = {}
     for strategy, paired in wins_with_sigs.items():
-        if dedup_rings and strategy == _DEDUP_STRATEGY:
+        if dedup_rings and strategy in _DEDUP_STRATEGIES:
+            raw_n = len(paired)
             values = _dedupe_by_ring(paired)
+            if len(values) < raw_n:
+                print(
+                    f"  [dedup] {strategy}: {raw_n} raw rows → {len(values)} "
+                    f"distinct UID-sets ({raw_n - len(values)} repeats collapsed)"
+                )
         else:
             values = [s for s, _ in paired]
         values = _cap_outliers(values, outlier_cap_percentile)
