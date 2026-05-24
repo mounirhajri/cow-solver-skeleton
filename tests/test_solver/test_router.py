@@ -140,6 +140,72 @@ async def test_router_skips_buy_orders(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not called
 
 
+@pytest.mark.asyncio
+async def test_legacy_path_logs_warning_when_dropping_buys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec §2: when v3_only_batched=False (escape hatch / RPC fallback),
+    quote_best_path is exact-input only, so buy orders are silently dropped.
+    Without the warning, an operator can't tell the gap exists in shadow
+    logs — they'd just see lower router-v2 win counts with no explanation.
+
+    Captures the structlog warning by monkeypatching the module logger's
+    .warning method (structlog → PrintLoggerFactory writes directly to
+    stdout, bypassing stdlib caplog).
+    """
+    warnings: list[tuple[str, dict[str, object]]] = []
+
+    async def mock_quote(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
+    monkeypatch.setattr(
+        "src.solver.router.log.warning",
+        lambda event, **kw: warnings.append((event, kw)),
+    )
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=False)
+    # 2 buys + 1 sell — we should see n_dropped=2 in the warning.
+    auction = _make_auction([
+        _make_order(uid="b1", kind="buy"),
+        _make_order(uid="b2", kind="buy"),
+        _make_order(uid="s1", kind="sell"),
+    ])
+    await router.solve(auction)
+
+    matches = [(ev, kw) for ev, kw in warnings if ev == "router_legacy_path_skips_buys"]
+    assert len(matches) == 1, f"expected exactly 1 skip-warning, got {len(matches)}"
+    assert matches[0][1]["n_dropped"] == 2, (
+        f"expected n_dropped=2, got {matches[0][1]['n_dropped']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_path_no_warning_when_no_buys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sell-only auction in legacy mode must NOT emit the warning (n=0)."""
+    warnings: list[str] = []
+
+    async def mock_quote(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
+    monkeypatch.setattr(
+        "src.solver.router.log.warning",
+        lambda event, **kw: warnings.append(event),
+    )
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=False)
+    await router.solve(_make_auction([_make_order(kind="sell")]))
+
+    assert "router_legacy_path_skips_buys" not in warnings, (
+        f"sell-only auction must not log the skip warning; got {warnings}"
+    )
+
+
 # ── Order cap ─────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

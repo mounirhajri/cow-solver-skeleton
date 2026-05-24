@@ -313,7 +313,18 @@ class RouterSolver:
     ) -> Solution | NoSolution:
         # quote_best_path is exact-input only; buys would need exact-output
         # plumbing. v3_only_batched is the supported path for buys.
+        # Visibility: when v3_only_batched gets disabled in prod (e.g. during
+        # an Alchemy outage), we silently lose buy-order volume — log it so
+        # the gap is observable. See specs/2026-05-26-router-and-logging-followups.md §2.
         sell_orders = [o for o in orders if o.kind == "sell"]
+        n_buys_dropped = len(orders) - len(sell_orders)
+        if n_buys_dropped > 0:
+            log.warning(
+                "router_legacy_path_skips_buys",
+                auction_id=auction.id,
+                n_dropped=n_buys_dropped,
+                n_processed=len(sell_orders),
+            )
         sem = asyncio.Semaphore(self._max_concurrent)
 
         async def _quote_one(order: object) -> tuple[object, list[HopQuote] | None]:

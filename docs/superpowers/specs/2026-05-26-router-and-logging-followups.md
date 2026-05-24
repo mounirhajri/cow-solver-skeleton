@@ -1,6 +1,6 @@
 # Router + Logging Follow-ups
 
-**Status:** §1 RESOLVED (skeleton PR #26 + edge PR #9). §2–§4 still open.
+**Status:** §1 + §2 + §4 RESOLVED. §3 (smart-wallet log triplication) still open.
 **Authored:** 2026-05-24, after the post-merge code-review pass that
 produced PR #24 (which fixed the iter-EBBO + ceil_div + bounds-check
 issues).
@@ -180,7 +180,17 @@ loses measurable trade volume.
 
 ---
 
-## 2. Legacy V3 path silently skips buy orders (High)
+## 2. Legacy V3 path silently skips buy orders (RESOLVED 2026-05-24)
+
+**Resolved** — the recommended warning log is now in place
+(`src/solver/router.py:_solve_legacy`). Full buy-order support in the
+legacy path is NOT shipped (and is no longer urgent: prod runs
+`v3_only_batched=True` which already supports buys via PR #20). If the
+escape hatch is ever activated, operators will now see
+`router_legacy_path_skips_buys` warnings with `n_dropped` so the gap
+is observable in journal/Loki searches.
+
+
 
 ### What's wrong
 
@@ -249,7 +259,17 @@ edge submodule (`bipartite.py`, `multi_party.py`) — two PRs (parent
 
 ---
 
-## 4. Unknown `signingScheme` is silently classified as EOA (Medium)
+## 4. Unknown `signingScheme` is silently classified as EOA (RESOLVED 2026-05-24)
+
+**Resolved** — `src/models/order.py` now carries a `field_validator` for
+`signing_scheme` that compares the (lower-cased) value against
+`_SMART_WALLET_SCHEMES ∪ _EOA_SCHEMES = {presign, eip1271, erc1271,
+eip712, ethsign}` and emits `unknown_signing_scheme_observed` exactly
+once per novel value per process lifetime (module-level dedup set
+`_warned_unknown_schemes`). Tests cover both the fire-once and the
+known-scheme silence invariants.
+
+
 
 ### What's wrong
 

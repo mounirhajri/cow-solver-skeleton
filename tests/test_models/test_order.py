@@ -70,3 +70,50 @@ def test_is_smart_wallet_signed_missing_field_defaults_false() -> None:
     order = Order.model_validate(raw)
     assert order.signing_scheme is None
     assert order.is_smart_wallet_signed is False
+
+
+def test_unknown_signing_scheme_logs_warning_once() -> None:
+    """Spec §4: a signingScheme value outside the known sets (smart-wallet
+    or EOA) must trigger the dedup-set membership the first time it appears,
+    so the warning fires once per novel value per process lifetime.
+
+    Soft failure mode otherwise: unknown scheme silently maps to EOA,
+    downstream branching keyed on the flag would behave wrong with no signal.
+
+    Asserting on the dedup-set is more robust than capturing structlog's
+    PrintLoggerFactory output (writes to stdout directly, not via stdlib).
+    """
+    from src.models import order as order_mod
+
+    order_mod._warned_unknown_schemes.clear()
+
+    Order.model_validate(_base_order(uid="0x" + "11" * 56, signingScheme="future-scheme-name"))
+    assert "future-scheme-name" in order_mod._warned_unknown_schemes, (
+        "first occurrence must register in the dedup set"
+    )
+
+    # Second call with the same scheme: set membership unchanged, warning
+    # path is short-circuited.  Test by reading the set itself rather than
+    # the logger output (structlog → stdout bypasses caplog).
+    snapshot_before = order_mod._warned_unknown_schemes.copy()
+    Order.model_validate(_base_order(uid="0x" + "22" * 56, signingScheme="future-scheme-name"))
+    assert order_mod._warned_unknown_schemes == snapshot_before, (
+        "second occurrence must not re-register (idempotent dedup)"
+    )
+
+
+def test_known_schemes_do_not_register_unknown() -> None:
+    """eip712 / ethsign / eip1271 / presign / erc1271 are all expected — must
+    NOT register in the unknown-scheme dedup set, otherwise legitimate
+    schemes silently get flagged as novel."""
+    from src.models import order as order_mod
+
+    order_mod._warned_unknown_schemes.clear()
+
+    for scheme in ("eip712", "ethsign", "eip1271", "presign", "erc1271", "PreSign", "EIP712"):
+        Order.model_validate(_base_order(signingScheme=scheme))
+
+    assert order_mod._warned_unknown_schemes == set(), (
+        f"known schemes must not be flagged as unknown; "
+        f"got {order_mod._warned_unknown_schemes}"
+    )
