@@ -11,6 +11,7 @@ from src.models.auction import Auction, Token
 from src.models.order import Order
 from src.models.solution import Solution
 from src.solver.base import NoSolution
+from tests.test_edge._helpers import mk_partial_order
 
 
 def _mk_order(
@@ -475,29 +476,6 @@ async def test_cooldown_not_set_on_no_solution_path() -> None:
 # ── Partial-fill rejection ────────────────────────────────────────────────────
 
 
-def _mk_partial_order_mp(
-    uid: str,
-    sell_token: str,
-    buy_token: str,
-    sell_amount: int,
-    buy_amount: int,
-    partially_fillable: bool,
-) -> Order:
-    return Order(
-        uid=uid,
-        sellToken=sell_token,
-        buyToken=buy_token,
-        sellAmount=sell_amount,
-        buyAmount=buy_amount,
-        feePolicies=[],
-        validTo=99,
-        kind="sell",
-        owner="0x" + "a" * 40,
-        partiallyFillable=partially_fillable,
-        **{"class": "limit"},
-    )
-
-
 def test_lp_drops_ring_when_non_partial_short_after_round():
     """_solve_ring_lp returns None when a non-partially-fillable leg is short.
 
@@ -508,13 +486,13 @@ def test_lp_drops_ring_when_non_partial_short_after_round():
     """
     tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
     ring = (
-        _mk_partial_order_mp(
+        mk_partial_order(
             "o1", "A", "B", sell_amount=1000, buy_amount=700, partially_fillable=False
         ),
-        _mk_partial_order_mp(
+        mk_partial_order(
             "o2", "B", "C", sell_amount=500, buy_amount=400, partially_fillable=True
         ),
-        _mk_partial_order_mp(
+        mk_partial_order(
             "o3", "C", "A", sell_amount=1000, buy_amount=600, partially_fillable=True
         ),
     )
@@ -522,3 +500,39 @@ def test_lp_drops_ring_when_non_partial_short_after_round():
     assert result is None, (
         "_solve_ring_lp must return None when a non-partial leg gets a fractional fill"
     )
+
+
+def test_solve_ring_lp_rejects_when_non_partial_gets_zero_fill(monkeypatch):
+    """Zero-fill is just an extreme short fill: the guard must still fire.
+
+    Rather than engineer an LP that returns x_real=0 (brittle), we patch
+    solve_ring_lp to return a hand-crafted RingLPResult with
+    executed_amounts=(0, 1000, 1000) and received_short_fill=(True, False, False).
+    With leg 0 flagged partially_fillable=False, the ring must be rejected.
+    Tests the guard contract directly.
+    """
+    from edge.matching.surplus import RingLPResult
+
+    tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
+    ring = (
+        mk_partial_order(
+            "o1", "A", "B", sell_amount=1000, buy_amount=700, partially_fillable=False
+        ),
+        mk_partial_order(
+            "o2", "B", "C", sell_amount=1000, buy_amount=900, partially_fillable=True
+        ),
+        mk_partial_order(
+            "o3", "C", "A", sell_amount=1000, buy_amount=900, partially_fillable=True
+        ),
+    )
+    fake_result = RingLPResult(
+        feasible=True,
+        executed_amounts=(0, 1000, 1000),
+        surplus_units=100,
+        clearing_prices={"A": 10**18, "B": 10**18, "C": 10**18},
+        received_short_fill=(True, False, False),
+    )
+    monkeypatch.setattr(
+        "edge.matching.surplus.solve_ring_lp", lambda r, t: fake_result
+    )
+    assert _solve_ring_lp(ring, tokens) is None

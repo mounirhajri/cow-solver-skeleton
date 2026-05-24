@@ -2,6 +2,7 @@
 from edge.matching.surplus import RingLPResult, solve_ring_lp
 from src.models.auction import Token
 from src.models.order import Order
+from tests.test_edge._helpers import mk_partial_order
 
 
 def _mk_order(
@@ -220,74 +221,49 @@ def test_missing_reference_price_falls_back_gracefully():
         assert tok in result.clearing_prices
 
 
-# ── Partial-fills: feasible_for_partial field ─────────────────────────────────
-
-
-def _mk_partial_order(
-    uid: str,
-    sell_token: str,
-    buy_token: str,
-    sell_amount: int,
-    buy_amount: int,
-    partially_fillable: bool = True,
-) -> Order:
-    """Like _mk_order but exposes partiallyFillable."""
-    return Order(
-        uid=uid,
-        sellToken=sell_token,
-        buyToken=buy_token,
-        sellAmount=sell_amount,
-        buyAmount=buy_amount,
-        feePolicies=[],
-        validTo=99,
-        kind="sell",
-        owner="0x" + "a" * 40,
-        partiallyFillable=partially_fillable,
-        **{"class": "limit"},
-    )
+# ── Partial-fills: received_short_fill field ──────────────────────────────────
 
 
 def test_lp_emits_floor_rounded_executed_for_partial_ring():
-    """LP floor-rounds x_real and reports feasible_for_partial correctly.
+    """LP floor-rounds x_real and reports received_short_fill correctly.
 
     Ring construction: order 0 has sell_amount=1000 but the cycle constraint
     (leg 1 caps at sell_amount=500) forces x_real[0] ≈ (1000/700)*500 = 714.28
-    → floor = 714 < 1000.  feasible_for_partial[0] must be True.
+    → floor = 714 < 1000.  received_short_fill[0] must be True.
     All orders are partially_fillable=True so no rejection occurs.
     Legs 1 and 2 fill fully (500 and 1000 respectively).
     """
     ring = (
-        _mk_partial_order("o1", "A", "B", sell_amount=1000, buy_amount=700),
-        _mk_partial_order("o2", "B", "C", sell_amount=500, buy_amount=400),
-        _mk_partial_order("o3", "C", "A", sell_amount=1000, buy_amount=600),
+        mk_partial_order("o1", "A", "B", sell_amount=1000, buy_amount=700),
+        mk_partial_order("o2", "B", "C", sell_amount=500, buy_amount=400),
+        mk_partial_order("o3", "C", "A", sell_amount=1000, buy_amount=600),
     )
     tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
     result = solve_ring_lp(ring, tokens)
 
     assert result.feasible
-    # Leg 0 is short of its sell_amount: floor((1000/700)*500) = 714 < 1000
-    assert result.executed_amounts[0] < 1000, (
-        f"expected leg 0 to be a partial fill, got {result.executed_amounts[0]}"
-    )
-    # feasible_for_partial tracks the shortfall
-    assert result.feasible_for_partial[0] is True
+    # Leg 0 is short: floor((1000/700)*500) = 714.  Pin the exact value so a
+    # future regression that relaxes the bound to `<=` would still trip here.
+    assert result.executed_amounts[0] == 714
+    # received_short_fill tracks the shortfall
+    assert result.received_short_fill[0] is True
     # Legs 1 and 2 fill fully
     assert result.executed_amounts[1] == 500
     assert result.executed_amounts[2] == 1000
-    assert result.feasible_for_partial[1] is False
-    assert result.feasible_for_partial[2] is False
+    assert result.received_short_fill[1] is False
+    assert result.received_short_fill[2] is False
 
 
 def test_lp_full_fill_unchanged_when_no_fractional():
-    """Regression: fully-filled ring has no short legs and feasible_for_partial is all False.
+    """Regression: fully-filled ring has no short legs and received_short_fill is all False.
 
     All three orders have sell_amount=1000 and a generous limit; the LP
     pushes every x_i to 1000 → executed_amounts == sell_amounts, no shortfall.
     """
     ring = (
-        _mk_partial_order("o1", "A", "B", sell_amount=1000, buy_amount=900),
-        _mk_partial_order("o2", "B", "C", sell_amount=1000, buy_amount=900),
-        _mk_partial_order("o3", "C", "A", sell_amount=1000, buy_amount=900),
+        mk_partial_order("o1", "A", "B", sell_amount=1000, buy_amount=900),
+        mk_partial_order("o2", "B", "C", sell_amount=1000, buy_amount=900),
+        mk_partial_order("o3", "C", "A", sell_amount=1000, buy_amount=900),
     )
     tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
     result = solve_ring_lp(ring, tokens)
@@ -295,4 +271,4 @@ def test_lp_full_fill_unchanged_when_no_fractional():
     assert result.feasible
     for i, x in enumerate(result.executed_amounts):
         assert x == ring[i].sell_amount, f"leg {i} should be fully filled"
-    assert result.feasible_for_partial == (False, False, False)
+    assert result.received_short_fill == (False, False, False)
