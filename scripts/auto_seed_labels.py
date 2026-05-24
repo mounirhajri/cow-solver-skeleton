@@ -1,16 +1,26 @@
-"""Auto-seed scam / legit labels from Honeypot.is for the RF classifier.
+"""Auto-seed scam / legit labels from GoPlus Security for the RF classifier.
 
 In Shadow mode TokenOutcome.caused_revert never becomes True organically.
 This script bootstraps the classifier's binary-path with external labels:
-calls Honeypot.is for each token that has features but no outcome label,
-inserts caused_revert=True for honeypots and appeared_in_winner=True for
-verified-clean tokens.
+calls GoPlus Security's token-security endpoint for tokens that have
+features but no outcome label, then inserts caused_revert=True for scams
+and appeared_in_winner=True for verified-clean tokens.
+
+## Why GoPlus instead of Honeypot.is
+
+The previous implementation used Honeypot.is, but that API does not
+support Arbitrum (`chainID=42161` returns HTTP 400 "Invalid chain").
+GoPlus Security supports Arbitrum, requires no auth, and — crucially —
+accepts batch requests via comma-separated `contract_addresses`, which
+reduces our per-token API-call count by ~50x and unlocks much higher
+weekly throughput within free-tier limits.
 
 Idempotent on (token_address): re-runs skip tokens that already have any
-outcome label. Rate-limited to stay within Honeypot.is free-tier limits.
+outcome label. Rate-limited via a semaphore over *batched* requests.
 
 Usage:
-    python -m scripts.auto_seed_labels [--batch-size 100] [--max-concurrent 5]
+    python -m scripts.auto_seed_labels [--batch-size 100] [--max-concurrent 3]
+                                       [--api-batch-size 50]
                                        [--dry-run] [--chain-id 42161]
 
 ## Scheduled execution
@@ -18,12 +28,10 @@ Usage:
 Run weekly via cron (on the host, not in the container):
 
     0 5 * * 0 docker exec cow-solver python -m scripts.auto_seed_labels \
-        --batch-size 200 >> /var/log/cow-solver-auto-seed.log 2>&1
+        --batch-size 500 >> /var/log/cow-solver-auto-seed.log 2>&1
 
-This drips ~200 tokens/week into the classifier's label set. Combined
-with `extract_features.py` (which populates `token_features`) and
-`train_classifier.py` (which auto-promotes if AUC improves), the RF
-pipeline becomes self-improving.
+500 tokens/week is comfortably within GoPlus free-tier rates: with
+--api-batch-size 50 that's only ~10 HTTP requests per run.
 """
 
 from __future__ import annotations
@@ -44,10 +52,11 @@ from src.persistence.models import ShadowAuction, TokenFeatures, TokenOutcome
 
 log = get_logger(__name__)
 
-HONEYPOT_URL = "https://api.honeypot.is/v2/IsHoneypot"
+GOPLUS_URL = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
 USER_AGENT = "cow-solver-classifier/1.0"
 HTTP_TIMEOUT_S = 5.0
 MAX_RETRY_ATTEMPTS = 3
+DEFAULT_API_BATCH_SIZE = 50
 
 
 @dataclass
@@ -61,7 +70,7 @@ class SeedResult:
 
 @dataclass
 class TokenVerdict:
-    """Classification verdict from Honeypot.is.
+    """Classification verdict from GoPlus.
 
     kind in {"scam", "legit", "skip", "error"}; only "scam"/"legit" → DB write.
     """
@@ -70,78 +79,150 @@ class TokenVerdict:
     kind: str
 
 
-async def _fetch_honeypot(
-    client: httpx.AsyncClient, token_address: str, chain_id: int
-) -> TokenVerdict:
-    """Call Honeypot.is for one token with exponential backoff on 429/5xx.
+def _parse_float(value: Any) -> float:
+    """Parse a GoPlus tax field. Empty/missing → 0.0 (not a red flag)."""
+    if value is None or value == "":
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        # Malformed taxes are an unknown signal — treat as 0 and let other
+        # fields (is_honeypot, is_open_source) drive the verdict.
+        return 0.0
 
-    Never raises — converts any failure into a TokenVerdict(kind="error").
+
+def _classify_one(token_address: str, entry: dict[str, Any] | None) -> TokenVerdict:
+    """Map a single GoPlus result entry to a verdict.
+
+    Asymmetric rule: ANY scam-indicator → scam, ALL legit-indicators → legit.
+    Rationale: a token mis-labeled scam just gets filtered out of routing,
+    but a token mis-labeled legit pollutes the classifier with spam features.
+    So we err on the side of "skip" when uncertain and require unanimous
+    evidence for "legit".
     """
+    if not isinstance(entry, dict):
+        return TokenVerdict(token_address, "skip")
+
+    is_honeypot = entry.get("is_honeypot")
+    cannot_buy = entry.get("cannot_buy")
+    cannot_sell_all = entry.get("cannot_sell_all")
+    is_open_source = entry.get("is_open_source")
+
+    # Any one of these is a hard scam signal.
+    if is_honeypot == "1" or cannot_buy == "1" or cannot_sell_all == "1":
+        return TokenVerdict(token_address, "scam")
+
+    # Required fields for a confident "legit" verdict.
+    if is_honeypot != "0":
+        # Missing / unknown honeypot status — can't promote to legit.
+        return TokenVerdict(token_address, "skip")
+    if is_open_source != "1":
+        # Closed-source contracts could hide arbitrary behavior; we don't
+        # have enough signal to call them legit.
+        return TokenVerdict(token_address, "skip")
+
+    # cannot_buy / cannot_sell_all: only "1" is bad; "0", missing, or empty
+    # are all acceptable for legit (we already rejected "1" above).
+    if cannot_buy not in (None, "", "0"):
+        return TokenVerdict(token_address, "skip")
+    if cannot_sell_all not in (None, "", "0"):
+        return TokenVerdict(token_address, "skip")
+
+    buy_tax = _parse_float(entry.get("buy_tax"))
+    sell_tax = _parse_float(entry.get("sell_tax"))
+    if buy_tax >= 0.05 or sell_tax >= 0.05:
+        # >=5% tax is too predatory for the solver to treat as legit.
+        return TokenVerdict(token_address, "skip")
+
+    return TokenVerdict(token_address, "legit")
+
+
+def _classify_batch(
+    addresses: list[str], data: dict[str, Any]
+) -> list[TokenVerdict]:
+    """Classify all tokens in a batch from one GoPlus response.
+
+    Addresses missing from `result` are returned as "skip" — GoPlus
+    couldn't analyze them this run; a future run will retry.
+    """
+    if data.get("code") != 1:
+        log.warning("goplus_response_not_ok", code=data.get("code"),
+                    message=data.get("message"))
+        return [TokenVerdict(a, "skip") for a in addresses]
+
+    result_map = data.get("result") or {}
+    if not isinstance(result_map, dict):
+        return [TokenVerdict(a, "skip") for a in addresses]
+
+    # GoPlus lower-cases the address keys in the response — normalize ours
+    # to match so we can look up by either input casing.
+    lower_map = {k.lower(): v for k, v in result_map.items()}
+
+    verdicts: list[TokenVerdict] = []
+    for addr in addresses:
+        entry = lower_map.get(addr.lower())
+        v = _classify_one(addr, entry if isinstance(entry, dict) else None)
+        log.info("goplus_verdict", token_address=addr, verdict=v.kind)
+        verdicts.append(v)
+    return verdicts
+
+
+async def _fetch_goplus_batch(
+    client: httpx.AsyncClient, addresses: list[str], chain_id: int
+) -> list[TokenVerdict]:
+    """Call GoPlus for a batch of tokens with exponential backoff on 429/5xx.
+
+    Never raises — converts any failure into a list of "error" verdicts.
+    """
+    if not addresses:
+        return []
+
+    url = GOPLUS_URL.format(chain_id=chain_id)
+    params = {"contract_addresses": ",".join(addresses)}
+
     # Exponential backoff: 1s, 2s, 4s. We retry only on 429 / 5xx — other
     # errors (timeouts, transport) are short-circuited because the API is
-    # cheap to skip; a future run will pick the token up again.
+    # cheap to skip; a future run will pick the tokens up again.
     backoff = 1.0
     for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
         try:
-            resp = await client.get(
-                HONEYPOT_URL,
-                params={"address": token_address, "chainID": chain_id},
-            )
+            resp = await client.get(url, params=params)
         except httpx.TimeoutException:
-            log.debug("honeypot_timeout", token=token_address, attempt=attempt)
-            return TokenVerdict(token_address, "error")
+            log.debug("goplus_timeout", n=len(addresses), attempt=attempt)
+            return [TokenVerdict(a, "error") for a in addresses]
         except httpx.HTTPError as exc:
-            log.warning("honeypot_network_error", token=token_address, error=str(exc))
-            return TokenVerdict(token_address, "error")
+            log.warning("goplus_network_error", n=len(addresses), error=str(exc))
+            return [TokenVerdict(a, "error") for a in addresses]
 
         if resp.status_code == 429 or 500 <= resp.status_code < 600:
             if attempt == MAX_RETRY_ATTEMPTS:
                 log.warning(
-                    "honeypot_retry_exhausted",
-                    token=token_address,
+                    "goplus_retry_exhausted",
+                    n=len(addresses),
                     status=resp.status_code,
                 )
-                return TokenVerdict(token_address, "error")
+                return [TokenVerdict(a, "error") for a in addresses]
             await asyncio.sleep(backoff)
             backoff *= 2
             continue
 
         if resp.status_code != 200:
             log.warning(
-                "honeypot_unexpected_status",
-                token=token_address,
+                "goplus_unexpected_status",
+                n=len(addresses),
                 status=resp.status_code,
             )
-            return TokenVerdict(token_address, "error")
+            return [TokenVerdict(a, "error") for a in addresses]
 
         try:
             data: dict[str, Any] = resp.json()
         except ValueError as exc:
-            log.warning("honeypot_bad_json", token=token_address, error=str(exc))
-            return TokenVerdict(token_address, "error")
+            log.warning("goplus_bad_json", n=len(addresses), error=str(exc))
+            return [TokenVerdict(a, "error") for a in addresses]
 
-        return _classify(token_address, data)
+        return _classify_batch(addresses, data)
 
-    return TokenVerdict(token_address, "error")
-
-
-def _classify(token_address: str, data: dict[str, Any]) -> TokenVerdict:
-    """Map a Honeypot.is JSON response to a verdict.
-
-    Missing `honeypotResult` or failed simulation → skip (we don't know).
-    """
-    honeypot_result = data.get("honeypotResult")
-    simulation_success = data.get("simulationSuccess")
-    if not isinstance(honeypot_result, dict):
-        return TokenVerdict(token_address, "skip")
-    is_honeypot = honeypot_result.get("isHoneypot")
-    if is_honeypot is True:
-        # Honeypots are flagged even if simulation didn't fully succeed —
-        # the detection is authoritative for the True case.
-        return TokenVerdict(token_address, "scam")
-    if is_honeypot is False and simulation_success is True:
-        return TokenVerdict(token_address, "legit")
-    return TokenVerdict(token_address, "skip")
+    return [TokenVerdict(a, "error") for a in addresses]
 
 
 async def _fetch_unlabeled_tokens(
@@ -164,7 +245,7 @@ async def _fetch_unlabeled_tokens(
 async def _get_anchor_auction_id(session: AsyncSession) -> int | None:
     """Pick the newest ShadowAuction.auction_id as FK anchor for synthetic labels.
 
-    TokenOutcome.auction_id is a required FK, but a Honeypot.is verdict is
+    TokenOutcome.auction_id is a required FK, but a GoPlus verdict is
     *independent* of any specific auction — it's a property of the token.
     Using the most-recent auction lets the row exist without inventing a
     fake auction. If no auctions exist yet, return None and skip the run.
@@ -173,14 +254,14 @@ async def _get_anchor_auction_id(session: AsyncSession) -> int | None:
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
-async def _process_token(
+async def _process_chunk(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
-    token_address: str,
+    chunk: list[str],
     chain_id: int,
-) -> TokenVerdict:
+) -> list[TokenVerdict]:
     async with semaphore:
-        return await _fetch_honeypot(client, token_address, chain_id)
+        return await _fetch_goplus_batch(client, chunk, chain_id)
 
 
 async def _seed(
@@ -189,6 +270,7 @@ async def _seed(
     max_concurrent: int,
     dry_run: bool,
     chain_id: int,
+    api_batch_size: int = DEFAULT_API_BATCH_SIZE,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> SeedResult:
     started = time.monotonic()
@@ -200,24 +282,33 @@ async def _seed(
         anchor_auction_id = await _get_anchor_auction_id(session)
 
     if not tokens:
-        log.info("honeypot_seed_no_tokens")
+        log.info("goplus_seed_no_tokens")
         return result
 
     if anchor_auction_id is None and not dry_run:
         # Without any ShadowAuction row the FK can't be satisfied. A future
         # run after the poller has captured at least one auction will work.
-        log.warning("honeypot_seed_no_anchor_auction", n_unlabeled=len(tokens))
+        log.warning("goplus_seed_no_anchor_auction", n_unlabeled=len(tokens))
         return result
+
+    # Chunk into batched API calls. GoPlus has no published hard limit, but
+    # ~50 addresses per call is a conservative middle ground that keeps
+    # individual responses small enough to parse quickly.
+    chunks = [
+        tokens[i : i + api_batch_size] for i in range(0, len(tokens), api_batch_size)
+    ]
 
     semaphore = asyncio.Semaphore(max_concurrent)
     async with httpx.AsyncClient(
         headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
         timeout=HTTP_TIMEOUT_S,
     ) as client:
-        tasks = [
-            _process_token(client, semaphore, addr, chain_id) for addr in tokens
-        ]
-        verdicts = await asyncio.gather(*tasks)
+        tasks = [_process_chunk(client, semaphore, c, chain_id) for c in chunks]
+        chunk_results = await asyncio.gather(*tasks)
+
+    verdicts: list[TokenVerdict] = []
+    for cr in chunk_results:
+        verdicts.extend(cr)
 
     to_insert: list[TokenOutcome] = []
     for v in verdicts:
@@ -256,12 +347,13 @@ async def _seed(
 
     elapsed_s = round(time.monotonic() - started, 2)
     log.info(
-        "honeypot_seed_done",
+        "goplus_seed_done",
         n_checked=result.n_checked,
         n_scam=result.n_scam,
         n_legit=result.n_legit,
         n_skipped=result.n_skipped,
         n_errors=result.n_errors,
+        n_chunks=len(chunks),
         elapsed_s=elapsed_s,
         dry_run=dry_run,
     )
@@ -269,7 +361,11 @@ async def _seed(
 
 
 async def main_async(
-    batch_size: int, max_concurrent: int, dry_run: bool, chain_id: int
+    batch_size: int,
+    max_concurrent: int,
+    dry_run: bool,
+    chain_id: int,
+    api_batch_size: int = DEFAULT_API_BATCH_SIZE,
 ) -> SeedResult:
     try:
         return await _seed(
@@ -277,20 +373,23 @@ async def main_async(
             max_concurrent=max_concurrent,
             dry_run=dry_run,
             chain_id=chain_id,
+            api_batch_size=api_batch_size,
         )
     except Exception as exc:  # never raise from a cron entry-point
-        log.error("honeypot_seed_unhandled", error=str(exc), error_type=type(exc).__name__)
+        log.error("goplus_seed_unhandled", error=str(exc), error_type=type(exc).__name__)
         return SeedResult()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Auto-seed scam/legit labels from Honeypot.is.",
+        description="Auto-seed scam/legit labels from GoPlus Security.",
     )
     parser.add_argument("--batch-size", type=int, default=100,
                         help="Number of tokens to process this run (default: 100).")
-    parser.add_argument("--max-concurrent", type=int, default=5,
-                        help="Max parallel Honeypot.is calls (default: 5).")
+    parser.add_argument("--max-concurrent", type=int, default=3,
+                        help="Max parallel GoPlus batched calls (default: 3).")
+    parser.add_argument("--api-batch-size", type=int, default=DEFAULT_API_BATCH_SIZE,
+                        help="Addresses per GoPlus call (default: 50).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print verdicts but skip DB writes.")
     parser.add_argument("--chain-id", type=int, default=42161,
@@ -302,6 +401,7 @@ def main() -> None:
             max_concurrent=args.max_concurrent,
             dry_run=args.dry_run,
             chain_id=args.chain_id,
+            api_batch_size=args.api_batch_size,
         )
     )
 

@@ -1,7 +1,8 @@
-"""Tests for scripts/auto_seed_labels.py — Honeypot.is auto-seeding pipeline."""
+"""Tests for scripts/auto_seed_labels.py — GoPlus auto-seeding pipeline."""
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 
 import httpx
@@ -13,7 +14,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from scripts.auto_seed_labels import _seed, main_async
 from src.persistence.models import ShadowAuction, TokenFeatures, TokenOutcome
 
-HONEYPOT_URL = "https://api.honeypot.is/v2/IsHoneypot"
+# Match any chain_id path so individual tests don't have to thread it through.
+GOPLUS_URL_RE = re.compile(
+    r"https://api\.gopluslabs\.io/api/v1/token_security/\d+.*"
+)
 
 TOKEN_A = "0x" + "a" * 40
 TOKEN_B = "0x" + "b" * 40
@@ -95,22 +99,40 @@ async def _seed_db(factory, *, tokens: list[str], with_outcomes: list[str] | Non
         await session.commit()
 
 
-def _hp_response(*, is_honeypot: bool | None, sim_success: bool = True,
-                 missing_result: bool = False) -> dict:
-    body: dict = {
-        "token": {"address": TOKEN_A, "name": "x", "symbol": "X", "decimals": 18},
-        "simulationSuccess": sim_success,
+def _gp_entry(
+    *,
+    is_honeypot: str = "0",
+    cannot_buy: str = "0",
+    cannot_sell_all: str = "0",
+    is_open_source: str = "1",
+    buy_tax: str = "0",
+    sell_tax: str = "0",
+) -> dict:
+    return {
+        "is_honeypot": is_honeypot,
+        "cannot_buy": cannot_buy,
+        "cannot_sell_all": cannot_sell_all,
+        "is_open_source": is_open_source,
+        "buy_tax": buy_tax,
+        "sell_tax": sell_tax,
     }
-    if not missing_result:
-        body["honeypotResult"] = {"isHoneypot": is_honeypot}
+
+
+def _gp_response(entries: dict[str, dict] | None, *, code: int = 1) -> dict:
+    """Build a GoPlus response body. Keys are lower-cased like the real API."""
+    body: dict = {"code": code, "message": "OK" if code == 1 else "ERR"}
+    if entries is not None:
+        body["result"] = {k.lower(): v for k, v in entries.items()}
     return body
 
 
 @respx.mock
 async def test_honeypot_classified_as_scam(session_factory) -> None:
     await _seed_db(session_factory, tokens=[TOKEN_A])
-    respx.get(HONEYPOT_URL).mock(
-        return_value=httpx.Response(200, json=_hp_response(is_honeypot=True))
+    respx.get(GOPLUS_URL_RE).mock(
+        return_value=httpx.Response(
+            200, json=_gp_response({TOKEN_A: _gp_entry(is_honeypot="1")})
+        )
     )
 
     result = await _seed(
@@ -131,9 +153,9 @@ async def test_honeypot_classified_as_scam(session_factory) -> None:
 @respx.mock
 async def test_clean_classified_as_legit(session_factory) -> None:
     await _seed_db(session_factory, tokens=[TOKEN_A])
-    respx.get(HONEYPOT_URL).mock(
+    respx.get(GOPLUS_URL_RE).mock(
         return_value=httpx.Response(
-            200, json=_hp_response(is_honeypot=False, sim_success=True)
+            200, json=_gp_response({TOKEN_A: _gp_entry()})
         )
     )
 
@@ -152,13 +174,11 @@ async def test_clean_classified_as_legit(session_factory) -> None:
 
 
 @respx.mock
-async def test_simulation_failure_skipped(session_factory) -> None:
+async def test_response_code_not_ok_skipped(session_factory) -> None:
+    """code != 1 → GoPlus couldn't analyze → skip, no DB writes."""
     await _seed_db(session_factory, tokens=[TOKEN_A])
-    # Sim failed AND honeypotResult missing → unknown → skip
-    respx.get(HONEYPOT_URL).mock(
-        return_value=httpx.Response(
-            200, json=_hp_response(is_honeypot=None, sim_success=False, missing_result=True)
-        )
+    respx.get(GOPLUS_URL_RE).mock(
+        return_value=httpx.Response(200, json=_gp_response(None, code=4029))
     )
 
     result = await _seed(
@@ -182,8 +202,10 @@ async def test_idempotent_skips_already_labeled(session_factory) -> None:
         tokens=[TOKEN_A, TOKEN_B],
         with_outcomes=[TOKEN_A],  # A already labeled
     )
-    route = respx.get(HONEYPOT_URL).mock(
-        return_value=httpx.Response(200, json=_hp_response(is_honeypot=False))
+    route = respx.get(GOPLUS_URL_RE).mock(
+        return_value=httpx.Response(
+            200, json=_gp_response({TOKEN_B: _gp_entry()})
+        )
     )
 
     result = await _seed(
@@ -191,7 +213,7 @@ async def test_idempotent_skips_already_labeled(session_factory) -> None:
         session_factory=session_factory,
     )
 
-    # Only TOKEN_B got queried — TOKEN_A was filtered by the unlabeled query.
+    # Only one batched call — A was filtered by the unlabeled query.
     assert route.call_count == 1
     assert result.n_checked == 1
     # A's pre-existing row + B's new legit row = 2 total.
@@ -212,9 +234,11 @@ async def test_rate_limit_retry_with_backoff(session_factory, monkeypatch) -> No
 
     responses = iter([
         httpx.Response(429, json={"error": "rate limited"}),
-        httpx.Response(200, json=_hp_response(is_honeypot=True)),
+        httpx.Response(
+            200, json=_gp_response({TOKEN_A: _gp_entry(is_honeypot="1")})
+        ),
     ])
-    respx.get(HONEYPOT_URL).mock(side_effect=lambda req: next(responses))
+    respx.get(GOPLUS_URL_RE).mock(side_effect=lambda req: next(responses))
 
     result = await _seed(
         batch_size=10, max_concurrent=2, dry_run=False, chain_id=42161,
@@ -231,8 +255,14 @@ async def test_rate_limit_retry_with_backoff(session_factory, monkeypatch) -> No
 @respx.mock
 async def test_dry_run_no_db_writes(session_factory) -> None:
     await _seed_db(session_factory, tokens=[TOKEN_A, TOKEN_B])
-    respx.get(HONEYPOT_URL).mock(
-        return_value=httpx.Response(200, json=_hp_response(is_honeypot=True))
+    respx.get(GOPLUS_URL_RE).mock(
+        return_value=httpx.Response(
+            200,
+            json=_gp_response({
+                TOKEN_A: _gp_entry(is_honeypot="1"),
+                TOKEN_B: _gp_entry(is_honeypot="1"),
+            }),
+        )
     )
 
     result = await _seed(
@@ -249,7 +279,7 @@ async def test_dry_run_no_db_writes(session_factory) -> None:
 
 @respx.mock
 async def test_concurrent_calls_respect_semaphore(session_factory) -> None:
-    """With max_concurrent=2 and 4 tokens, peak in-flight must stay <= 2."""
+    """With max_concurrent=2 and 4 chunks, peak in-flight must stay <= 2."""
     await _seed_db(session_factory, tokens=[TOKEN_A, TOKEN_B, TOKEN_C, TOKEN_D])
 
     import asyncio as _asyncio
@@ -266,13 +296,19 @@ async def test_concurrent_calls_respect_semaphore(session_factory) -> None:
         await _asyncio.sleep(0.01)
         async with lock:
             in_flight -= 1
-        return httpx.Response(200, json=_hp_response(is_honeypot=False))
+        # Each chunk has exactly one address; return a clean verdict for it.
+        addrs = _req.url.params["contract_addresses"].split(",")
+        return httpx.Response(
+            200,
+            json=_gp_response({a: _gp_entry() for a in addrs}),
+        )
 
-    respx.get(HONEYPOT_URL).mock(side_effect=_handler)
+    respx.get(GOPLUS_URL_RE).mock(side_effect=_handler)
 
+    # api_batch_size=1 forces one chunk per token so the semaphore actually bites.
     result = await _seed(
         batch_size=10, max_concurrent=2, dry_run=False, chain_id=42161,
-        session_factory=session_factory,
+        api_batch_size=1, session_factory=session_factory,
     )
 
     assert result.n_legit == 4
@@ -305,6 +341,65 @@ async def test_no_anchor_auction_skips_writes(session_factory) -> None:
     )
 
     assert result.n_checked == 0
+    async with session_factory() as s:
+        rows = (await s.execute(select(TokenOutcome))).scalars().all()
+    assert len(rows) == 0
+
+
+@respx.mock
+async def test_batched_request_includes_multiple_addresses(session_factory) -> None:
+    """A single GoPlus call must carry all addresses in the chunk, comma-joined."""
+    await _seed_db(session_factory, tokens=[TOKEN_A, TOKEN_B, TOKEN_C])
+
+    seen_params: dict[str, str] = {}
+
+    async def _handler(req: httpx.Request) -> httpx.Response:
+        seen_params["contract_addresses"] = req.url.params["contract_addresses"]
+        return httpx.Response(
+            200,
+            json=_gp_response({
+                TOKEN_A: _gp_entry(),
+                TOKEN_B: _gp_entry(),
+                TOKEN_C: _gp_entry(),
+            }),
+        )
+
+    route = respx.get(GOPLUS_URL_RE).mock(side_effect=_handler)
+
+    result = await _seed(
+        batch_size=10, max_concurrent=2, dry_run=False, chain_id=42161,
+        api_batch_size=50, session_factory=session_factory,
+    )
+
+    # One HTTP call carrying all three addresses.
+    assert route.call_count == 1
+    sent = seen_params["contract_addresses"].split(",")
+    assert set(sent) == {TOKEN_A, TOKEN_B, TOKEN_C}
+    assert result.n_legit == 3
+
+
+@respx.mock
+async def test_richer_classification_legit_requires_all_conditions(session_factory) -> None:
+    """is_honeypot=0 alone isn't enough — closed-source must NOT be legit."""
+    await _seed_db(session_factory, tokens=[TOKEN_A])
+    respx.get(GOPLUS_URL_RE).mock(
+        return_value=httpx.Response(
+            200,
+            json=_gp_response({
+                TOKEN_A: _gp_entry(is_honeypot="0", is_open_source="0"),
+            }),
+        )
+    )
+
+    result = await _seed(
+        batch_size=10, max_concurrent=2, dry_run=False, chain_id=42161,
+        session_factory=session_factory,
+    )
+
+    # Ambiguous → skip; no DB write.
+    assert result.n_legit == 0
+    assert result.n_scam == 0
+    assert result.n_skipped == 1
     async with session_factory() as s:
         rows = (await s.execute(select(TokenOutcome))).scalars().all()
     assert len(rows) == 0
