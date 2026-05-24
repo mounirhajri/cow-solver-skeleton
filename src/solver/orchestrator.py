@@ -114,18 +114,29 @@ class SolverOrchestrator:
                     error=None,
                 ))
 
-        # Try composing when multiple strategies produced solutions
-        if self._compose and len(winning_solutions) > 1:
+        # Composer candidates exclude naive: its clearingPrices come from the
+        # auction oracle (or price_refiner's V2/V3 spot quotes), which over-
+        # state realised settlement prices — composing them in fabricates a
+        # CIP-14 score that no production batch could execute against
+        # (verified live 2026-05-24: composer routinely scored ~481 ETH per
+        # win because naive's executed_amounts × oracle prices dwarfed every
+        # real solver's surplus).  Naive stays in the chain as the "always
+        # respond" baseline; we just never submit it as our solution.
+        composable_solutions = [
+            (name, sol) for name, sol in winning_solutions if name != "naive"
+        ]
+
+        if self._compose and len(composable_solutions) > 1:
             try:
                 from edge.matching import CandidateSolution, compose
                 candidates = [
                     CandidateSolution(strategy=name, solution=sol)
-                    for name, sol in winning_solutions
+                    for name, sol in composable_solutions
                 ]
                 composed = compose(candidates, auction_id=int(auction.id))
                 if composed is not None:
                     log.info("composer_merged",
-                             n_candidates=len(winning_solutions),
+                             n_candidates=len(composable_solutions),
                              n_trades=len(composed.trades),
                              auction_id=auction.id)
                     attempts.append(AttemptRecord(
@@ -139,9 +150,11 @@ class SolverOrchestrator:
             except ImportError:
                 pass  # edge not present — fall through to first-winner
 
-        # First-winner fallback
-        if winning_solutions:
-            return winning_solutions[0][1], attempts
+        # First-winner fallback — also skips naive so we never submit it as
+        # the chosen solution. If only naive solved, we fall through to
+        # NoSolution rather than ship oracle-priced fantasy trades.
+        if composable_solutions:
+            return composable_solutions[0][1], attempts
         return NoSolution(), attempts
 
 
