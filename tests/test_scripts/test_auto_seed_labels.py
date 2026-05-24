@@ -406,6 +406,107 @@ async def test_batched_request_includes_multiple_addresses(session_factory) -> N
 
 
 @respx.mock
+async def test_auth_token_sent_when_env_vars_set(session_factory, monkeypatch) -> None:
+    """With GOPLUS_APP_KEY + GOPLUS_APP_SECRET set, the script must:
+      1. POST to /api/v1/token with sign = sha1(app_key + time + app_secret)
+      2. Forward the access_token as `Authorization: Bearer ...` on token_security calls
+    """
+    import hashlib as _hashlib
+
+    await _seed_db(session_factory, tokens=[TOKEN_A])
+    monkeypatch.setenv("GOPLUS_APP_KEY", "test-key")
+    monkeypatch.setenv("GOPLUS_APP_SECRET", "test-secret")
+
+    captured: dict[str, Any] = {}
+
+    async def _token_handler(req: httpx.Request) -> httpx.Response:
+        captured["token_body"] = req.read()
+        return httpx.Response(
+            200,
+            json={"code": 1, "message": "OK",
+                  "result": {"access_token": "ACCESS-XYZ", "expires_in": 3600}},
+        )
+
+    async def _ts_handler(req: httpx.Request) -> httpx.Response:
+        captured["authorization"] = req.headers.get("authorization")
+        return httpx.Response(
+            200, json=_gp_response({TOKEN_A: _gp_entry()})
+        )
+
+    respx.post("https://api.gopluslabs.io/api/v1/token").mock(side_effect=_token_handler)
+    respx.get(GOPLUS_URL_RE).mock(side_effect=_ts_handler)
+
+    result = await _seed(
+        batch_size=10, max_concurrent=2, dry_run=False, chain_id=42161,
+        session_factory=session_factory,
+    )
+
+    assert result.n_legit == 1
+    assert captured.get("authorization") == "Bearer ACCESS-XYZ"
+    # Body must contain the SHA1 sign derived from key + time + secret.
+    import json as _json
+    body = _json.loads(captured["token_body"])
+    expected_sign = _hashlib.sha1(
+        ("test-key" + str(body["time"]) + "test-secret").encode("utf-8")
+    ).hexdigest()
+    assert body["sign"] == expected_sign
+    assert body["app_key"] == "test-key"
+
+
+@respx.mock
+async def test_auth_token_fetch_failure_falls_back_to_anonymous(
+    session_factory, monkeypatch
+) -> None:
+    """If the token endpoint returns an error, the run must still proceed
+    without the Authorization header — not hard-fail."""
+    await _seed_db(session_factory, tokens=[TOKEN_A])
+    monkeypatch.setenv("GOPLUS_APP_KEY", "test-key")
+    monkeypatch.setenv("GOPLUS_APP_SECRET", "test-secret")
+
+    captured: dict[str, Any] = {}
+
+    respx.post("https://api.gopluslabs.io/api/v1/token").mock(
+        return_value=httpx.Response(200, json={"code": 4010, "message": "invalid sign"})
+    )
+
+    async def _ts_handler(req: httpx.Request) -> httpx.Response:
+        captured["authorization"] = req.headers.get("authorization")
+        return httpx.Response(200, json=_gp_response({TOKEN_A: _gp_entry()}))
+
+    respx.get(GOPLUS_URL_RE).mock(side_effect=_ts_handler)
+
+    result = await _seed(
+        batch_size=10, max_concurrent=2, dry_run=False, chain_id=42161,
+        session_factory=session_factory,
+    )
+
+    assert result.n_legit == 1
+    assert captured.get("authorization") is None
+
+
+@respx.mock
+async def test_no_env_vars_means_no_token_call(session_factory, monkeypatch) -> None:
+    """No GOPLUS_APP_KEY → script should not call the token endpoint at all."""
+    await _seed_db(session_factory, tokens=[TOKEN_A])
+    monkeypatch.delenv("GOPLUS_APP_KEY", raising=False)
+    monkeypatch.delenv("GOPLUS_APP_SECRET", raising=False)
+
+    token_route = respx.post("https://api.gopluslabs.io/api/v1/token").mock(
+        return_value=httpx.Response(200, json={"code": 1, "result": {"access_token": "X"}})
+    )
+    respx.get(GOPLUS_URL_RE).mock(
+        return_value=httpx.Response(200, json=_gp_response({TOKEN_A: _gp_entry()}))
+    )
+
+    await _seed(
+        batch_size=10, max_concurrent=2, dry_run=False, chain_id=42161,
+        session_factory=session_factory,
+    )
+
+    assert token_route.call_count == 0
+
+
+@respx.mock
 async def test_richer_classification_legit_requires_all_conditions(session_factory) -> None:
     """is_honeypot=0 alone isn't enough — closed-source must NOT be legit."""
     await _seed_db(session_factory, tokens=[TOKEN_A])
