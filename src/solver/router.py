@@ -56,6 +56,41 @@ def _eth_value_sort_key(order: Order, auction: Auction) -> int:
     return order.sell_amount * token_info.reference_price // 10**18
 
 
+def _expected_surplus_sort_key(order: Order, auction: Auction) -> int:
+    """Expected surplus headroom at reference prices.
+
+    Computes ``sell_value - buy_value`` in ETH-equivalent units.  Positive
+    when the user has given us margin to capture (sell side worth more at
+    market than buy side requires); zero / negative when the order is
+    already OTM at reference (any router quote would lose).
+
+    Why this beats sorting by ETH-value: whale orders (high ETH-value) tend
+    to be pre-optimised — their limit prices sit on the live market price
+    so the surplus headroom is ~0 and we cannot beat the winner solver.
+    Mid-size orders with sloppy limits leave 10–100 bps of headroom; those
+    are where router-v2 can win.
+
+    Falls back to ``_eth_value_sort_key`` when either token lacks a
+    reference price — without prices we can't compute headroom, and ETH
+    value is at least a directional proxy for "interesting order".
+    """
+    sell_tok = auction.tokens.get(order.sell_token)
+    buy_tok = auction.tokens.get(order.buy_token)
+    if (
+        sell_tok is None
+        or sell_tok.reference_price is None
+        or buy_tok is None
+        or buy_tok.reference_price is None
+    ):
+        return _eth_value_sort_key(order, auction)
+    sell_value = order.sell_amount * sell_tok.reference_price
+    buy_value = order.buy_amount * buy_tok.reference_price
+    # OTM orders (negative headroom) collapse to 0 so they sort to the back
+    # rather than dominating with large negative numbers.  We still process
+    # them if max_orders > #ITM_orders, but never preferentially.
+    return max(0, (sell_value - buy_value) // 10**18)
+
+
 class RouterSolver:
     name = "router-v2"
 
@@ -85,7 +120,7 @@ class RouterSolver:
     async def solve(self, auction: Auction) -> Solution | NoSolution:
         sell_orders = sorted(
             [o for o in auction.orders if o.kind == "sell"],
-            key=lambda o: _eth_value_sort_key(o, auction),
+            key=lambda o: _expected_surplus_sort_key(o, auction),
             reverse=True,
         )[: self._max_orders]
 

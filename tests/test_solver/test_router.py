@@ -193,7 +193,7 @@ async def test_order_cap_default_is_50(monkeypatch: pytest.MonkeyPatch) -> None:
     assert call_count == 50
 
 
-# ── ETH-value sort ────────────────────────────────────────────────────────────
+# ── Expected-surplus sort (with ETH-value fallback) ───────────────────────────
 
 @pytest.mark.asyncio
 async def test_order_cap_sorts_by_eth_value(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -234,6 +234,100 @@ async def test_order_cap_sorts_by_eth_value(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert quoted_amounts == [10**18], (
         "max_orders=1 should pick the WETH order (≈1 ETH) over the USDC order (≈0.25 ETH)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sort_prefers_bigger_absolute_surplus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When two orders are both ITM, the one with bigger absolute headroom
+    (sell_value - buy_value) wins — even if its margin *percentage* is smaller.
+
+    100 WETH × 1 % headroom → 1 ETH absolute surplus  (BIGGER)
+      1 WETH × 50 % headroom → 0.5 ETH absolute surplus (SMALLER)
+
+    This is economically correct: a tiny relative margin on a whale can
+    still be the biggest real opportunity in the auction.
+    """
+    quoted_amounts: list[int] = []
+
+    async def mock_quote(
+        _mc: object, _si: object, _bi: object, amount_in: int, _ints: object
+    ) -> None:
+        quoted_amounts.append(amount_in)
+        return None
+
+    monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
+
+    weth = "0x" + "1" * 40
+    weth2 = "0x" + "3" * 40  # second 1-ETH-priced token, decouple from DAI math
+    tokens = {
+        weth:  Token(decimals=18, referencePrice=10**18),
+        weth2: Token(decimals=18, referencePrice=10**18),
+    }
+    # Big trade, 1 % capture: 100 WETH for 99 → +1 ETH absolute
+    big_small_margin = _make_order(
+        uid="big", sellToken=weth, buyToken=weth2,
+        sellAmount=100 * 10**18, buyAmount=99 * 10**18,
+    )
+    # Small trade, 50 % capture: 1 WETH for 0.5 → +0.5 ETH absolute
+    small_big_margin = _make_order(
+        uid="small", sellToken=weth, buyToken=weth2,
+        sellAmount=10**18, buyAmount=5 * 10**17,
+    )
+    multicall = AsyncMock()
+    router = RouterSolver(
+        multicall=multicall, intermediates=[], max_orders=1, v3_only_batched=False
+    )
+    await router.solve(_make_auction([big_small_margin, small_big_margin], tokens=tokens))
+    assert quoted_amounts == [100 * 10**18], (
+        f"expected big-absolute-surplus order quoted, got {quoted_amounts}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sort_ranks_otm_orders_last(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A negative-margin (OTM at reference) order must NOT outrank an
+    in-the-money one — even when its sell_amount dominates.
+
+    OTM orders return surplus 0 (clamped) from the sort key so they pile
+    up at the back; the router would lose any quote against them.
+    """
+    quoted_amounts: list[int] = []
+
+    async def mock_quote(
+        _mc: object, _si: object, _bi: object, amount_in: int, _ints: object
+    ) -> None:
+        quoted_amounts.append(amount_in)
+        return None
+
+    monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
+
+    weth = "0x" + "1" * 40
+    weth2 = "0x" + "3" * 40
+    tokens = {
+        weth:  Token(decimals=18, referencePrice=10**18),
+        weth2: Token(decimals=18, referencePrice=10**18),
+    }
+    # OTM: 100 WETH but limit demands 150 ETH-equiv back → can't be filled
+    #      profitably; surplus key clamps to 0.
+    otm = _make_order(
+        uid="otm", sellToken=weth, buyToken=weth2,
+        sellAmount=100 * 10**18, buyAmount=150 * 10**18,
+    )
+    # ITM: 1 WETH for 0.5 → +0.5 ETH absolute surplus.
+    itm = _make_order(
+        uid="itm", sellToken=weth, buyToken=weth2,
+        sellAmount=10**18, buyAmount=5 * 10**17,
+    )
+    multicall = AsyncMock()
+    router = RouterSolver(
+        multicall=multicall, intermediates=[], max_orders=1, v3_only_batched=False
+    )
+    await router.solve(_make_auction([otm, itm], tokens=tokens))
+    assert quoted_amounts == [10**18], (
+        f"OTM order should NOT outrank ITM, got {quoted_amounts}"
     )
 
 
