@@ -18,6 +18,17 @@ weekly throughput within free-tier limits.
 Idempotent on (token_address): re-runs skip tokens that already have any
 outcome label. Rate-limited via a semaphore over *batched* requests.
 
+## Authentication (optional, recommended)
+
+Anonymous tier blocks aggressively (~3 req/s ceiling, JSON code=4029). Setting
+both ``GOPLUS_APP_KEY`` and ``GOPLUS_APP_SECRET`` as env vars unlocks the
+authenticated tier (~10x higher allowance) — the script exchanges them for a
+short-lived access_token on startup and adds ``Authorization: Bearer <token>``
+to every request. If either is missing or the token exchange fails, the run
+continues anonymously rather than hard-failing.
+
+Register at https://gopluslabs.io to get a free key pair.
+
 Usage:
     python -m scripts.auto_seed_labels [--batch-size 100] [--max-concurrent 3]
                                        [--api-batch-size 50]
@@ -38,6 +49,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -53,6 +66,7 @@ from src.persistence.models import ShadowAuction, TokenFeatures, TokenOutcome
 log = get_logger(__name__)
 
 GOPLUS_URL = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
+GOPLUS_TOKEN_URL = "https://api.gopluslabs.io/api/v1/token"
 USER_AGENT = "cow-solver-classifier/1.0"
 HTTP_TIMEOUT_S = 5.0
 MAX_RETRY_ATTEMPTS = 3
@@ -171,6 +185,55 @@ def _classify_batch(
         log.info("goplus_verdict", token_address=addr, verdict=v.kind)
         verdicts.append(v)
     return verdicts
+
+
+async def _fetch_access_token(
+    client: httpx.AsyncClient, app_key: str, app_secret: str
+) -> str | None:
+    """Exchange app_key + app_secret for a short-lived access_token.
+
+    GoPlus signing rule (verified 2026-05-24 against
+    docs.gopluslabs.io/reference/getaccesstokenusingpost):
+        sign = sha1(app_key + str(time_seconds) + app_secret) → hex
+
+    Authenticated tier raises rate-limits ~10x vs anonymous (~30/min instead
+    of ~3/s blocking ceiling). Token TTL is ~1 hour, plenty for a single
+    seed run. Returns None on any failure — caller should fall back to
+    anonymous mode rather than hard-fail the whole run.
+    """
+    ts = str(int(time.time()))
+    sign = hashlib.sha1((app_key + ts + app_secret).encode("utf-8")).hexdigest()
+    try:
+        resp = await client.post(
+            GOPLUS_TOKEN_URL,
+            json={"app_key": app_key, "time": int(ts), "sign": sign},
+        )
+    except httpx.HTTPError as exc:
+        log.warning("goplus_token_network_error", error=str(exc))
+        return None
+
+    if resp.status_code != 200:
+        log.warning("goplus_token_bad_status", status=resp.status_code)
+        return None
+
+    try:
+        body: dict[str, Any] = resp.json()
+    except ValueError:
+        log.warning("goplus_token_bad_json")
+        return None
+
+    if body.get("code") != 1:
+        log.warning("goplus_token_rejected", code=body.get("code"),
+                    message=body.get("message"))
+        return None
+
+    result = body.get("result") or {}
+    token = result.get("access_token") if isinstance(result, dict) else None
+    if not isinstance(token, str) or not token:
+        log.warning("goplus_token_missing_in_response")
+        return None
+    log.info("goplus_token_acquired", expires_in=result.get("expires_in"))
+    return token
 
 
 async def _fetch_goplus_batch(
@@ -338,10 +401,18 @@ async def _seed(
     ]
 
     semaphore = asyncio.Semaphore(max_concurrent)
-    async with httpx.AsyncClient(
-        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-        timeout=HTTP_TIMEOUT_S,
-    ) as client:
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    async with httpx.AsyncClient(headers=headers, timeout=HTTP_TIMEOUT_S) as client:
+        # Optional auth: if both env vars are set, exchange them for a
+        # short-lived access token. Failure here is non-fatal — anonymous
+        # mode still works, just with the harsher rate-limit.
+        app_key = os.environ.get("GOPLUS_APP_KEY")
+        app_secret = os.environ.get("GOPLUS_APP_SECRET")
+        if app_key and app_secret:
+            token = await _fetch_access_token(client, app_key, app_secret)
+            if token is not None:
+                client.headers["Authorization"] = f"Bearer {token}"
+
         tasks = [_process_chunk(client, semaphore, c, chain_id) for c in chunks]
         chunk_results = await asyncio.gather(*tasks)
 
