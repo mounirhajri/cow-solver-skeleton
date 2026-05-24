@@ -111,4 +111,20 @@ class TokenFeatures(Base):
     age_blocks: Mapped[int | None] = mapped_column(Integer)
     on_arbitrum_token_list: Mapped[bool | None] = mapped_column(Boolean)
     on_coingecko: Mapped[bool | None] = mapped_column(Boolean)
+    # GoPlus Security feature columns.  Populated by scripts/auto_seed_labels.py
+    # alongside the legit/scam outcome label.  All nullable for backward
+    # compatibility — null means "we never asked GoPlus about this token".
+    is_proxy: Mapped[bool | None] = mapped_column(Boolean)
+    is_mintable: Mapped[bool | None] = mapped_column(Boolean)
+    can_take_back_ownership: Mapped[bool | None] = mapped_column(Boolean)
+    hidden_owner: Mapped[bool | None] = mapped_column(Boolean)
+    slippage_modifiable: Mapped[bool | None] = mapped_column(Boolean)
+    transfer_pausable: Mapped[bool | None] = mapped_column(Boolean)
+    owner_change_balance: Mapped[bool | None] = mapped_column(Boolean)
+    external_call: Mapped[bool | None] = mapped_column(Boolean)
+    honeypot_with_same_creator: Mapped[bool | None] = mapped_column(Boolean)
+    anti_whale_modifiable: Mapped[bool | None] = mapped_column(Boolean)
+    creator_percent: Mapped[float | None] = mapped_column(Numeric(10, 6))
+    buy_tax: Mapped[float | None] = mapped_column(Numeric(10, 6))
+    sell_tax: Mapped[float | None] = mapped_column(Numeric(10, 6))
     last_refreshed: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

@@ -73,6 +73,19 @@ async def session_factory():
                 age_blocks INTEGER,
                 on_arbitrum_token_list INTEGER,
                 on_coingecko INTEGER,
+                is_proxy INTEGER,
+                is_mintable INTEGER,
+                can_take_back_ownership INTEGER,
+                hidden_owner INTEGER,
+                slippage_modifiable INTEGER,
+                transfer_pausable INTEGER,
+                owner_change_balance INTEGER,
+                external_call INTEGER,
+                honeypot_with_same_creator INTEGER,
+                anti_whale_modifiable INTEGER,
+                creator_percent NUMERIC,
+                buy_tax NUMERIC,
+                sell_tax NUMERIC,
                 last_refreshed TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """))
@@ -506,6 +519,86 @@ async def test_no_env_vars_means_no_token_call(session_factory, monkeypatch) -> 
     )
 
     assert token_route.call_count == 0
+
+
+@respx.mock
+async def test_goplus_security_features_upserted(session_factory) -> None:
+    """Beyond the scam/legit verdict, the seeder must persist the GoPlus
+    security feature columns into token_features so the cold-start
+    IsolationForest can use them as signal."""
+    await _seed_db(session_factory, tokens=[TOKEN_A])
+    respx.get(GOPLUS_URL_RE).mock(
+        return_value=httpx.Response(
+            200,
+            json=_gp_response({
+                TOKEN_A: {
+                    **_gp_entry(),
+                    "is_proxy": "1",
+                    "is_mintable": "0",
+                    "can_take_back_ownership": "1",
+                    "hidden_owner": "0",
+                    "slippage_modifiable": "1",
+                    "transfer_pausable": "0",
+                    "owner_change_balance": "1",
+                    "external_call": "0",
+                    "honeypot_with_same_creator": "0",
+                    "anti_whale_modifiable": "1",
+                    "creator_percent": "0.123",
+                    "buy_tax": "0.01",
+                    "sell_tax": "0.02",
+                },
+            }),
+        )
+    )
+
+    result = await _seed(
+        batch_size=10, max_concurrent=2, dry_run=False, chain_id=42161,
+        session_factory=session_factory,
+    )
+
+    assert result.n_features_written == 1
+    async with session_factory() as s:
+        from src.persistence.models import TokenFeatures
+        row = (await s.execute(select(TokenFeatures))).scalar_one()
+    assert bool(row.is_proxy) is True
+    assert bool(row.is_mintable) is False
+    assert bool(row.can_take_back_ownership) is True
+    assert bool(row.slippage_modifiable) is True
+    assert bool(row.anti_whale_modifiable) is True
+    assert float(row.buy_tax) == 0.01
+    assert float(row.sell_tax) == 0.02
+    # creator_percent is stored as numeric; just check it's roughly right.
+    assert abs(float(row.creator_percent) - 0.123) < 1e-3
+
+
+@respx.mock
+async def test_goplus_security_features_partial_response(session_factory) -> None:
+    """A GoPlus response missing some security fields must persist only the
+    fields that ARE present — null fields must not blank out the row."""
+    await _seed_db(session_factory, tokens=[TOKEN_A])
+    respx.get(GOPLUS_URL_RE).mock(
+        return_value=httpx.Response(
+            200,
+            json=_gp_response({
+                TOKEN_A: {
+                    **_gp_entry(),
+                    "is_proxy": "1",
+                    # the rest of the GoPlus security fields are absent.
+                },
+            }),
+        )
+    )
+    result = await _seed(
+        batch_size=10, max_concurrent=2, dry_run=False, chain_id=42161,
+        session_factory=session_factory,
+    )
+    assert result.n_features_written == 1
+    async with session_factory() as s:
+        from src.persistence.models import TokenFeatures
+        row = (await s.execute(select(TokenFeatures))).scalar_one()
+    assert bool(row.is_proxy) is True
+    # is_mintable was absent from the response → stays NULL, not False
+    assert row.is_mintable is None
 
 
 @respx.mock

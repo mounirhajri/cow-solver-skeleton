@@ -108,3 +108,46 @@ def test_batch_of_rows_works():
     df = pd.concat(rows, ignore_index=True)
     result = apply_feature_engineering(df)
     assert len(result) == 10
+
+
+# ── GoPlus security feature engineering ───────────────────────────────────────
+
+
+def test_goplus_bool_features_pass_through_as_zero_one():
+    """is_proxy=True → 1, is_mintable=False → 0, others missing → 0."""
+    df = _row(is_proxy=True, is_mintable=False)
+    out = apply_feature_engineering(df)
+    assert out["is_proxy"].iloc[0] == 1
+    assert out["is_mintable"].iloc[0] == 0
+    # Other bools default to 0 when missing.
+    assert out["hidden_owner"].iloc[0] == 0
+
+
+def test_goplus_taxes_clipped_to_unit_interval():
+    """A 1.5 buy_tax (GoPlus parser glitch) clips to 1.0, negative to 0."""
+    df = _row(buy_tax=1.5, sell_tax=-0.2)
+    out = apply_feature_engineering(df)
+    assert out["buy_tax"].iloc[0] == 1.0
+    assert out["sell_tax"].iloc[0] == 0.0
+
+
+def test_goplus_enriched_flag_off_when_no_data():
+    df = _row()  # no GoPlus fields set
+    out = apply_feature_engineering(df)
+    assert out["goplus_enriched"].iloc[0] == 0
+
+
+def test_goplus_enriched_flag_on_when_any_field_present():
+    df = _row(is_proxy=True)
+    out = apply_feature_engineering(df)
+    assert out["goplus_enriched"].iloc[0] == 1
+
+
+def test_engineered_column_count_locked():
+    """Tripwire: 16 legacy columns + 13 GoPlus security + 1 enriched flag = 30
+    + 1 (decimals + log + missing-indicator extras = 16) so total stays at 30.
+    Update this number when intentionally adding columns."""
+    assert len(ENGINEERED_FEATURE_COLUMNS) == 30, (
+        f"ENGINEERED_FEATURE_COLUMNS has {len(ENGINEERED_FEATURE_COLUMNS)} "
+        f"columns; update test if intentional."
+    )
