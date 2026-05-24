@@ -81,9 +81,21 @@ async def session_factory():
     await engine.dispose()
 
 
-async def _seed_db(factory, *, tokens: list[str], with_outcomes: list[str] | None = None) -> None:
-    """Insert an anchor auction, token_features rows, and optional outcomes."""
+async def _seed_db(
+    factory,
+    *,
+    tokens: list[str],
+    with_outcomes: list[str] | None = None,
+    with_scam_outcomes: list[str] | None = None,
+) -> None:
+    """Insert an anchor auction, token_features rows, and optional outcomes.
+
+    `with_outcomes` adds plain `appeared_in_winner=True` rows (auction-derived).
+    `with_scam_outcomes` adds `caused_revert=True` rows (confirmed scam) —
+    these are the only ones that should make the auto-seeder skip a token.
+    """
     with_outcomes = with_outcomes or []
+    with_scam_outcomes = with_scam_outcomes or []
     async with factory() as session:
         session.add(ShadowAuction(
             auction_id=42, polled_at=datetime.now(UTC), n_orders=0,
@@ -95,6 +107,11 @@ async def _seed_db(factory, *, tokens: list[str], with_outcomes: list[str] | Non
             session.add(TokenOutcome(
                 token_address=addr, auction_id=42,
                 appeared_in_winner=True, appeared_in_ours=False, caused_revert=False,
+            ))
+        for addr in with_scam_outcomes:
+            session.add(TokenOutcome(
+                token_address=addr, auction_id=42,
+                appeared_in_winner=False, appeared_in_ours=False, caused_revert=True,
             ))
         await session.commit()
 
@@ -195,16 +212,22 @@ async def test_response_code_not_ok_skipped(session_factory) -> None:
 
 
 @respx.mock
-async def test_idempotent_skips_already_labeled(session_factory) -> None:
-    """Tokens with an existing token_outcomes row must not be re-queried."""
+async def test_confirmed_scam_tokens_are_skipped(session_factory) -> None:
+    """Tokens already confirmed as scam (caused_revert=True) must not be re-queried.
+
+    Legit-only outcomes (`appeared_in_winner=True`) are NOT a reason to skip —
+    every auction-touched token has those by default, and we still want
+    external scam-classification for them.
+    """
     await _seed_db(
         session_factory,
         tokens=[TOKEN_A, TOKEN_B],
-        with_outcomes=[TOKEN_A],  # A already labeled
+        with_outcomes=[TOKEN_A],            # A has legit-only outcomes — should still be re-queried
+        with_scam_outcomes=[TOKEN_B],       # B is confirmed scam — should be skipped
     )
     route = respx.get(GOPLUS_URL_RE).mock(
         return_value=httpx.Response(
-            200, json=_gp_response({TOKEN_B: _gp_entry()})
+            200, json=_gp_response({TOKEN_A: _gp_entry()})
         )
     )
 
@@ -213,13 +236,13 @@ async def test_idempotent_skips_already_labeled(session_factory) -> None:
         session_factory=session_factory,
     )
 
-    # Only one batched call — A was filtered by the unlabeled query.
+    # Exactly one API call for TOKEN_A; TOKEN_B was filtered out.
     assert route.call_count == 1
     assert result.n_checked == 1
-    # A's pre-existing row + B's new legit row = 2 total.
+    # A's pre-existing legit row + A's new legit row + B's scam row = 3 total.
     async with session_factory() as s:
         rows = (await s.execute(select(TokenOutcome))).scalars().all()
-    assert len(rows) == 2
+    assert len(rows) == 3
 
 
 @respx.mock

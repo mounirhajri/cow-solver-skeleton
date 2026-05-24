@@ -228,14 +228,31 @@ async def _fetch_goplus_batch(
 async def _fetch_unlabeled_tokens(
     session: AsyncSession, batch_size: int
 ) -> list[str]:
-    """Tokens that have features but no token_outcomes row yet."""
+    """Tokens that have features but no confirmed-scam outcome yet.
+
+    The naive "no outcome row at all" check was wrong: every token that
+    has appeared in any auction picks up an `appeared_in_winner=True`
+    row via the normal solver flow (`persist_winner_and_outcomes`), so
+    >99 % of tokens look "already labeled" even though we never asked
+    an external service whether they're scams.
+
+    The right question is "has this token been confirmed as scam?".
+    If yes — skip, no need to re-query GoPlus. If no (could be unknown
+    or legit-only) — re-query and let GoPlus give us a verdict.
+
+    Trade-off: a token that GoPlus repeatedly classifies as legit will
+    pick up one extra `appeared_in_winner=True` row per run, which is
+    fine for the classifier (it aggregates per-token) and keeps the
+    code simple. A confirmed-scam token never gets re-queried.
+    """
+    confirmed_scam = (
+        select(TokenOutcome.token_address)
+        .where(TokenOutcome.caused_revert.is_(True))
+        .distinct()
+    )
     stmt = (
         select(TokenFeatures.token_address)
-        .outerjoin(
-            TokenOutcome,
-            TokenOutcome.token_address == TokenFeatures.token_address,
-        )
-        .where(TokenOutcome.token_address.is_(None))
+        .where(TokenFeatures.token_address.not_in(confirmed_scam))
         .limit(batch_size)
     )
     rows = (await session.execute(stmt)).scalars().all()
