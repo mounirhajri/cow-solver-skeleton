@@ -411,7 +411,13 @@ async def _seed(
         if app_key and app_secret:
             token = await _fetch_access_token(client, app_key, app_secret)
             if token is not None:
-                client.headers["Authorization"] = f"Bearer {token}"
+                # GoPlus expects the raw access_token in Authorization — NO
+                # "Bearer " prefix. Verified live 2026-05-24: with prefix the
+                # token_security endpoint returns code=4012 'signature
+                # verification failure'; without prefix it returns code=1.
+                # The docs page that suggests "Bearer" formatting refers to
+                # a different (AVS) endpoint family.
+                client.headers["Authorization"] = token
 
         tasks = [_process_chunk(client, semaphore, c, chain_id) for c in chunks]
         chunk_results = await asyncio.gather(*tasks)
