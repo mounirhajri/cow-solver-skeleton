@@ -26,6 +26,15 @@ from src.solver.orchestrator import AttemptRecord
 
 log = get_logger(__name__)
 
+# Skip persisting microscopic-surplus solutions. These are mathematically
+# valid matches against tiny counter-orders (e.g. $10M TWAP vs $0.001 micro-
+# order in same auction) that pass limit checks via partial downscale but
+# produce surplus below any reasonable submission threshold. The estimator
+# already filters them via winner_score comparison — we just stop creating
+# the rows in the first place. Saves shadow_solutions row growth without
+# losing any economically relevant data.
+EPSILON_WEI = 10**12  # 1 microETH ≈ $0.002 at €1800/ETH
+
 
 async def persist_shadow_attempt(
     auction: Auction,
@@ -76,6 +85,7 @@ async def persist_shadow_attempt(
                 if tok.reference_price
             }
 
+        n_sub_dust_skipped = 0
         for a in attempts:
             score: int | None = None
             if a.solution and uid_map and native_prices:
@@ -84,6 +94,17 @@ async def persist_shadow_attempt(
                     # Keep 0 as NULL (no real surplus); only store positive scores.
                     # A score of 0 means the solution is valid but unprofitable.
                     score = raw_score if raw_score > 0 else None
+
+            # Sub-dust filter: skip persisting solutions with a computed score
+            # below EPSILON_WEI. These originate from bipartite-matcher downscaling
+            # large TWAP orders against tiny counter-orders (Ghost Order pattern).
+            # Rows with solution=None (errors/timeouts) or score=None (computation
+            # failed / zero surplus) are always kept — only skip when score is a
+            # positive integer below EPSILON_WEI.
+            if a.solution is not None and score is not None and score < EPSILON_WEI:
+                n_sub_dust_skipped += 1
+                continue
+
             session.add(
                 ShadowSolution(
                     auction_id=auction_id,
@@ -94,6 +115,13 @@ async def persist_shadow_attempt(
                     error=a.error,
                     our_score_wei=score,
                 )
+            )
+
+        if n_sub_dust_skipped:
+            log.info(
+                "sub_dust_solutions_skipped",
+                auction_id=auction_id,
+                n_sub_dust_skipped=n_sub_dust_skipped,
             )
 
         await session.commit()
