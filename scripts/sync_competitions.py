@@ -11,7 +11,9 @@ Key behaviours
 - Idempotent: INSERT … ON CONFLICT DO NOTHING means re-runs are safe.
 - 404 skip: auctions that settled without on-chain competition data are
   logged at INFO and skipped (no row inserted).
-- Throttle: 5 requests / second via asyncio.Semaphore + asyncio.sleep.
+- Throttle: 1 req/s by default (CoW API rate-limits sustained higher rates
+  without an authenticated key; overridable via COW_API_RPS env var).
+- On HTTP 429: honour ``Retry-After`` header (capped at 60 s) and retry once.
 - Batch: processes at most ``--limit`` auctions per run, ordered newest-first
   so the most recent data is always populated first.
 
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -46,8 +49,13 @@ COW_COMPETITION_URL = (
 )
 USER_AGENT = "cow-solver-skeleton/1.0"
 HTTP_TIMEOUT_S = 10.0
-# CoW API is rate-limited; 5 req/s is safe without an API key.
-REQUESTS_PER_SECOND = 5
+# CoW API rate-limit without auth is stricter than docs suggest — live runs
+# 2026-05-25 returned HTTP 429 at sustained 5 req/s. Drop to 1 req/s, plus
+# explicit Retry-After handling below. Override via COW_API_RPS env var if
+# we ever get an authenticated key with higher limits.
+REQUESTS_PER_SECOND = float(os.environ.get("COW_API_RPS", "1"))
+# Hard upper bound on Retry-After sleep to avoid pathological 1-hour pauses.
+RETRY_AFTER_MAX_S = 60.0
 
 
 @dataclass
@@ -93,19 +101,45 @@ async def _fetch_competition(
     """Fetch competition data for a single auction.
 
     Returns the parsed JSON body on success, None on 404 (no competition data
-    available for this auction), and raises on other HTTP errors.
+    available for this auction), and raises on other HTTP errors. On 429
+    Too Many Requests, sleeps for ``Retry-After`` seconds (server-provided)
+    or 5 s (fallback) and retries ONCE. Per-call retry budget is bounded so
+    a sustained rate-limit doesn't stall the entire batch.
     """
     url = COW_COMPETITION_URL.format(auction_id=auction_id)
-    try:
-        resp = await client.get(url)
-    except httpx.HTTPError as exc:
-        log.warning("cow_competition_fetch_error", auction_id=auction_id, error=str(exc))
-        raise
+    for attempt in (1, 2):
+        try:
+            resp = await client.get(url)
+        except httpx.HTTPError as exc:
+            log.warning(
+                "cow_competition_fetch_error", auction_id=auction_id, error=str(exc)
+            )
+            raise
 
-    if resp.status_code == 404:
-        log.info("cow_competition_not_found", auction_id=auction_id)
-        return None
+        if resp.status_code == 404:
+            log.info("cow_competition_not_found", auction_id=auction_id)
+            return None
 
+        if resp.status_code == 429 and attempt == 1:
+            # Honour Retry-After header if present; default 5 s.
+            retry_after_raw = resp.headers.get("Retry-After", "5")
+            try:
+                retry_after = float(retry_after_raw)
+            except (TypeError, ValueError):
+                retry_after = 5.0
+            retry_after = min(retry_after, RETRY_AFTER_MAX_S)
+            log.warning(
+                "cow_competition_rate_limited",
+                auction_id=auction_id,
+                retry_after_s=retry_after,
+            )
+            await asyncio.sleep(retry_after)
+            continue
+
+        resp.raise_for_status()
+        return resp.json()  # type: ignore[no-any-return]
+
+    # If we get here, retry didn't recover.
     resp.raise_for_status()
     return resp.json()  # type: ignore[no-any-return]
 
@@ -192,10 +226,12 @@ async def _sync(
 
     log.info("sync_competitions_start", n_auctions=len(auction_ids))
 
-    # Rate limiter: allow at most REQUESTS_PER_SECOND concurrent requests.
-    # We achieve 5 req/s by releasing one permit per 1/5 = 0.2 s.
-    semaphore = asyncio.Semaphore(REQUESTS_PER_SECOND)
-    interval = 1.0 / REQUESTS_PER_SECOND  # seconds per permit
+    # Rate limiter: pace requests at REQUESTS_PER_SECOND. Semaphore size 1
+    # keeps the loop strictly sequential (no parallel overlap can spike past
+    # the rate), the interval-after-call enforces the temporal spacing.
+    # Permit size = 1 (sequential) + interval-after-call enforces 1/RPS spacing.
+    semaphore = asyncio.Semaphore(1)
+    interval = 1.0 / REQUESTS_PER_SECOND  # seconds per request
 
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     async with httpx.AsyncClient(headers=headers, timeout=HTTP_TIMEOUT_S) as client:
