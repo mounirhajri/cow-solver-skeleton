@@ -58,8 +58,18 @@ class SolverOrchestrator:
         self._ebbo_intermediates = ebbo_intermediates or []
         self._ebbo_tolerance_bps = ebbo_tolerance_bps
 
-    async def solve(self, auction: Auction) -> tuple[Solution | NoSolution, list[AttemptRecord]]:
-        attempts: list[AttemptRecord] = []
+    async def solve(
+        self,
+        auction: Auction,
+        attempts: list[AttemptRecord] | None = None,
+    ) -> tuple[Solution | NoSolution, list[AttemptRecord]]:
+        # Callers may pass an attempts list to capture partial state across an
+        # outer cancellation (e.g. main.py's wait_for timeout) — the list is
+        # mutated in place so the caller can persist whatever was collected
+        # before cancellation hit. When None, a fresh list is created (default
+        # behaviour for tests + standalone use).
+        if attempts is None:
+            attempts = []
         winning_solutions: list[tuple[str, Solution]] = []
 
         # Spec §3: count smart-wallet orders once per auction, before the

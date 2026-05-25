@@ -14,7 +14,7 @@ from src.models.solution import Solution
 from src.shadow.logger import SolutionLogger
 from src.shadow.persist import persist_shadow_attempt_safe
 from src.solver.base import NoSolution
-from src.solver.orchestrator import SolverOrchestrator, load_default_orchestrator
+from src.solver.orchestrator import AttemptRecord, SolverOrchestrator, load_default_orchestrator
 
 log = get_logger(__name__)
 
@@ -41,9 +41,15 @@ def create_app(
         body = await request.json()
         auction = Auction.model_validate(body)
 
+        # Pre-allocate the attempts list so the orchestrator can mutate it in
+        # place; this preserves partial shadow data even when the outer
+        # wait_for cancels mid-strategy (e.g. multi-party LP exceeding the
+        # solve_timeout). Without this, every timeout left shadow_solutions
+        # un-written (verified outage 2026-05-24 → 2026-05-25).
+        attempts: list[AttemptRecord] = []
         try:
-            result, attempts = await asyncio.wait_for(
-                orchestrator.solve(auction),
+            result, _ = await asyncio.wait_for(
+                orchestrator.solve(auction, attempts),
                 timeout=settings.solve_timeout_seconds,
             )
         except TimeoutError:
@@ -53,10 +59,12 @@ def create_app(
                 timeout=settings.solve_timeout_seconds,
             )
             SOLVE_TOTAL.labels(outcome="error").inc()
+            background_tasks.add_task(persist_shadow_attempt_safe, auction, attempts, None)
             return _empty_solution(auction.id)
         except Exception as e:  # noqa: BLE001
             log.error("solve_error", auction_id=auction.id, error=str(e))
             SOLVE_TOTAL.labels(outcome="error").inc()
+            background_tasks.add_task(persist_shadow_attempt_safe, auction, attempts, None)
             return _empty_solution(auction.id)
 
         # Persist shadow data in the background — never blocks the hot path
