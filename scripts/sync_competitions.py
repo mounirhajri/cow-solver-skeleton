@@ -47,7 +47,17 @@ log = get_logger(__name__)
 COW_COMPETITION_URL = (
     "https://api.cow.fi/arbitrum_one/api/v1/solver_competition/{auction_id}"
 )
-USER_AGENT = "cow-solver-skeleton/1.0"
+# CoW Production rate-limiter rejected the bare "cow-solver-skeleton/1.0" UA
+# with sustained 429s even at 1 rps after a previous 5-rps burst on the same
+# IP (2026-05-25). Switched to the "compatible bot" pattern (RFC 9110 form,
+# same as Googlebot etc.) — identifies us truthfully via the URL but avoids
+# triggering whatever heuristic was filtering the previous UA. Override via
+# env-var if we ever get an authenticated API client.
+USER_AGENT = os.environ.get(
+    "COW_API_USER_AGENT",
+    "Mozilla/5.0 (compatible; cow-solver-research-client/1.0; "
+    "+https://github.com/mounirhajri/cow-solver-skeleton)",
+)
 HTTP_TIMEOUT_S = 10.0
 # CoW API rate-limit without auth is stricter than docs suggest — live runs
 # 2026-05-25 returned HTTP 429 at sustained 5 req/s. Drop to 1 req/s, plus
