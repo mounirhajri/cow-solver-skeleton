@@ -108,6 +108,47 @@ def compute_solution_score(
         with contextlib.suppress(ValueError, TypeError):
             np_map[tok.lower()] = int(price)
 
+    # Validity pass: CIP-14 / the on-chain protocol rejects a Solution if any
+    # included trade settles below its order's limit price at the Solution's
+    # clearing prices. The per-trade scoring functions below silently clamp
+    # individual surplus to >=0, which means a multi-pair Solution that
+    # violates one trade's limit while another trade enjoys surplus would
+    # produce a positive score here but be rejected on-chain. Mirror that
+    # semantic: any limit-violating fulfillment trade invalidates the whole
+    # score.
+    for trade in solution.get("trades") or []:
+        if trade.get("kind") != "fulfillment":
+            continue
+        uid = (trade.get("orderUid") or trade.get("order_uid") or "").lower()
+        order = orders_by_uid.get(uid)
+        if order is None:
+            continue
+        try:
+            executed = int(trade.get("executedAmount") or 0)
+            if executed <= 0:
+                continue
+            sell_tok = (order.get("sellToken") or order.get("sell_token") or "").lower()
+            buy_tok = (order.get("buyToken") or order.get("buy_token") or "").lower()
+            signed_sell = int(order.get("sellAmount") or order.get("sell_amount") or 0)
+            signed_buy = int(order.get("buyAmount") or order.get("buy_amount") or 0)
+            side = (order.get("kind") or "sell").lower()
+            cp_sell = cp.get(sell_tok, 0)
+            cp_buy = cp.get(buy_tok, 0)
+            if not all([signed_sell, signed_buy, cp_sell, cp_buy]):
+                continue
+            if side == "sell":
+                bought = _ceil_div(executed * cp_sell, cp_buy)
+                limit_buy = _ceil_div(executed * signed_buy, signed_sell)
+                if bought < limit_buy:
+                    return 0
+            else:
+                sold = (executed * cp_buy) // cp_sell
+                limit_sell = (executed * signed_sell) // signed_buy
+                if sold > limit_sell:
+                    return 0
+        except (ValueError, TypeError, ZeroDivisionError):
+            continue
+
     total = 0
     for trade in solution.get("trades") or []:
         if trade.get("kind") != "fulfillment":
