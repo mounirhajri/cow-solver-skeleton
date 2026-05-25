@@ -4,10 +4,13 @@ Behaviour the tests lock in:
   - Solution passes when every sell trade's user output meets/exceeds the
     external V3 quote within tolerance.
   - Solution fails when ANY trade falls short by more than tolerance.
-  - Buy-kind trades and orders missing clearing prices are skipped
-    (not failed) — they are not yet covered by this validator.
+  - Buy-kind trades are now validated: user must not pay more sell-token
+    than external V3 quoteExactOutput would charge (plus tolerance).
+  - Orders missing clearing prices are skipped (not failed).
   - RPC errors in the quoter do NOT fail the solution; they're logged
     and treated as "no external comparison available, pass through".
+  - Solutions with more than _MAX_TRADES_PER_CHECK trades are rejected
+    outright rather than silently truncated.
 """
 
 from __future__ import annotations
@@ -92,6 +95,23 @@ def quoter(monkeypatch):
     return table
 
 
+@pytest.fixture
+def quoter_buy(monkeypatch):
+    """Replace _quote_best_exact_output with a mock keyed by (sell, buy, amount_out).
+
+    Returns the sell-token cost (amount_in) for an exact-output quote, or None
+    when no route exists (key absent from table).
+    """
+    table: dict[tuple[str, str, int], int | None] = {}
+
+    async def _stub(_mc, sell_token, buy_token, amount_out, _intermediates):
+        key = (sell_token.lower(), buy_token.lower(), amount_out)
+        return table.get(key)
+
+    monkeypatch.setattr("src.solver.ebbo._quote_best_exact_output", _stub)
+    return table
+
+
 @pytest.mark.asyncio
 async def test_passes_when_our_buy_beats_external(quoter) -> None:
     o = _order(sell_amount=1000, buy_amount=900)
@@ -140,19 +160,161 @@ async def test_within_tolerance_still_passes(quoter) -> None:
 
 
 @pytest.mark.asyncio
-async def test_buy_orders_are_skipped_not_failed(quoter) -> None:
-    """Buy-kind orders are not yet covered by EBBO — they must be skipped
-    rather than counted as a violation."""
-    o = _order(kind="buy")
+async def test_buy_orders_are_now_validated(quoter, quoter_buy) -> None:
+    """Buy-kind orders are now validated against quoteExactOutput.
+
+    Setup:
+      - order: buy, sellAmount=1000, buyAmount=500
+        (user wants 500 buy-token, willing to pay up to 1000 sell-token)
+      - executed_amount = 500 (exact buy side)
+      - clearing prices: cp_sell=2, cp_buy=1
+        => our_sell_amount = floor(500 * 1 / 2) = 250
+        Wait — let's make it clearly violating.
+      - clearing prices: cp_buy=10, cp_sell=1
+        => our_sell_amount = floor(500 * 10 / 1) = 5000
+      - External quote: 800 sell-token for 500 buy-token (much cheaper)
+      - our_sell=5000 >> threshold=800*(10050/10000)=804 → FAIL
+    """
+    o = _order(kind="buy", sell_token="0xa", buy_token="0xb",
+               sell_amount=1000, buy_amount=500)
     auction = _auction([o])
-    trade = Trade(kind="fulfillment", orderUid=UID, executedAmount=1000)
-    solution = _solution([trade], prices={"0xa": 1, "0xb": 2})
-    # No quote stubbed — wouldn't matter; buy should skip before quoter call.
+    trade = Trade(kind="fulfillment", orderUid=UID, executedAmount=500)
+    # cp_buy=10, cp_sell=1 → our_sell = 500*10//1 = 5000, ext=800
+    solution = _solution([trade], prices={"0xa": 1, "0xb": 10})
+    quoter_buy[("0xa", "0xb", 500)] = 800
+
+    r = await validate_solution_ebbo(solution, auction, multicall=None, intermediates=[])
+    assert not r.passes
+    assert r.n_checked == 1
+    assert len(r.violations) == 1
+    assert UID[:18] in r.violations[0]
+
+
+@pytest.mark.asyncio
+async def test_buy_order_within_tolerance_passes(quoter, quoter_buy) -> None:
+    """Buy trade that pays only slightly more than external (within 50 bps) passes.
+
+    our_sell = floor(500 * 1 / 1) = 500.
+    ext_sell = 499.  overpay = 1/499 ≈ 20 bps < 50 bps tolerance → PASS.
+    threshold = 499 * 10050 // 10000 = 501
+    our_sell=500 <= 501 → passes.
+    """
+    o = _order(kind="buy", sell_token="0xa", buy_token="0xb",
+               sell_amount=1000, buy_amount=500)
+    auction = _auction([o])
+    trade = Trade(kind="fulfillment", orderUid=UID, executedAmount=500)
+    # cp_buy=1, cp_sell=1 → our_sell = 500*1//1 = 500
+    solution = _solution([trade], prices={"0xa": 1, "0xb": 1})
+    quoter_buy[("0xa", "0xb", 500)] = 499  # ext cheaper by ~20 bps
+
+    r = await validate_solution_ebbo(solution, auction, multicall=None, intermediates=[])
+    assert r.passes
+    assert r.n_checked == 1
+
+
+@pytest.mark.asyncio
+async def test_buy_order_no_route_skipped_not_failed(quoter, quoter_buy) -> None:
+    """Buy trade with no V3 route (exotic token) is skipped, not failed."""
+    o = _order(kind="buy", sell_token="0xa", buy_token="0xexotic",
+               sell_amount=1000, buy_amount=500)
+    auction = _auction([o])
+    trade = Trade(kind="fulfillment", orderUid=UID, executedAmount=500)
+    solution = _solution([trade], prices={"0xa": 1, "0xexotic": 1})
+    # No entry in quoter_buy → mock returns None
 
     r = await validate_solution_ebbo(solution, auction, multicall=None, intermediates=[])
     assert r.passes
     assert r.n_checked == 0
     assert r.n_skipped == 1
+
+
+@pytest.mark.asyncio
+async def test_buy_order_quote_exception_skipped(quoter, monkeypatch) -> None:
+    """RPC error during buy-side quoting skips the trade, not fails the solution."""
+    o = _order(kind="buy", sell_token="0xa", buy_token="0xb",
+               sell_amount=1000, buy_amount=500)
+    auction = _auction([o])
+    trade = Trade(kind="fulfillment", orderUid=UID, executedAmount=500)
+    solution = _solution([trade], prices={"0xa": 1, "0xb": 1})
+
+    async def _boom(*a, **k):
+        raise RuntimeError("rpc timeout")
+
+    monkeypatch.setattr("src.solver.ebbo._quote_best_exact_output", _boom)
+
+    r = await validate_solution_ebbo(solution, auction, multicall=None, intermediates=[])
+    assert r.passes
+    assert r.n_skipped == 1
+
+
+@pytest.mark.asyncio
+async def test_mixed_sell_and_buy_trades(quoter, quoter_buy) -> None:
+    """One passing sell + one failing buy in the same solution → passes=False,
+    only the failing buy appears in violations."""
+    o_sell = _order(uid=UID, sell_token="0xa", buy_token="0xb",
+                    sell_amount=1000, buy_amount=900, kind="sell")
+    o_buy = _order(uid=UID2, sell_token="0xa", buy_token="0xb",
+                   sell_amount=1000, buy_amount=500, kind="buy")
+    auction = _auction([o_sell, o_buy])
+
+    trades = [
+        Trade(kind="fulfillment", orderUid=UID, executedAmount=1000),   # sell
+        Trade(kind="fulfillment", orderUid=UID2, executedAmount=500),   # buy
+    ]
+    # Prices 1:1 → sell: our_buy = ceil(1000*1/1)=1000; buy: our_sell=500*1//1=500
+    solution = _solution(trades, prices={"0xa": 1, "0xb": 1})
+
+    # Sell trade: external 1000 == our 1000 → passes
+    quoter[("0xa", "0xb", 1000)] = 1000
+    # Buy trade: external ext_sell=400, our_sell=500, threshold=400*10050//10000=402
+    # 500 > 402 → fails
+    quoter_buy[("0xa", "0xb", 500)] = 400
+
+    r = await validate_solution_ebbo(solution, auction, multicall=None, intermediates=[])
+    assert not r.passes
+    assert len(r.violations) == 1
+    assert UID2[:18] in r.violations[0]
+    assert r.n_checked == 2
+
+
+@pytest.mark.asyncio
+async def test_truncation_rejects_solution(monkeypatch) -> None:
+    """Solution with more trades than _MAX_TRADES_PER_CHECK is rejected outright."""
+    from src.solver import ebbo as _ebbo
+    monkeypatch.setattr(_ebbo, "_MAX_TRADES_PER_CHECK", 20)
+
+    orders = [_order(uid=f"0x{i:0112x}") for i in range(25)]
+    auction = _auction(orders)
+    trades = [
+        Trade(kind="fulfillment", orderUid=f"0x{i:0112x}", executedAmount=1000)
+        for i in range(25)
+    ]
+    solution = _solution(trades, prices={"0xa": 1, "0xb": 1})
+
+    r = await validate_solution_ebbo(solution, auction, multicall=None, intermediates=[])
+    assert not r.passes
+    assert r.n_truncated == 5
+    assert r.n_checked == 0
+    assert len(r.violations) == 1
+    assert "truncation" in r.violations[0]
+
+
+@pytest.mark.asyncio
+async def test_truncation_boundary_exactly_max(quoter) -> None:
+    """Solution with exactly _MAX_TRADES_PER_CHECK (20) trades is NOT truncated."""
+    orders = [_order(uid=f"0x{i:0112x}") for i in range(20)]
+    auction = _auction(orders)
+    trades = [
+        Trade(kind="fulfillment", orderUid=f"0x{i:0112x}", executedAmount=1000)
+        for i in range(20)
+    ]
+    solution = _solution(trades, prices={"0xa": 1, "0xb": 1})
+    quoter[("0xa", "0xb", 1000)] = 1000  # all pass
+
+    r = await validate_solution_ebbo(solution, auction, multicall=None, intermediates=[])
+    assert r.passes
+    assert r.n_truncated == 0
+    assert r.n_checked == 20
 
 
 @pytest.mark.asyncio
@@ -249,8 +411,12 @@ def test_default_tolerance_is_documented() -> None:
 
 @pytest.mark.asyncio
 async def test_truncates_at_max_trades(quoter, monkeypatch) -> None:
-    """Pathological composer output > _MAX_TRADES_PER_CHECK is truncated and
-    counted in n_truncated, not silently dropped."""
+    """Pathological composer output > _MAX_TRADES_PER_CHECK is rejected outright.
+
+    Previous behaviour was: truncate and pass the first N trades.  New
+    behaviour: return passes=False immediately — unvalidated trades must
+    never reach submission.  n_truncated is still populated for telemetry.
+    """
     from src.solver import ebbo as _ebbo
     monkeypatch.setattr(_ebbo, "_MAX_TRADES_PER_CHECK", 3)
     orders = [_order(uid=f"0x{i:0112x}") for i in range(5)]
@@ -263,9 +429,11 @@ async def test_truncates_at_max_trades(quoter, monkeypatch) -> None:
     quoter[("0xa", "0xb", 1000)] = 1000
 
     r = await validate_solution_ebbo(solution, auction, multicall=None, intermediates=[])
-    assert r.passes
-    assert r.n_checked == 3      # _MAX_TRADES_PER_CHECK
-    assert r.n_truncated == 2    # 5 trades − 3 checked
+    assert not r.passes                   # NEW: rejects rather than passing
+    assert r.n_checked == 0               # nothing checked — rejected early
+    assert r.n_truncated == 2             # 5 trades − 3 limit
+    assert len(r.violations) == 1
+    assert "truncation" in r.violations[0]
 
 
 @pytest.mark.asyncio
