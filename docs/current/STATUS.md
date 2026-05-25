@@ -38,8 +38,10 @@ This doc is the single source of truth for "what's running, what's broken, what'
 | `e1ad98b` | `src/config.py`: solve_timeout 13s → 25s — outer cap was starving router-v2 (last in chain, 11s budget) after partial-fills deploy slowed bipartite/multi-party |
 | `787a8c5` (edge) | `edge/matching/bipartite.py`: drop multi-pair matches whose limit prices are violated at the Solution's committed clearing ratio (previous code emitted limit-violating trades that CIP-14 scoring silently clamped, producing inflated 7.77 ETH median scores on $80M-scale USDC/USDT TWAP fills) |
 | `770287a` | `src/shadow/scoring.py`: zero out CIP-14 score when any fulfillment trade violates its limit at the Solution's clearing prices (defense-in-depth against the bipartite case + any future strategy that emits limit-violating Solutions) |
+| `629fd71` | `src/shadow/persist.py` + `src/solver/router.py`: skip score computation for `strategy="naive"` (oracle reference_price clearing = phantom surplus, KNOWN-BAD); add `router_high_surplus_observed` log when implied surplus > 100bps (forensic visibility for off-market quotes) |
+| `7c92cea` (edge) + `7f4d03a` | `edge/matching/bipartite.py`: cap per-match fill volume at 1% of sell_amount for partially-fillable orders ≥ 10^12 base units (orthogonal to limit-violation fix; addresses TWAP orders encoded at full 10M USDC sellAmount producing ~1.7 ETH per fill on unrealisable depth) |
 
-Post-fix verification (2026-05-25 16:14 UTC): bipartite produces single-pair stablecoin CoWs at sane scores (~6 micro-ETH per match instead of 7.77 ETH). All 5 strategies continue to persist rows; no timeouts in sample window.
+Post-fix verification (2026-05-25 18:00 UTC, clean TRUNCATE baseline): bipartite max score ≤ 0.0000 ETH (cap working), naive scored=0 (NULL enforced), multi-party honest no_solution, router-v2 + composer ~6 ETH (legit V3 AMM arb on persistent loose-limit orders). All 5 strategies persisting rows; no timeouts.
 
 ### 1.4 Raw shadow data vs. aggregate analytics
 
