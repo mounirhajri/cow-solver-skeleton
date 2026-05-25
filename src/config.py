@@ -34,7 +34,12 @@ class Settings(BaseSettings):
 
     # Behaviour
     amm_state_lazy: bool = True
-    solve_timeout_seconds: float = 13.0  # slightly below CoW's 15s deadline
+    # Sequential strategy budget: naive(4s) + bipartite(2.6s) + multi-party(2.6s)
+    # + router-v2(11s) = ~20s worst-case. We're in shadow mode — no CoW
+    # submission deadline applies, so the prior 13s cap was starving router-v2
+    # before it could quote (verified 2026-05-25: 0 router-v2 rows persisted
+    # since the partial-fills deploy slowed bipartite/multi-party).
+    solve_timeout_seconds: float = 25.0
 
     # RouterSolver concurrency
     # Alchemy free tier: ~330 CU/s = ~12 eth_calls/s.  Each in-flight order
