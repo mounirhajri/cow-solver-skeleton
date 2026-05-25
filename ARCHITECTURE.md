@@ -1,8 +1,9 @@
 # Architecture
 
 This document gives a one-page overview for readers (including the CoW
-team during code review). For deeper rationale see the specs in
-`docs/superpowers/specs/`.
+team during code review). For current implementation status see
+[`docs/current/STATUS.md`](docs/current/STATUS.md); for deeper rationale
+see the specs in [`docs/current/specs/`](docs/current/specs/).
 
 ## Request flow
 
@@ -11,7 +12,7 @@ CoW Driver  ──POST /solve──▶  FastAPI app  ──▶  SolverOrchestrat
                                                     │
                                 ┌───────────────────┼───────────────────┐
                                 ▼                   ▼                   ▼
-                            Strategy 1          Strategy N          (all run in parallel,
+                            Strategy 1   ───▶   Strategy N         (sequential for-loop,
                             NaiveSolver         RouterSolver         each with own timeout)
                                 │                   │
                                 └─────────┬─────────┘

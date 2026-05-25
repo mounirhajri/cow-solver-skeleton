@@ -9,10 +9,15 @@ the shadow harness. The matching algorithms + token-quality classifier
 live in a private git submodule under `edge/`, loaded at runtime when
 present. Public clones fall back to the naive + router strategies only.
 
+> **For current implementation status, open work, and known issues, see
+> [`docs/current/STATUS.md`](docs/current/STATUS.md).** That file is the
+> source of truth — claims here cover only the high-level shape.
+
 ## Strategy chain
 
-The orchestrator runs strategies in parallel and a token-disjoint
-composer merges non-overlapping solutions:
+The orchestrator runs strategies **sequentially** (single for-loop in
+`src/solver/orchestrator.py:77`) and a token-disjoint composer merges
+non-overlapping solutions:
 
 | # | Strategy | Module | Purpose |
 |---|----------|--------|---------|
@@ -46,14 +51,17 @@ owns actual signature validation; we don't make on-chain
 
 ## Design rationale
 
-Each phase has a written spec in `docs/superpowers/specs/`:
+Current specs live under `docs/current/specs/`; historical/superseded
+docs are in `docs/archive/`. Start here:
 
-- [`2026-05-22-cow-solver-design.md`](docs/superpowers/specs/2026-05-22-cow-solver-design.md)
-  — high-level architecture, phasing, risks
-- [`2026-05-23-solver-revenue-strategy-design.md`](docs/superpowers/specs/2026-05-23-solver-revenue-strategy-design.md)
-  — tactical revenue plan, G1-G6 go/no-go gate, current status per phase
-- [`2026-05-23-phase2-pool-indexer-design.md`](docs/superpowers/specs/2026-05-23-phase2-pool-indexer-design.md)
-  — Pool-Indexer MVP design (lazy indexer, Redis cache)
+- [`docs/current/STATUS.md`](docs/current/STATUS.md)
+  — current implementation status, open work, known issues, realistic
+  revenue expectations
+- [`docs/current/specs/cow-solver-design.md`](docs/current/specs/cow-solver-design.md)
+  — high-level architecture, phasing, risks (master spec)
+- [`docs/current/specs/phase2-pool-indexer-design.md`](docs/current/specs/phase2-pool-indexer-design.md)
+  — Pool-Indexer MVP design (lazy indexer, Redis cache); implementation
+  exists but disabled in prod via `LONG_TAIL_ENABLED=false`
 
 ## Local development
 
@@ -97,9 +105,13 @@ docker exec cow-solver python -m scripts.backfill_scores
 
 ## Deployment
 
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Push to `main` triggers a
-GitHub Actions deploy via SSH to the production host. Alembic migrations
-run automatically on container restart.
+See [docs/current/DEPLOYMENT.md](docs/current/DEPLOYMENT.md). Push to
+`main` triggers a GitHub Actions deploy via SSH to the production host;
+Alembic migrations run automatically on container restart.
+
+**Known gap:** the `HETZNER_SSH_KEY` GHA secret is currently
+passphrase-protected so CI deploys fail; deploys are manual until that's
+replaced. See [`STATUS.md` §2.1](docs/current/STATUS.md#21-critical-blockers-for-barnbonding-pool).
 
 ## Configuration knobs
 
