@@ -32,7 +32,15 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import httpx
+# Use curl_cffi (libcurl bindings with browser-TLS fingerprint) instead of
+# httpx — CloudFront in front of api.cow.fi rate-limits Python-default-httpx
+# TLS fingerprints to 429 even at 1 rps, while raw curl and urllib succeed.
+# Verified 2026-05-25: urllib → 200, httpx → 429 on identical request.
+# curl_cffi.requests.AsyncSession is a drop-in async client.
+# Alias curl_cffi AsyncSession to avoid name collision with
+# sqlalchemy.ext.asyncio.AsyncSession imported below.
+from curl_cffi.requests import AsyncSession as HttpAsyncSession
+from curl_cffi.requests import RequestsError
 from sqlalchemy import outerjoin, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -106,9 +114,9 @@ async def _fetch_unsynced_auction_ids(
 
 
 async def _fetch_competition(
-    client: httpx.AsyncClient, auction_id: int
+    client: HttpAsyncSession, auction_id: int
 ) -> dict[str, Any] | None:
-    """Fetch competition data for a single auction.
+    """Fetch competition data for a single auction via curl_cffi.
 
     Returns the parsed JSON body on success, None on 404 (no competition data
     available for this auction), and raises on other HTTP errors. On 429
@@ -119,8 +127,11 @@ async def _fetch_competition(
     url = COW_COMPETITION_URL.format(auction_id=auction_id)
     for attempt in (1, 2):
         try:
-            resp = await client.get(url)
-        except httpx.HTTPError as exc:
+            # impersonate="chrome" applies the latest Chrome TLS+JA3 fingerprint.
+            # Without this, curl_cffi degrades to a generic-libcurl handshake
+            # which CloudFront has historically also rate-limited.
+            resp = await client.get(url, impersonate="chrome")
+        except RequestsError as exc:
             log.warning(
                 "cow_competition_fetch_error", auction_id=auction_id, error=str(exc)
             )
@@ -146,11 +157,17 @@ async def _fetch_competition(
             await asyncio.sleep(retry_after)
             continue
 
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"HTTP {resp.status_code} for {url}: {resp.text[:200]}"
+            )
         return resp.json()  # type: ignore[no-any-return]
 
     # If we get here, retry didn't recover.
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"HTTP {resp.status_code} for {url} after retry: {resp.text[:200]}"
+        )
     return resp.json()  # type: ignore[no-any-return]
 
 
@@ -244,7 +261,7 @@ async def _sync(
     interval = 1.0 / REQUESTS_PER_SECOND  # seconds per request
 
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    async with httpx.AsyncClient(headers=headers, timeout=HTTP_TIMEOUT_S) as client:
+    async with HttpAsyncSession(headers=headers, timeout=HTTP_TIMEOUT_S) as client:
         for auction_id in auction_ids:
             result.auction_ids_seen.append(auction_id)
             started = time.monotonic()

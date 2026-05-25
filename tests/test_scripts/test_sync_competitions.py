@@ -1,23 +1,24 @@
-"""Tests for scripts/sync_competitions.py."""
+"""Tests for scripts/sync_competitions.py.
+
+The script uses ``curl_cffi.requests.AsyncSession`` for the live HTTP path
+(CloudFront fronting api.cow.fi rate-limits Python-default-httpx TLS
+fingerprints to 429 — verified 2026-05-25). Tests bypass the HTTP layer
+entirely by monkeypatching ``_fetch_competition`` to return canned JSON
+payloads. This decouples test coverage from the HTTP-library choice and
+keeps tests fast.
+"""
 
 from __future__ import annotations
 
-import re
 from datetime import UTC, datetime
 from typing import Any
 
-import httpx
 import pytest
-import respx
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from scripts.sync_competitions import _sync
 from src.persistence.models import ShadowAuction, ShadowCompetitor
-
-COW_COMPETITION_URL_RE = re.compile(
-    r"https://api\.cow\.fi/arbitrum_one/api/v1/solver_competition/\d+"
-)
 
 # Trimmed real-world example based on auction 7370873.
 # 8 solvers exactly as described in the task spec.
@@ -161,7 +162,23 @@ async def _add_auction(factory: async_sessionmaker, auction_id: int = 7370873) -
         await session.commit()
 
 
-@respx.mock
+def _make_fetch_stub(
+    response: dict[str, Any] | None,
+    *,
+    call_log: list[int] | None = None,
+) -> Any:
+    """Build an async stub for `_fetch_competition` returning a canned payload.
+
+    Pass `response=None` to simulate 404. `call_log`, if given, captures
+    the auction_id of each call so tests can assert N HTTP attempts.
+    """
+    async def _stub(_client: Any, auction_id: int) -> dict[str, Any] | None:
+        if call_log is not None:
+            call_log.append(auction_id)
+        return response
+    return _stub
+
+
 async def test_inserts_8_rows_for_8_solvers(session_factory, monkeypatch) -> None:
     """All 8 solver bids in the sample response become rows in shadow_competitors."""
     await _add_auction(session_factory)
@@ -170,8 +187,9 @@ async def test_inserts_8_rows_for_8_solvers(session_factory, monkeypatch) -> Non
         return None
 
     monkeypatch.setattr("scripts.sync_competitions.asyncio.sleep", _fast_sleep)
-    respx.get(COW_COMPETITION_URL_RE).mock(
-        return_value=httpx.Response(200, json=SAMPLE_COMPETITION_RESPONSE)
+    monkeypatch.setattr(
+        "scripts.sync_competitions._fetch_competition",
+        _make_fetch_stub(SAMPLE_COMPETITION_RESPONSE),
     )
 
     result = await _sync(days=7, limit=100, session_factory=session_factory)
@@ -186,7 +204,6 @@ async def test_inserts_8_rows_for_8_solvers(session_factory, monkeypatch) -> Non
     assert len(rows) == 8
 
 
-@respx.mock
 async def test_idempotent_rerun_still_8_rows(session_factory, monkeypatch) -> None:
     """Running sync twice must not duplicate rows."""
     await _add_auction(session_factory)
@@ -195,8 +212,9 @@ async def test_idempotent_rerun_still_8_rows(session_factory, monkeypatch) -> No
         return None
 
     monkeypatch.setattr("scripts.sync_competitions.asyncio.sleep", _fast_sleep)
-    respx.get(COW_COMPETITION_URL_RE).mock(
-        return_value=httpx.Response(200, json=SAMPLE_COMPETITION_RESPONSE)
+    monkeypatch.setattr(
+        "scripts.sync_competitions._fetch_competition",
+        _make_fetch_stub(SAMPLE_COMPETITION_RESPONSE),
     )
 
     await _sync(days=7, limit=100, session_factory=session_factory)
@@ -210,17 +228,17 @@ async def test_idempotent_rerun_still_8_rows(session_factory, monkeypatch) -> No
     assert len(rows) == 8
 
 
-@respx.mock
 async def test_404_skipped_no_exception(session_factory, monkeypatch) -> None:
-    """404 from CoW API must be logged INFO and not cause an exception or insert a row."""
+    """404 from CoW API (stub returning None) must be skipped without exception."""
     await _add_auction(session_factory)
 
     async def _fast_sleep(_s: float) -> None:
         return None
 
     monkeypatch.setattr("scripts.sync_competitions.asyncio.sleep", _fast_sleep)
-    respx.get(COW_COMPETITION_URL_RE).mock(
-        return_value=httpx.Response(404, json={"description": "not found"})
+    monkeypatch.setattr(
+        "scripts.sync_competitions._fetch_competition",
+        _make_fetch_stub(None),  # None → simulates 404 path
     )
 
     result = await _sync(days=7, limit=100, session_factory=session_factory)
@@ -235,9 +253,8 @@ async def test_404_skipped_no_exception(session_factory, monkeypatch) -> None:
     assert len(rows) == 0
 
 
-@respx.mock
 async def test_rate_limit_throttle_uses_sleep(session_factory, monkeypatch) -> None:
-    """The script calls asyncio.sleep between requests to enforce 5 req/s."""
+    """The script calls asyncio.sleep between requests to pace at REQUESTS_PER_SECOND."""
     await _add_auction(session_factory, auction_id=100)
     await _add_auction(session_factory, auction_id=101)
 
@@ -247,8 +264,9 @@ async def test_rate_limit_throttle_uses_sleep(session_factory, monkeypatch) -> N
         sleep_calls.append(s)
 
     monkeypatch.setattr("scripts.sync_competitions.asyncio.sleep", _capture_sleep)
-    respx.get(COW_COMPETITION_URL_RE).mock(
-        return_value=httpx.Response(200, json=SAMPLE_COMPETITION_RESPONSE)
+    monkeypatch.setattr(
+        "scripts.sync_competitions._fetch_competition",
+        _make_fetch_stub(SAMPLE_COMPETITION_RESPONSE),
     )
 
     await _sync(days=7, limit=100, session_factory=session_factory)
@@ -258,7 +276,6 @@ async def test_rate_limit_throttle_uses_sleep(session_factory, monkeypatch) -> N
     assert len(sleep_calls) == 2
 
 
-@respx.mock
 async def test_winner_flag_and_score_persisted(session_factory, monkeypatch) -> None:
     """Verify winner flag and score are stored correctly."""
     await _add_auction(session_factory)
@@ -267,8 +284,9 @@ async def test_winner_flag_and_score_persisted(session_factory, monkeypatch) -> 
         return None
 
     monkeypatch.setattr("scripts.sync_competitions.asyncio.sleep", _fast_sleep)
-    respx.get(COW_COMPETITION_URL_RE).mock(
-        return_value=httpx.Response(200, json=SAMPLE_COMPETITION_RESPONSE)
+    monkeypatch.setattr(
+        "scripts.sync_competitions._fetch_competition",
+        _make_fetch_stub(SAMPLE_COMPETITION_RESPONSE),
     )
 
     await _sync(days=7, limit=100, session_factory=session_factory)
@@ -289,7 +307,6 @@ async def test_winner_flag_and_score_persisted(session_factory, monkeypatch) -> 
     assert null_score_rows[0].solver_name == "arc-solve"
 
 
-@respx.mock
 async def test_no_auctions_returns_empty_result(session_factory) -> None:
     """When shadow_auctions is empty the script returns with no work done."""
     result = await _sync(days=7, limit=100, session_factory=session_factory)

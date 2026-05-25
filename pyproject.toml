@@ -9,6 +9,12 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     "httpx>=0.27",
+    # curl_cffi: libcurl-via-Python with browser-TLS fingerprint impersonation.
+    # Required for the CoW competition API endpoint (CloudFront fronted),
+    # which 429s our standard httpx client by TLS-fingerprint despite a
+    # successful raw curl. Used only in scripts/sync_competitions.py;
+    # production solve path stays on httpx.
+    "curl_cffi>=0.7",
     "structlog>=24.4",
     "prometheus-client>=0.21",
     "redis>=5.2",
