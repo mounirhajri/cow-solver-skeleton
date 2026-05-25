@@ -36,8 +36,26 @@ This doc is the single source of truth for "what's running, what's broken, what'
 |---|---|
 | `5b64a31` | `src/main.py` + `src/solver/orchestrator.py`: persist shadow attempts even on TimeoutError/Exception (caused 15.5h outage 2026-05-24/25 — multi-party LP timeouts silently discarded all attempt rows) |
 | `e1ad98b` | `src/config.py`: solve_timeout 13s → 25s — outer cap was starving router-v2 (last in chain, 11s budget) after partial-fills deploy slowed bipartite/multi-party |
+| `787a8c5` (edge) | `edge/matching/bipartite.py`: drop multi-pair matches whose limit prices are violated at the Solution's committed clearing ratio (previous code emitted limit-violating trades that CIP-14 scoring silently clamped, producing inflated 7.77 ETH median scores on $80M-scale USDC/USDT TWAP fills) |
+| `770287a` | `src/shadow/scoring.py`: zero out CIP-14 score when any fulfillment trade violates its limit at the Solution's clearing prices (defense-in-depth against the bipartite case + any future strategy that emits limit-violating Solutions) |
 
-Post-fix verification (2026-05-25 15:00 UTC): all 5 strategies persist rows, 0 timeouts in sample window.
+Post-fix verification (2026-05-25 16:14 UTC): bipartite produces single-pair stablecoin CoWs at sane scores (~6 micro-ETH per match instead of 7.77 ETH). All 5 strategies continue to persist rows; no timeouts in sample window.
+
+### 1.4 Raw shadow data vs. aggregate analytics
+
+`shadow_solutions.our_score_wei` is a PER-ATTEMPT score. The same persistent order (e.g. an off-market loose-limit buy that keeps appearing in successive auctions) can be matched by the same strategy across many auctions — each emission is a separate row with its own score, but only ONE such fill could actually settle on-chain.
+
+Aggregate revenue projections must deduplicate. `scripts/estimate_economics.py` already collapses persistent UIDs per strategy:
+
+```
+[dedup] cow-matching-bipartite: 13 raw rows → 5 distinct UID-sets (8 repeats collapsed)
+[dedup] cow-matching-multi-party: 26 raw rows → 8 distinct UID-sets
+[dedup] router-v2: 36 raw rows → 1 distinct UID-set (35 repeats collapsed)
+```
+
+When quoting numbers for external pitch or competitor analysis, use `estimate_economics` output, not raw `SELECT FROM shadow_solutions` aggregates.
+
+Naive's score is NULL'd at persistence (`src/shadow/persist.py`) because the price_refiner code path uses oracle reference_prices as clearing prices — see `src/solver/price_refiner.py:168-183` (KNOWN-BAD comment). Naive is never submitted; its rows exist for composer-debug observability only and would otherwise distort percentile dashboards.
 
 ---
 

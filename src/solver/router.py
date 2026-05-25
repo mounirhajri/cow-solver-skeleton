@@ -498,5 +498,25 @@ class RouterSolver:
         24 h, driving an €67M/Mo phantom projection. See
         ``docs/superpowers/specs/2026-05-26-router-and-logging-followups.md``.
         """
+        # Forensic log: surplus rate (AMM clearing vs order's limit ratio).
+        # >100bps means the order's limit price sits well off-market — either
+        # a genuine stale loose-limit order (legit arb capture) or a thinly
+        # liquid V3 quote that wouldn't actually settle. Aggregate analytics
+        # already deduplicate persistent orders, but per-fill visibility
+        # helps debug suspect quote sources before they show up in win-rate
+        # projections.
+        if order.sell_amount and order.buy_amount and executed_sell and executed_buy:
+            numerator = executed_buy * order.sell_amount - order.buy_amount * executed_sell
+            denominator = order.buy_amount * executed_sell
+            if denominator > 0 and numerator > 0:
+                surplus_bps = numerator * 10_000 // denominator
+                if surplus_bps > 100:
+                    log.info(
+                        "router_high_surplus_observed",
+                        order_uid=order.uid,
+                        surplus_bps=surplus_bps,
+                        kind=order.kind,
+                    )
+
         prices.setdefault(order.sell_token, executed_buy)
         prices.setdefault(order.buy_token, executed_sell)

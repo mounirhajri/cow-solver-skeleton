@@ -483,10 +483,13 @@ def _attempt_with_solution(score_override: int | None = None) -> AttemptRecord:
     """Return an AttemptRecord that has a solution dict.
 
     The solution content is irrelevant — we patch compute_solution_score to
-    control the returned score directly.
+    control the returned score directly. Uses a non-naive strategy because
+    persist_shadow_attempt now forces our_score_wei=None for naive
+    regardless of the patched score (KNOWN-BAD phantom path; see
+    src/shadow/persist.py).
     """
     return AttemptRecord(
-        strategy="naive",
+        strategy="router-v2",
         status="solved",
         latency_ms=10,
         solution={"id": 9999, "prices": {}, "trades": []},

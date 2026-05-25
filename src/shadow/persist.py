@@ -88,7 +88,18 @@ async def persist_shadow_attempt(
         n_sub_dust_skipped = 0
         for a in attempts:
             score: int | None = None
-            if a.solution and uid_map and native_prices:
+            if a.strategy == "naive":
+                # KNOWN-BAD score path: price_refiner.py:168-183 uses each
+                # token's oracle reference_price as the clearing price, which
+                # produces phantom CIP-14 surplus equal to the order's
+                # OTM-headroom at oracle. Naive is never submitted —
+                # orchestrator.py:150-152 excludes it from the composer
+                # candidate set — but persisting its score here pollutes any
+                # downstream aggregate analytics (estimate_economics,
+                # analyze_router_solutions, percentile dashboards).  Keep the
+                # solution JSON and status for observability; leave score NULL.
+                pass
+            elif a.solution and uid_map and native_prices:
                 with contextlib.suppress(Exception):  # noqa: BLE001
                     raw_score = compute_solution_score(a.solution, uid_map, native_prices)
                     # Keep 0 as NULL (no real surplus); only store positive scores.
