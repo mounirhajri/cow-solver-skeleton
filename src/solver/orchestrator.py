@@ -62,6 +62,18 @@ class SolverOrchestrator:
         attempts: list[AttemptRecord] = []
         winning_solutions: list[tuple[str, Solution]] = []
 
+        # Spec §3: count smart-wallet orders once per auction, before the
+        # strategy loop.  Strategies must NOT log this event — doing so would
+        # triple the Loki/journal volume (once per strategy × 3 strategies).
+        n_eip1271 = sum(1 for o in auction.orders if o.is_smart_wallet_signed)
+        n_eoa = len(auction.orders) - n_eip1271
+        log.info(
+            "smart_wallet_orders_observed",
+            auction_id=auction.id,
+            n_eip1271=n_eip1271,
+            n_eoa=n_eoa,
+        )
+
         for strat in self._strategies:
             start = time.perf_counter()
             # Strategies may declare their own timeout via a numeric `timeout`

@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.models.auction import Auction
 from src.persistence.models import ShadowAuction, ShadowSolution
-from src.shadow.persist import persist_shadow_attempt, persist_shadow_attempt_safe
+from src.shadow.persist import EPSILON_WEI, persist_shadow_attempt, persist_shadow_attempt_safe
 from src.solver.orchestrator import AttemptRecord
 
 
@@ -474,3 +474,154 @@ async def test_persist_skipped_auction_safe_swallows_errors(monkeypatch) -> None
     monkeypatch.setattr("src.shadow.persist.persist_skipped_auction", broken)
     # Must NOT raise
     await persist_skipped_auction_safe(99, {}, {}, 500)
+
+
+# ─── Sub-dust filter tests (Issue #3) ────────────────────────────────────────
+
+
+def _attempt_with_solution(score_override: int | None = None) -> AttemptRecord:
+    """Return an AttemptRecord that has a solution dict.
+
+    The solution content is irrelevant — we patch compute_solution_score to
+    control the returned score directly.
+    """
+    return AttemptRecord(
+        strategy="naive",
+        status="solved",
+        latency_ms=10,
+        solution={"id": 9999, "prices": {}, "trades": []},
+        error=None,
+    )
+
+
+def _patch_scoring(monkeypatch, score_value: int) -> None:
+    """Patch the three scoring helpers so the per-attempt score path executes.
+
+    uid_map and native_prices must both be non-empty for the scoring guard to
+    pass; compute_solution_score is patched to return the desired value.
+    """
+    monkeypatch.setattr(
+        "src.shadow.persist.orders_by_uid_from_auction",
+        lambda *args, **kwargs: {"0xdummy": object()},
+    )
+    monkeypatch.setattr(
+        "src.shadow.persist.extract_native_prices",
+        lambda *args, **kwargs: {"0xdummy": 1},
+    )
+    monkeypatch.setattr(
+        "src.shadow.persist.compute_solution_score",
+        lambda *args, **kwargs: score_value,
+    )
+
+
+@pytest.mark.asyncio
+async def test_persist_skips_sub_dust_solution(session_factory, monkeypatch) -> None:
+    """Solutions with score < EPSILON_WEI must NOT be written to shadow_solutions."""
+    sub_dust_score = int(5e11)  # below EPSILON_WEI (10**12)
+    assert sub_dust_score < EPSILON_WEI
+
+    _patch_scoring(monkeypatch, sub_dust_score)
+
+    auction = _auction("3001")
+    attempts = [_attempt_with_solution()]
+    await persist_shadow_attempt(auction, attempts)
+
+    async with session_factory() as s:
+        rows = (await s.execute(select(ShadowSolution))).scalars().all()
+    assert len(rows) == 0, "Sub-dust solution should not have been persisted"
+
+
+@pytest.mark.asyncio
+async def test_persist_keeps_dust_threshold_solution(session_factory, monkeypatch) -> None:
+    """Solutions with score == EPSILON_WEI must be persisted (filter uses <, not <=)."""
+    at_threshold_score = EPSILON_WEI  # exactly 10**12 — must be kept
+
+    _patch_scoring(monkeypatch, at_threshold_score)
+
+    auction = _auction("3002")
+    attempts = [_attempt_with_solution()]
+    await persist_shadow_attempt(auction, attempts)
+
+    async with session_factory() as s:
+        rows = (await s.execute(select(ShadowSolution))).scalars().all()
+    assert len(rows) == 1, "Solution at EPSILON_WEI threshold must be kept"
+    assert int(rows[0].our_score_wei) == EPSILON_WEI
+
+
+@pytest.mark.asyncio
+async def test_persist_keeps_score_none_solution(session_factory, monkeypatch) -> None:
+    """When score computation yields 0 (→ score=None), the row is still persisted.
+
+    score=None means zero surplus (unprofitable but valid) — not sub-dust. The
+    sub-dust filter only fires when score is a positive int below EPSILON_WEI.
+    """
+    # raw_score=0 → score gets set to None by the `raw_score > 0` guard.
+    _patch_scoring(monkeypatch, 0)
+
+    auction = _auction("3003")
+    attempts = [_attempt_with_solution()]
+    await persist_shadow_attempt(auction, attempts)
+
+    async with session_factory() as s:
+        rows = (await s.execute(select(ShadowSolution))).scalars().all()
+    assert len(rows) == 1, "Solution with score=None must still be persisted"
+    assert rows[0].our_score_wei is None
+
+
+@pytest.mark.asyncio
+async def test_persist_logs_sub_dust_count(session_factory, monkeypatch) -> None:
+    """3 sub-dust + 1 real solution: single summary log.info fires with n_sub_dust_skipped=3.
+
+    structlog uses PrintLoggerFactory which bypasses stdlib caplog, so we
+    capture by monkeypatching the module-level log.info directly — the same
+    pattern used in test_router.py and test_rf_filter.py.
+    """
+    sub_dust = int(5e11)  # below EPSILON_WEI
+    real_score = int(1e13)  # well above EPSILON_WEI
+
+    # uid_map and native_prices must be non-empty so the scoring path runs.
+    monkeypatch.setattr(
+        "src.shadow.persist.orders_by_uid_from_auction",
+        lambda *args, **kwargs: {"0xdummy": object()},
+    )
+    monkeypatch.setattr(
+        "src.shadow.persist.extract_native_prices",
+        lambda *args, **kwargs: {"0xdummy": 1},
+    )
+
+    scores = iter([sub_dust, sub_dust, sub_dust, real_score])
+    monkeypatch.setattr(
+        "src.shadow.persist.compute_solution_score",
+        lambda *args, **kwargs: next(scores),
+    )
+
+    log_calls: list[tuple[str, dict]] = []
+
+    def capture_log(event: str, **kwargs: object) -> None:
+        log_calls.append((event, dict(kwargs)))
+
+    monkeypatch.setattr("src.shadow.persist.log.info", capture_log)
+
+    auction = _auction("3004")
+    attempts = [
+        AttemptRecord(
+            strategy=f"naive-{i}",
+            status="solved",
+            latency_ms=10,
+            solution={"id": 9999, "prices": {}, "trades": []},
+            error=None,
+        )
+        for i in range(4)
+    ]
+
+    await persist_shadow_attempt(auction, attempts)
+
+    # One real solution should be persisted
+    async with session_factory() as s:
+        rows = (await s.execute(select(ShadowSolution))).scalars().all()
+    assert len(rows) == 1, "Only the real solution should be persisted"
+
+    # Exactly one summary log must be emitted for the sub-dust count
+    dust_logs = [(ev, kw) for ev, kw in log_calls if ev == "sub_dust_solutions_skipped"]
+    assert len(dust_logs) == 1, "Exactly one summary log must be emitted"
+    assert dust_logs[0][1]["n_sub_dust_skipped"] == 3

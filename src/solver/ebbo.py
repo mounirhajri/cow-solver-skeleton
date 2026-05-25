@@ -8,25 +8,29 @@ the driver may reject the solution outright.  Repeated EBBO violations
 slash the solver bond.
 
 This module checks **before** we submit:
-    for every sell trade in the composed Solution, get a fresh V3 quote
-    for the same swap at the same input size; if our effective output
-    (executed_sell × clearing_price[sell] / clearing_price[buy]) is below
-    the external quote minus ``tolerance_bps``, fail the validation and
-    fall back to no-solution.
+    for every trade in the composed Solution, get a fresh V3 quote for
+    the same swap at the same input/output size; if our clearing prices
+    give the user a worse deal than external V3 routing (minus tolerance),
+    fail the validation and fall back to no-solution.
 
-We intentionally check only **sell** trades here — buy trades require
-``quoteExactOutput`` plumbing.  router-v2 already has it (PR #20), but
-wiring it into EBBO is follow-up work; until then buy trades skip the
-check (counted as ``n_skipped`` so we can monitor coverage).  Trades
-whose tokens lack a V3 route (deep long-tail) are skipped — by definition
-we cannot under-perform a non-existent external quote.
+Sell trades: user sells ``executed_amount`` of sell_token.  We compute
+    ``our_buy_amount = ceil(executed × cp_sell / cp_buy)`` and require it
+    to meet or beat the external ``quoteExactInput`` result.
+
+Buy trades: user receives exactly ``executed_amount`` of buy_token.  We
+    compute ``our_sell_amount = floor(executed × cp_buy / cp_sell)``
+    (matching ``_score_buy_trade`` rounding) and require it to be no worse
+    than the external ``quoteExactOutput`` result (plus tolerance).
+
+Trades whose tokens lack a V3 route (deep long-tail) are skipped — by
+definition we cannot under-perform a non-existent external quote.
+
+Solutions with more than ``_MAX_TRADES_PER_CHECK`` trades are rejected
+outright rather than silently truncated: submitting unvalidated trades is
+the exact failure mode EBBO is meant to prevent.
 
 Tolerance default is 50 bps (0.5 %); this absorbs slippage between the
-quote call and the on-chain settlement window.  CoW's documented EBBO
-slack is tighter than this and the production check uses median ref
-prices — we err generous in the validator to avoid rejecting solutions
-that would actually settle, accepting more false-positives in the
-trade-off.
+quote call and the on-chain settlement window.
 """
 
 from __future__ import annotations
@@ -36,8 +40,10 @@ from dataclasses import dataclass
 from src.log import get_logger
 from src.models.auction import Auction
 from src.models.solution import Solution
+from src.routing.amm_v3 import FEE_TIERS
 from src.routing.multicall import Multicall3
 from src.routing.multihop import quote_best_path
+from src.routing.v3_batched import V3Path, batched_v3_quote
 from src.shadow.scoring import _ceil_div
 
 log = get_logger(__name__)
@@ -48,11 +54,65 @@ log = get_logger(__name__)
 # between our quote and the production settlement window.
 DEFAULT_TOLERANCE_BPS = 50
 
-# Cap on how many trades a single solution might contain.  Composer-level
-# greed today never produces more than ~6 trades; this guard exists to
-# bound the EBBO RPC budget in the pathological case of a misconfigured
-# composer that emits dozens of trades.
+# Hard cap on trades per solution.  Exceeded → REJECT (not truncate+pass).
+# Submitting unvalidated trades is the exact failure mode EBBO prevents.
 _MAX_TRADES_PER_CHECK = 20
+
+
+async def _quote_best_exact_output(
+    multicall: Multicall3,
+    sell_token: str,
+    buy_token: str,
+    amount_out: int,
+    intermediates: list[str],
+) -> int | None:
+    """Return the cheapest sell-token cost to receive ``amount_out`` buy-token.
+
+    Queries all four V3 fee tiers (direct) plus each intermediate in a single
+    Multicall3 round-trip using ``quoteExactOutput`` semantics.  Returns the
+    minimum non-zero ``amount_in`` found, or ``None`` if no route exists.
+
+    ``V3BatchedQuote.amount_out`` is the variable side returned by the quoter:
+    for exact-output paths that variable side is ``amount_in`` (sell-token
+    cost), so naming is consistent with the sell-side helper even though the
+    interpretation differs.
+    """
+    paths: list[V3Path] = []
+    for fee in FEE_TIERS:
+        paths.append(
+            V3Path(
+                order_uid="",
+                token_in=sell_token,
+                token_out=buy_token,
+                amount_in=amount_out,
+                fee_tier_in=fee,
+                exact_output=True,
+            )
+        )
+    for mid in intermediates:
+        if mid.lower() in (sell_token.lower(), buy_token.lower()):
+            continue
+        for fee in FEE_TIERS:
+            paths.append(
+                V3Path(
+                    order_uid="",
+                    token_in=sell_token,
+                    token_out=buy_token,
+                    amount_in=amount_out,
+                    fee_tier_in=fee,
+                    intermediate=mid,
+                    fee_tier_out=fee,
+                    exact_output=True,
+                )
+            )
+
+    quotes = await batched_v3_quote(multicall, paths)
+    # Pick the minimum non-zero amount_in (cheapest route for the user)
+    best: int | None = None
+    for q in quotes:
+        if q.amount_out > 0 and (best is None or q.amount_out < best):
+            best = q.amount_out
+    return best
 
 
 @dataclass(frozen=True)
@@ -75,108 +135,149 @@ async def validate_solution_ebbo(
     intermediates: list[str],
     tolerance_bps: int = DEFAULT_TOLERANCE_BPS,
 ) -> EBBOResult:
-    """Verify every sell trade in ``solution`` beats external V3 quote.
+    """Verify every trade in ``solution`` beats external V3 quote.
 
     Returns ``EBBOResult`` with ``passes=False`` if ANY trade falls short
-    by more than ``tolerance_bps`` of its external-quote output.  Trades
-    that lack clearing prices, that reference unknown order UIDs, or that
-    are buy-kind orders are skipped (not failed).
+    by more than ``tolerance_bps``.  Trades that lack clearing prices or
+    that reference unknown order UIDs are skipped (not failed).
+
+    Solutions with more than ``_MAX_TRADES_PER_CHECK`` trades are rejected
+    immediately rather than silently truncated — submitting even one
+    unvalidated trade is the failure mode this module exists to prevent.
     """
     uid_to_order = {o.uid: o for o in auction.orders}
     violations: list[str] = []
     n_checked = 0
     n_skipped = 0
 
-    trades = solution.trades[:_MAX_TRADES_PER_CHECK]
-    n_truncated = max(0, len(solution.trades) - _MAX_TRADES_PER_CHECK)
+    n_total = len(solution.trades)
+    n_truncated = max(0, n_total - _MAX_TRADES_PER_CHECK)
     if n_truncated:
         log.warning(
             "ebbo_trade_count_truncated",
             auction_id=auction.id,
-            total=len(solution.trades),
+            total=n_total,
             checked=_MAX_TRADES_PER_CHECK,
             truncated=n_truncated,
         )
+        return EBBOResult(
+            passes=False,
+            violations=[
+                f"truncation: {n_total} trades exceed limit of {_MAX_TRADES_PER_CHECK}"
+            ],
+            n_checked=0,
+            n_skipped=0,
+            n_truncated=n_truncated,
+        )
 
-    for trade in trades:
+    for trade in solution.trades:
         order = uid_to_order.get(trade.order_uid)
         if order is None:
             n_skipped += 1
             continue
 
-        # Buy-side EBBO requires quoteExactOutput plumbing in this module;
-        # router-v2 already has it but threading the same through
-        # quote_best_path is a separate piece of work.  Skip buys for now
-        # rather than block-list them — they're 8 % of order volume so
-        # skipping costs little, and the EBBO check on sell trades covers
-        # the production-blocking failure mode (multi-party ring prices
-        # underwater vs. external V3).
-        if order.kind != "sell":
-            n_skipped += 1
-            continue
-
         cp_sell = solution.prices.get(order.sell_token)
         cp_buy = solution.prices.get(order.buy_token)
-        if cp_sell is None or cp_buy is None or cp_buy == 0:
+        if cp_sell is None or cp_buy is None or cp_buy == 0 or cp_sell == 0:
             # Composed solution missing prices for this trade's tokens —
-            # we shouldn't have emitted it, but skipping is safer than
-            # rejecting on incomplete data.
+            # skipping is safer than rejecting on incomplete data.
             n_skipped += 1
             continue
 
-        # What the user actually receives at our clearing prices.
-        # Use _ceil_div to mirror src/shadow/scoring._score_sell_trade — the
-        # CIP-14 canonical rounding direction.  Without this the validator
-        # could reject a solution by 1 wei that the scoring path would
-        # accept, producing inconsistent rejection counts.
-        our_buy_amount = _ceil_div(
-            int(trade.executed_amount) * int(cp_sell), int(cp_buy)
-        )
+        executed = int(trade.executed_amount)
 
-        # External quote for the same swap, same size.  None means "no V3
-        # route at all" — in which case our internal trade is by definition
-        # not violating EBBO (there's no external to beat).
-        try:
-            ext_path = await quote_best_path(
-                multicall,
-                order.sell_token,
-                order.buy_token,
-                int(trade.executed_amount),
-                intermediates,
-            )
-        except Exception as exc:  # noqa: BLE001
-            # RPC hiccup — log and skip rather than fail-closed.  A failed
-            # EBBO check on a transient network blip would deny revenue.
-            log.warning(
-                "ebbo_quote_failed",
-                auction_id=auction.id,
-                order_uid=order.uid,
-                error=str(exc),
-            )
+        if order.kind == "sell":
+            # Sell trade: user gives executed sell_token, receives buy_token.
+            # our_buy_amount = ceil(executed × cp_sell / cp_buy) — mirrors
+            # _score_sell_trade rounding so validator and scorer agree.
+            our_buy_amount = _ceil_div(executed * int(cp_sell), int(cp_buy))
+
+            try:
+                ext_path = await quote_best_path(
+                    multicall,
+                    order.sell_token,
+                    order.buy_token,
+                    executed,
+                    intermediates,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "ebbo_quote_failed",
+                    auction_id=auction.id,
+                    order_uid=order.uid,
+                    error=str(exc),
+                )
+                n_skipped += 1
+                continue
+
+            if ext_path is None or not ext_path:
+                n_skipped += 1
+                continue
+
+            ext_buy_amount = int(ext_path[-1].amount_out)
+            if ext_buy_amount <= 0:
+                n_skipped += 1
+                continue
+
+            # Pass if our_buy >= ext_buy × (1 - tolerance).
+            threshold = (ext_buy_amount * (10_000 - tolerance_bps)) // 10_000
+            n_checked += 1
+            if our_buy_amount < threshold:
+                shortfall_bps = (
+                    (ext_buy_amount - our_buy_amount) * 10_000
+                    // max(ext_buy_amount, 1)
+                )
+                violations.append(
+                    f"{order.uid[:18]}: our={our_buy_amount} ext={ext_buy_amount} "
+                    f"({shortfall_bps}bps short)"
+                )
+
+        elif order.kind == "buy":
+            # Buy trade: user receives exactly executed buy_token, pays sell_token.
+            # our_sell_amount = floor(executed × cp_buy / cp_sell) — mirrors
+            # _score_buy_trade rounding (integer // = floor).
+            our_sell_amount = (executed * int(cp_buy)) // int(cp_sell)
+
+            try:
+                ext_sell_amount = await _quote_best_exact_output(
+                    multicall,
+                    order.sell_token,
+                    order.buy_token,
+                    executed,
+                    intermediates,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "ebbo_quote_failed",
+                    auction_id=auction.id,
+                    order_uid=order.uid,
+                    error=str(exc),
+                )
+                n_skipped += 1
+                continue
+
+            if ext_sell_amount is None or ext_sell_amount <= 0:
+                n_skipped += 1
+                continue
+
+            # Pass if our_sell <= ext_sell × (1 + tolerance).
+            # User pays MORE than external would charge = worse experience.
+            threshold = (ext_sell_amount * (10_000 + tolerance_bps)) // 10_000
+            n_checked += 1
+            if our_sell_amount > threshold:
+                overpay_bps = (
+                    (our_sell_amount - ext_sell_amount) * 10_000
+                    // max(ext_sell_amount, 1)
+                )
+                violations.append(
+                    f"{order.uid[:18]}: our_sell={our_sell_amount} "
+                    f"ext_sell={ext_sell_amount} ({overpay_bps}bps overpay)"
+                )
+
+        else:
+            # Unknown order kind — skip defensively.
             n_skipped += 1
             continue
-
-        if ext_path is None or not ext_path:
-            n_skipped += 1
-            continue
-
-        ext_buy_amount = int(ext_path[-1].amount_out)
-        if ext_buy_amount <= 0:
-            n_skipped += 1
-            continue
-
-        # Pass if our_buy >= ext_buy × (1 - tolerance).
-        # Use integer math so we don't introduce float-precision drift.
-        threshold = (ext_buy_amount * (10_000 - tolerance_bps)) // 10_000
-        n_checked += 1
-        if our_buy_amount < threshold:
-            shortfall_bps = (
-                (ext_buy_amount - our_buy_amount) * 10_000 // max(ext_buy_amount, 1)
-            )
-            violations.append(
-                f"{order.uid[:18]}: our={our_buy_amount} ext={ext_buy_amount} "
-                f"({shortfall_bps}bps short)"
-            )
 
     return EBBOResult(
         passes=not violations,

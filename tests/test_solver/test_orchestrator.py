@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from src.models.auction import Auction
+from src.models.order import Order
 from src.models.solution import Solution, Trade
 from src.solver.base import NoSolution
 from src.solver.orchestrator import SolverOrchestrator
@@ -196,6 +197,76 @@ async def test_composer_excludes_naive_when_other_strategy_solves(auction: Aucti
         # falls back (only 1 composable candidate left, threshold is "> 1").
         # So we expect NO composer attempt at all in this 2-strategy case.
         pytest.fail("Composer should not run with a single non-naive solver")
+
+
+async def test_orchestrator_logs_smart_wallet_ratio_once_per_auction(
+    auction: Auction,
+) -> None:
+    """Spec §3: smart_wallet_orders_observed fires exactly once at orchestrator
+    level, not 3× (once per strategy).  Two strategies both run; the event must
+    appear exactly once regardless of how many strategies are in the chain."""
+    log_events: list[tuple[str, dict]] = []
+
+    import src.solver.orchestrator as orch_mod
+
+    original_log_info = orch_mod.log.info
+
+    def _capture(event: str, **kw: object) -> None:
+        log_events.append((event, kw))
+        original_log_info(event, **kw)
+
+    orch_mod.log.info = _capture  # type: ignore[method-assign]
+
+    try:
+        # Build an auction with a mix of EIP-1271 (smart-wallet) and EOA orders.
+        base_order = auction.orders[0]
+        # Patch-construct a minimal EIP-1271 order by overriding signing_scheme.
+        eip1271_order = Order(
+            uid="0x" + "e" * 112,
+            sellToken=base_order.sell_token,
+            buyToken=base_order.buy_token,
+            sellAmount=str(base_order.sell_amount),
+            buyAmount=str(base_order.buy_amount),
+            feePolicies=[],
+            validTo=base_order.valid_to,
+            kind=base_order.kind,
+            owner=base_order.owner,
+            partiallyFillable=base_order.partially_fillable,
+            **{"class": base_order.class_},
+            signingScheme="eip1271",
+        )
+        mixed_auction = auction.model_copy(
+            update={"orders": [base_order, eip1271_order]}
+        )
+
+        # Two strategies: both return NoSolution (we care only about the log).
+        s1 = AsyncMock(name="s1")
+        s1.name = "s1"
+        s1.solve.return_value = NoSolution()
+        s2 = AsyncMock(name="s2")
+        s2.name = "s2"
+        s2.solve.return_value = NoSolution()
+
+        orch = SolverOrchestrator(
+            strategies=[s1, s2],
+            per_strategy_timeout=1.0,
+            run_all_strategies=True,
+        )
+        await orch.solve(mixed_auction)
+
+        smart_wallet_logs = [
+            e for e in log_events if e[0] == "smart_wallet_orders_observed"
+        ]
+        assert len(smart_wallet_logs) == 1, (
+            f"expected exactly 1 smart_wallet_orders_observed event, got "
+            f"{len(smart_wallet_logs)}"
+        )
+        kw = smart_wallet_logs[0][1]
+        assert kw["n_eip1271"] == 1, f"expected n_eip1271=1, got {kw['n_eip1271']}"
+        assert kw["n_eoa"] == 1, f"expected n_eoa=1, got {kw['n_eoa']}"
+        assert kw["auction_id"] == mixed_auction.id
+    finally:
+        orch_mod.log.info = original_log_info  # type: ignore[method-assign]
 
 
 async def test_ebbo_rejection_falls_through_to_next_candidate(auction: Auction) -> None:
