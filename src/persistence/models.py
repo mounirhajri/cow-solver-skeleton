@@ -23,6 +23,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -128,3 +129,35 @@ class TokenFeatures(Base):
     buy_tax: Mapped[float | None] = mapped_column(Numeric(10, 6))
     sell_tax: Mapped[float | None] = mapped_column(Numeric(10, 6))
     last_refreshed: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class ShadowCompetitor(Base):
+    """One row per (auction, solver) — full bid details from the CoW competition API.
+
+    Populated by ``scripts/sync_competitions.py`` after each auction settles.
+    Used by ``scripts/analyze_competitors.py`` to calibrate score gaps and
+    map solver specialisation per token-pair.
+    """
+
+    __tablename__ = "shadow_competitors"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    auction_id: Mapped[int] = mapped_column(
+        ForeignKey("shadow_auctions.auction_id"), index=True
+    )
+    solver_name: Mapped[str] = mapped_column(String(50), index=True)
+    solver_address: Mapped[str] = mapped_column(String(42))
+    score: Mapped[int | None] = mapped_column(Numeric(40, 0))
+    ranking: Mapped[int] = mapped_column(Integer)
+    is_winner: Mapped[bool] = mapped_column(Boolean, default=False)
+    filtered_out: Mapped[bool] = mapped_column(Boolean, default=False)
+    clearing_prices: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    orders: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    polled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (
+        # one row per (auction, solver) pair
+        UniqueConstraint(
+            "auction_id", "solver_address", name="uq_shadow_competitors_auction_solver"
+        ),
+    )
