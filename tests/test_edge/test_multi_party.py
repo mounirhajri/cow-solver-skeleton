@@ -722,26 +722,28 @@ async def test_ring_breakdown_not_emitted_when_no_rings(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_loose_tolerance_solves_ring_strict_rejects(monkeypatch) -> None:
-    """Ring with Π r_i slightly > 1 is solved under loose tolerance, dropped strict.
+async def test_loose_tolerance_admits_ring_but_zero_volume_rejects(monkeypatch) -> None:
+    """Π r_i > 1 ring is admitted under loose tolerance but rejected as zero-volume.
 
     Three orders with b/s = 1010/1000 = 1.01 each. Π r_i ≈ 1.0303,
     log_sum ≈ 0.02985.  At parity reference prices each order is slightly
     OTM (sell_value=1000 < buy_value=1010) — so only the loose-OTM solver
     admits them into the candidate graph; the strict solver filters them
-    out before ring enumeration and produces no solution.
+    out before ring enumeration.
 
-    Under loose admission, the ring slack at 200 bps/leg is
-    3 × ln(1.02) ≈ 0.0594 > 0.02985 → feasible.  Without the surplus.py
-    fix, the same ring would land in ``n_rate_infeasible`` under loose
-    admission (the bug this commit closes); the assertions below lock in
-    the post-fix behaviour.
+    Under loose admission the ring passes the pre-LP rate-feasibility
+    shortcut (slack 3 × -ln(1-0.02) ≈ 0.0606 > 0.02985), so the LP runs.
+    BUT: any ring with Π r_i > 1 has only the trivial solution x=0 (the
+    chain ``x_0 >= Π r * x_0`` with ``Π r > 1`` forces ``x_0 <= 0``).
+    The zero-volume guard correctly rejects this case so the composer
+    never sees an operationally-barren candidate.
+
+    Contract under test: the breakdown log records this ring under
+    ``n_zero_volume``, NOT ``n_solved`` or ``n_rate_infeasible``. This is
+    the post-cleanup behaviour — the prior commit emitted these rings as
+    zero-amount Solutions that the sub-dust filter then NULL'd.
     """
     events = _capture_log(monkeypatch)
-    # Partially-fillable so the LP's zero-volume fallback (Π r_i > 1 means
-    # the cycle cannot generate positive surplus on its own) does not trip
-    # the non-partial-short guard.  The contract under test is the pre-LP
-    # ring-feasibility shortcut, not the LP's volume optimum.
     orders = [
         mk_partial_order(
             "o1", "0xA", "0xB", sell_amount=1000, buy_amount=1010,
@@ -758,10 +760,15 @@ async def test_loose_tolerance_solves_ring_strict_rejects(monkeypatch) -> None:
     ]
     tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
 
-    # ── Loose tolerance: admits, ring passes feasibility, breakdown emits
-    # with n_solved=1, n_rate_infeasible=0. ──────────────────────────────
+    # ── Loose tolerance: pre-LP filter admits, zero-volume guard rejects.
+    # No candidate reaches the composer; breakdown shows n_zero_volume=1. ─
     loose_solver = CoWMatchingSolver(otm_tolerance_bps=200)
-    await loose_solver.solve(_mk_auction(orders, tokens, auction_id="100"))
+    loose_result = await loose_solver.solve(
+        _mk_auction(orders, tokens, auction_id="100")
+    )
+    assert isinstance(loose_result, NoSolution), (
+        "Π r > 1 rings must not produce a Solution even under loose tolerance"
+    )
     loose_bds = [
         e for e in events
         if e["event"] == "multi_party_ring_breakdown" and e["auction_id"] == "100"
@@ -770,18 +777,20 @@ async def test_loose_tolerance_solves_ring_strict_rejects(monkeypatch) -> None:
         "loose-tolerance solver should admit the ring and emit a breakdown log"
     )
     bd_loose = loose_bds[0]
-    assert bd_loose["n_solved"] == 1, (
-        f"expected n_solved=1 under loose tolerance, got {bd_loose}"
+    assert bd_loose["n_zero_volume"] == 1, (
+        f"expected n_zero_volume=1 (Π r > 1 → x=0 → guard rejects), got {bd_loose}"
+    )
+    assert bd_loose["n_solved"] == 0, (
+        f"zero-volume ring must not count as solved, got {bd_loose}"
     )
     assert bd_loose["n_rate_infeasible"] == 0, (
-        "post-fix: loose tolerance must not reject this ring on rate"
+        "ring passed the pre-LP rate-feasibility filter under loose tolerance"
     )
 
     # ── Strict tolerance (default 0): orders fail OTM filter, no rings. ──
     # No ring is enumerated → breakdown log is suppressed (matches the
     # ``not_emitted_when_no_rings`` contract) and the solver returns
-    # NoSolution.  This validates that strict-mode behaviour is unchanged
-    # by the fix.
+    # NoSolution.  This validates that strict-mode behaviour is unchanged.
     strict_solver = CoWMatchingSolver()  # otm_tolerance_bps=0 by default
     strict_result = await strict_solver.solve(
         _mk_auction(orders, tokens, auction_id="101")
