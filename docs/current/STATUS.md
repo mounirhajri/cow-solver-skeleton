@@ -74,7 +74,51 @@ A "ghost-order" is a CoW orderbook order that no live solver ever settles — ty
 
 **Conceptual gap that remains:** the matcher still doesn't run onchain simulation, which is what real solvers (helixbox, kaisersolver, wraxyn) use to deterministically catch ghosts.  Phase B will add `eth_call`-based pre-flight before going live — needed regardless of the dynamic detector because settlement TXs that revert burn gas.
 
-### 1.5 Raw shadow data vs. aggregate analytics
+**Live verification (2026-05-26 ~11:00 UTC, ~1h after deploy):**
+- Per-auction filter: `n_filtered ≈ 1106` constant across logged events → **~99.1% of all orders per auction are ghosts**
+- `n_remaining ≈ 10` real sell-orders per auction for bipartite to match against
+- Aligns with prior 99.4% pollution finding (now measured on order-count basis vs solution basis)
+
+### 1.5 Multi-Party + Phase A Interaction (2026-05-26, in observation)
+
+Discovered while sanity-checking Phase A deployment.  Has implications for revenue projections.
+
+**Context:** memory claimed Multi-Party at 1% solve rate, blocked by 2 persistent fill-or-kill TWAPs (`0xd9ec0e2f` + `0xfe7c06bb`).  Both UIDs verified in `ghost_orders` post-deploy (seen=618 each).
+
+**What the data actually showed:**
+
+| Window | Multi-Party solved/total | Rate | Surplus |
+|---|---|---|---|
+| 6-24h ago (pre-PR-#34) | 1/416 | 0.24% | 1× scored 0.026564 ETH |
+| 1-6h ago (post-PR-#34, pre-Phase-A) | 7/180 | **3.89%** | **7× NULL-scored, `executedAmount=0` on all trades** |
+| 0-1h ago (post-Phase-A) | 1/37 | 2.70% | 1× scored 0.005977 ETH (3-trade ring) |
+
+**Re-interpretation of "1% solve rate" memory claim:**
+
+1. PR #34 (2026-05-26 morning) unstuck Multi-Party from 0.24% to ~3-4% solve rate — but solves were dominated by ghost-containing rings, which the zero-volume guard (PR #35) and phantom-cap (PR #36) correctly NULL'd.  Sample inspection of NULL-scored solves found UID `0x9bed2dd21329…` — one of the four original USDC↔USDT ghosts identified at the start of the ghost investigation.
+2. So "1% solve rate" was outdated; the actual rate post-PR-#34 was ~4%, but **effective surplus was zero** because every found ring contained ghosts that triggered downstream NULL'ing.
+3. Phase A removes ghosts from the input set → Multi-Party rings are now built from real orders → `executedAmount > 0` → scored surplus survives.
+
+**Sample is n=1 post-Phase-A — preliminary, not a forecast.**
+
+**Hypothetical projection (n=1, treat with extreme caution):**
+
+If post-Phase-A Multi-Party sustains:
+- ~3% solve rate over ~36 attempts/h → ~26 solves/day
+- Of those, expect ~80% to have scored surplus (vs ~12% pre-Phase-A) → ~20 real solves/day
+- × ~0.006 ETH avg surplus → ~0.12 ETH/day = 3.6 ETH/Mo
+- Gross @ €1827/ETH ≈ €6500/Mo, net after bonding fee + server ≈ **~€5000/Mo**
+
+If this holds, **Multi-Party becomes the dominant revenue strategy** and the §4.2 "realistic likely" €2,000/Mo projection is conservative.  But every number above carries n=1 confidence — could be 10× off in either direction.
+
+**Validation plan:**
+- 6h post-deploy: check ratio of NULL vs scored Multi-Party solves
+- 24h post-deploy: re-run `scripts/estimate_economics --days 1` on clean baseline
+- 7d post-deploy: confidence intervals tighten enough for pitch-level claims
+
+Until 24h baseline lands, **engineering investment in any specific strategy is premature** — wait, measure, then prioritize.
+
+### 1.6 Raw shadow data vs. aggregate analytics
 
 `shadow_solutions.our_score_wei` is a PER-ATTEMPT score. The same persistent order (e.g. an off-market loose-limit buy that keeps appearing in successive auctions) can be matched by the same strategy across many auctions — each emission is a separate row with its own score, but only ONE such fill could actually settle on-chain.
 
@@ -186,7 +230,13 @@ Naive's score is NULL'd at persistence (`src/shadow/persist.py`) because the pri
 
 **Important:** Earlier Memory/spec projections of €1090-2600/mo NET were based on inflated phantom scores that did not survive the 2026-05-25 bipartite + scoring + cap fixes. The numbers below are from the clean post-fix shadow baseline.
 
-**Pending re-evaluation (2026-05-26):** the figures in §4.1–4.2 were computed BEFORE the ghost-detector deploy (see §1.4) — meaning 99.4% of bipartite contributions came from non-fillable ghost-pairs.  Once the detector has run for 24+ hours on production data, `estimate_economics` should be re-run.  The likely outcome is that the bipartite floor drops further (its 8 of 9 attributed wins were almost certainly ghost-pollution); router-v2 and multi-party numbers are independent of ghosts and unchanged.
+**Pending re-evaluation (2026-05-26):** the figures in §4.1–4.2 were computed BEFORE the ghost-detector deploy (see §1.4) — meaning 99.4% of bipartite contributions came from non-fillable ghost-pairs.  Once the detector has run for 24+ hours on production data, `estimate_economics` should be re-run.
+
+Re-evaluation expectations (post-deploy hypothesis based on partial data, see §1.5):
+- Bipartite floor likely drops significantly (8 of 9 attributed wins were ghost-pollution)
+- Multi-Party likely becomes dominant — the "1% solve rate" framing was wrong; combination of PR #34 (rate unstuck) + Phase A (ghost-clean rings) may yield ~€5,000/Mo net at n=1-derived projection
+- Router-v2 unchanged (independent of ghosts)
+- Net effect could be break-even or modestly profitable, **not** the prior €45/Mo polluted estimate — but direction is uncertain until 24h sample lands
 
 ### 4.1 Verified Conservative Floor (`estimate_economics --days 1`, n=9 after dedup + p99 outlier-cap)
 
