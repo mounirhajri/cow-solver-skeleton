@@ -801,3 +801,74 @@ async def test_loose_tolerance_admits_ring_but_zero_volume_rejects(monkeypatch) 
         if e["event"] == "multi_party_ring_breakdown" and e["auction_id"] == "101"
     ]
     assert strict_bds == []
+
+
+# ---------------------------------------------------------------------------
+# Phase A ghost-detector integration tests (2026-05-26)
+# ---------------------------------------------------------------------------
+
+
+class _FakeGhostDetector:
+    """In-memory GhostDetector stub for tests — no DB required."""
+
+    def __init__(self, ghost_uids: set[str]) -> None:
+        self._ghost_uids = ghost_uids
+
+    async def is_ghost(self, order: Order) -> bool:
+        return order.uid in self._ghost_uids
+
+
+@pytest.mark.asyncio
+async def test_multi_party_drops_ghost_uids_before_ring_enumeration(monkeypatch):
+    """Orders whose UID is flagged ghost are dropped before ring enumeration.
+
+    Constructs a 4-order graph that could form a 3-ring (A→B→C→A), but one
+    of the ring legs is a ghost.  After the ghost-filter, only 2 orders remain
+    (< MIN_RING_LENGTH), so the solver must short-circuit to NoSolution and
+    emit the filter log.
+    """
+    calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "edge.matching.multi_party.log.info",
+        lambda event, **kw: calls.append((event, kw)),
+    )
+
+    o1 = _mk_order("real_AB",  "0xA", "0xB")
+    o2 = _mk_order("real_BC",  "0xB", "0xC")
+    o3 = _mk_order("ghost_CA", "0xC", "0xA")
+    tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
+
+    detector = _FakeGhostDetector(ghost_uids={"ghost_CA"})
+    solver = CoWMatchingSolver(ghost_detector=detector)
+    result = await solver.solve(_mk_auction([o1, o2, o3], tokens))
+
+    assert isinstance(result, NoSolution)
+    filter_events = [kw for ev, kw in calls if ev == "multi_party_dynamic_ghost_filter"]
+    assert filter_events, "multi_party_dynamic_ghost_filter log was not emitted"
+    assert filter_events[0]["n_filtered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_multi_party_no_detector_is_noop(monkeypatch):
+    """No detector injected → solver behaves exactly like the pre-detector code.
+
+    Regression guard for tests / skeleton clones that instantiate
+    CoWMatchingSolver() without arguments.
+    """
+    calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "edge.matching.multi_party.log.info",
+        lambda event, **kw: calls.append((event, kw)),
+    )
+
+    o1 = _mk_order("a", "0xA", "0xB")
+    o2 = _mk_order("b", "0xB", "0xC")
+    tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
+
+    solver = CoWMatchingSolver()  # no ghost_detector
+    await solver.solve(_mk_auction([o1, o2], tokens))
+
+    filter_events = [ev for ev, _ in calls if ev == "multi_party_dynamic_ghost_filter"]
+    assert not filter_events, (
+        "multi_party_dynamic_ghost_filter must not fire when no detector is provided"
+    )

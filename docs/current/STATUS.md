@@ -79,44 +79,50 @@ A "ghost-order" is a CoW orderbook order that no live solver ever settles — ty
 - `n_remaining ≈ 10` real sell-orders per auction for bipartite to match against
 - Aligns with prior 99.4% pollution finding (now measured on order-count basis vs solution basis)
 
-### 1.5 Multi-Party + Phase A Interaction (2026-05-26, in observation)
+### 1.5 Multi-Party + Phase A Interaction (2026-05-26)
 
-Discovered while sanity-checking Phase A deployment.  Has implications for revenue projections.
+**Earlier hypothesis in this section was wrong — corrected below after deep inspection of the actual ring contents.**
 
-**Context:** memory claimed Multi-Party at 1% solve rate, blocked by 2 persistent fill-or-kill TWAPs (`0xd9ec0e2f` + `0xfe7c06bb`).  Both UIDs verified in `ghost_orders` post-deploy (seen=618 each).
+**Original hypothesis (now retracted):** Phase A removes ghosts from Multi-Party input → rings built from real orders → first scored post-deploy solve (auction 7379300, 0.006 ETH) is evidence Phase A unlocked ~€5,000/Mo Multi-Party revenue.
 
-**What the data actually showed:**
+**What the deep inspection actually found:**
 
-| Window | Multi-Party solved/total | Rate | Surplus |
+Auction 7379300's "post-Phase-A" 3-trade ring (3-token cycle through `0x2f2a25` / USDC / USDT) **contains UID `0x9bed2dd21329…` as one of its three legs**.  Owner address `0x0c3f65b68b3059f7c02d8be083a885fe67d7b6cd` is identical to the original USDC↔USDT ghost identified at the start of the investigation, and the UID is currently in `ghost_orders` (seen=618).
+
+**Root cause:** when wiring Phase A on 2026-05-26, the `DynamicGhostDetector` was only injected into `BipartiteMatcher`, not into `CoWMatchingSolver` (Multi-Party).  See [src/solver/orchestrator.py](src/solver/orchestrator.py) at the time — Multi-Party constructor lacked the `ghost_detector` parameter and the call site didn't pass one.  So Multi-Party continued to operate on the un-filtered order set.
+
+**What this means:**
+
+| Window | Multi-Party solved/total | Rate | What's actually true |
 |---|---|---|---|
-| 6-24h ago (pre-PR-#34) | 1/416 | 0.24% | 1× scored 0.026564 ETH |
-| 1-6h ago (post-PR-#34, pre-Phase-A) | 7/180 | **3.89%** | **7× NULL-scored, `executedAmount=0` on all trades** |
-| 0-1h ago (post-Phase-A) | 1/37 | 2.70% | 1× scored 0.005977 ETH (3-trade ring) |
+| 6-24h ago (pre-PR-#34) | 1/416 | 0.24% | One real solve (auction 7371674, verified 3-token ring) |
+| 1-6h ago (post-PR-#34, pre-Phase-A) | 7/180 | 3.89% | Rings found but ghost-polluted → zero-volume guard NULL'd scores |
+| 0-1h ago (no Phase A applied to Multi-Party) | 1/37 | 2.70% | Ring still includes ghost UID; CIP-14 score likely phantom (would revert on settle) |
 
-**Re-interpretation of "1% solve rate" memory claim:**
+**Re-interpretation of Multi-Party's true performance:**
+- Verified scored solves on clean data: **n=1** (auction 7371674, 0.0266 ETH, 2026-05-25 evening)
+- Post-PR-#34 ring emissions: high rate (~3-4%) but content is suspect — guards NULL most, the one that wasn't NULL'd contains a known ghost
+- Until Multi-Party is also wired to Phase A and we re-sample, the actual ghost-clean solve rate is unknown
 
-1. PR #34 (2026-05-26 morning) unstuck Multi-Party from 0.24% to ~3-4% solve rate — but solves were dominated by ghost-containing rings, which the zero-volume guard (PR #35) and phantom-cap (PR #36) correctly NULL'd.  Sample inspection of NULL-scored solves found UID `0x9bed2dd21329…` — one of the four original USDC↔USDT ghosts identified at the start of the ghost investigation.
-2. So "1% solve rate" was outdated; the actual rate post-PR-#34 was ~4%, but **effective surplus was zero** because every found ring contained ghosts that triggered downstream NULL'ing.
-3. Phase A removes ghosts from the input set → Multi-Party rings are now built from real orders → `executedAmount > 0` → scored surplus survives.
+**Fix shipped (this commit):**
 
-**Sample is n=1 post-Phase-A — preliminary, not a forecast.**
+| File | Change |
+|---|---|
+| `edge/matching/multi_party.py` | `CoWMatchingSolver.__init__` gains `ghost_detector` parameter; `solve()` runs the dynamic-ghost filter BEFORE ring-cooldown / RF-filter / OTM-graph construction |
+| `src/solver/orchestrator.py` | passes `ghost_detector=ghost_detector` to both `CoWMatchingSolver` instantiations (parallels the BipartiteMatcher wiring) |
+| `tests/test_edge/test_multi_party.py` | 2 new tests for the ghost-filter integration (analogous to bipartite tests) |
 
-**Hypothetical projection (n=1, treat with extreme caution):**
+**What we still need to verify (next 6-24h):**
+- After deploy: do new Multi-Party solves still contain ghost UIDs?  Should be zero.
+- Does the solve rate drop from ~3-4% to a lower-but-genuine rate?  Likely yes — many of the 3-4% rings were enabled by ghost legs.
+- What's the true ghost-clean Multi-Party rate and surplus?  Currently unknown.
 
-If post-Phase-A Multi-Party sustains:
-- ~3% solve rate over ~36 attempts/h → ~26 solves/day
-- Of those, expect ~80% to have scored surplus (vs ~12% pre-Phase-A) → ~20 real solves/day
-- × ~0.006 ETH avg surplus → ~0.12 ETH/day = 3.6 ETH/Mo
-- Gross @ €1827/ETH ≈ €6500/Mo, net after bonding fee + server ≈ **~€5000/Mo**
+**Revised expectation for Multi-Party revenue:** unknown.  The ~€5k/Mo projection from the retracted hypothesis was based on assuming the lone post-deploy scored solve was genuine.  It wasn't.  Real number could be anywhere from €0/Mo (if ghost-clean solves are rare) to €5k+/Mo (if PR #34 found genuine new ring topology beyond what ghosts were enabling).  24h sample required.
 
-If this holds, **Multi-Party becomes the dominant revenue strategy** and the §4.2 "realistic likely" €2,000/Mo projection is conservative.  But every number above carries n=1 confidence — could be 10× off in either direction.
-
-**Validation plan:**
-- 6h post-deploy: check ratio of NULL vs scored Multi-Party solves
-- 24h post-deploy: re-run `scripts/estimate_economics --days 1` on clean baseline
-- 7d post-deploy: confidence intervals tighten enough for pitch-level claims
-
-Until 24h baseline lands, **engineering investment in any specific strategy is premature** — wait, measure, then prioritize.
+**Lessons from the discovery:**
+1. End-to-end content verification (tracing every UID in a solve) beats aggregate metric checking — the score+rate signals looked encouraging, but the ring contents told the truth.
+2. Phase A's success on Bipartite was real (verified separately); the gap was the orchestrator wiring, not the detector design.
+3. Don't post hypotheses from n=1 — even if "directionally consistent" with prior models.  This was a self-inflicted error in the prior STATUS update.
 
 ### 1.6 Raw shadow data vs. aggregate analytics
 
@@ -232,11 +238,11 @@ Naive's score is NULL'd at persistence (`src/shadow/persist.py`) because the pri
 
 **Pending re-evaluation (2026-05-26):** the figures in §4.1–4.2 were computed BEFORE the ghost-detector deploy (see §1.4) — meaning 99.4% of bipartite contributions came from non-fillable ghost-pairs.  Once the detector has run for 24+ hours on production data, `estimate_economics` should be re-run.
 
-Re-evaluation expectations (post-deploy hypothesis based on partial data, see §1.5):
+Re-evaluation expectations after the full Phase A wiring (see §1.5 — Multi-Party was initially mis-wired, fixed in follow-up PR):
 - Bipartite floor likely drops significantly (8 of 9 attributed wins were ghost-pollution)
-- Multi-Party likely becomes dominant — the "1% solve rate" framing was wrong; combination of PR #34 (rate unstuck) + Phase A (ghost-clean rings) may yield ~€5,000/Mo net at n=1-derived projection
+- Multi-Party: unknown.  Memory's "1% solve rate" was outdated, PR #34 raised emission rate to ~3-4%, but inspection of post-deploy solves found ghost UIDs still in the rings — Multi-Party wasn't actually filtered until the follow-up PR.  True ghost-clean Multi-Party rate and surplus require 24h sample after the wiring fix.
 - Router-v2 unchanged (independent of ghosts)
-- Net effect could be break-even or modestly profitable, **not** the prior €45/Mo polluted estimate — but direction is uncertain until 24h sample lands
+- Net effect: direction uncertain until full clean baseline lands.  No confident projection can be made today.
 
 ### 4.1 Verified Conservative Floor (`estimate_economics --days 1`, n=9 after dedup + p99 outlier-cap)
 
