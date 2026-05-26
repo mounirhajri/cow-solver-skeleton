@@ -138,13 +138,17 @@ async def _seed(factory: async_sessionmaker) -> None:
         await session.commit()
 
 
-async def _capture_analysis(factory: async_sessionmaker, days: int = 7) -> str:
+async def _capture_analysis(
+    factory: async_sessionmaker,
+    days: int = 7,
+    strategy: str | None = None,
+) -> str:
     """Run analysis and return captured stdout as a string."""
     captured = io.StringIO()
     old_stdout = sys.stdout
     sys.stdout = captured
     try:
-        await run_analysis(days=days, session_factory=factory)
+        await run_analysis(days=days, strategy=strategy, session_factory=factory)
     finally:
         sys.stdout = old_stdout
     return captured.getvalue()
@@ -219,3 +223,102 @@ class TestEmptyDatabase:
         assert "View 1" in output
         assert "View 2" in output
         assert "View 3" in output
+
+
+class TestStrategyFilter:
+    """--strategy plumbing: restrict views 1+3 to a single strategy."""
+
+    async def _seed_two_strategies(self, factory: async_sessionmaker) -> None:
+        """Two strategies on the same auction: bipartite (real) + router-v2 (phantom).
+
+        The historical bug: max-across-strategies picked router-v2's phantom
+        score as "our" entry, putting us above winner. With strategy filter,
+        we now see bipartite's real score and rank correctly below winner.
+        """
+        now = datetime.now(UTC)
+        async with factory() as session:
+            session.add(
+                ShadowAuction(
+                    auction_id=42,
+                    polled_at=now,
+                    n_orders=2,
+                    raw_competition={},
+                    raw_auction={},
+                )
+            )
+            session.add(
+                ShadowCompetitor(
+                    auction_id=42, solver_name="helixbox",
+                    solver_address="0x" + "1" * 40,
+                    score=1_000_000_000, ranking=1, is_winner=True,
+                    filtered_out=False, clearing_prices={}, orders=[], polled_at=now,
+                )
+            )
+            # bipartite: real, well below winner (rank 2)
+            session.add(
+                ShadowSolution(
+                    auction_id=42, strategy="cow-matching-bipartite",
+                    status="solved", our_score_wei=500_000_000,
+                )
+            )
+            # router-v2: phantom (would be picked by max-across-strategies)
+            session.add(
+                ShadowSolution(
+                    auction_id=42, strategy="router-v2",
+                    status="solved", our_score_wei=5_000_000_000,
+                )
+            )
+            await session.commit()
+
+    async def test_strategy_filter_shows_only_named_strategy(
+        self, session_factory
+    ) -> None:
+        """With --strategy cow-matching-bipartite, only bipartite's score is ranked."""
+        await self._seed_two_strategies(session_factory)
+        output = await _capture_analysis(
+            session_factory, strategy="cow-matching-bipartite"
+        )
+
+        # Header echoes the strategy
+        assert "strategy=cow-matching-bipartite" in output
+        # Bipartite (500M) < winner (1B) → rank 2 → "2nd" bucket fires
+        assert "2nd" in output
+
+    async def test_strategy_filter_excludes_other_strategies(
+        self, session_factory
+    ) -> None:
+        """router-v2's phantom 5B does NOT contribute when --strategy=bipartite."""
+        await self._seed_two_strategies(session_factory)
+        output = await _capture_analysis(
+            session_factory, strategy="cow-matching-bipartite"
+        )
+
+        # View 3 score-gap should reflect bipartite-vs-winner (500M gap),
+        # NOT the phantom (which would have shown "we won").
+        # 1_000_000_000 - 500_000_000 = 500_000_000
+        assert "500,000,000" in output or "500000000" in output
+        # "Auctions we WON: 0" — phantom would have flipped this to 1.
+        assert "WON          : 0" in output or "WON" in output
+
+    async def test_no_filter_uses_max_across_strategies(self, session_factory) -> None:
+        """Without --strategy: max-across-strategies → router-v2 phantom picked.
+
+        Regression guard: this is the historical (buggy) behaviour that
+        --strategy was designed to bypass.  Locking it in so we notice if
+        someone "fixes" max-across-strategies separately.
+        """
+        await self._seed_two_strategies(session_factory)
+        output = await _capture_analysis(session_factory)
+
+        # max(500M, 5B) = 5B → above winner 1B → we "won" the auction
+        # View 3: WON count == 1
+        assert "WON          : 1" in output or "WON: 1" in output.replace(" ", "")
+
+    async def test_strategy_filter_with_no_matching_rows(self, session_factory) -> None:
+        """Filter on a strategy that has no rows → 'No scored solutions' message."""
+        await self._seed_two_strategies(session_factory)
+        output = await _capture_analysis(
+            session_factory, strategy="cow-matching-multi-party"
+        )
+        # No multi-party rows exist → both Views 1 and 3 short-circuit.
+        assert "No scored solutions" in output

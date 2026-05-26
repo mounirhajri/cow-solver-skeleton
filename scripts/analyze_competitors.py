@@ -18,7 +18,13 @@ View 3 — Score gap to winner
 
 Usage
 -----
-    python -m scripts.analyze_competitors [--days 7]
+    python -m scripts.analyze_competitors [--days 7] [--strategy STRATEGY]
+
+The optional ``--strategy`` flag restricts views 1 and 3 to a specific
+strategy (e.g. ``cow-matching-bipartite``).  Without it the historical
+behaviour (best score per auction across all strategies) is preserved —
+useful as a sanity check but biased by phantom-suspect scores from
+router-v2 prior to the persist-time upper cap.
 """
 
 from __future__ import annotations
@@ -48,15 +54,25 @@ log = get_logger(__name__)
 async def _view_ranking_distribution(
     session: AsyncSession,
     since: datetime,
+    strategy: str | None = None,
 ) -> None:
-    """Print a histogram of where our score would rank among all competitors."""
+    """Print a histogram of where our score would rank among all competitors.
+
+    When ``strategy`` is given, only ShadowSolution rows for that strategy are
+    considered.  Default ``None`` keeps the historical "best score across all
+    strategies" behaviour, which is biased toward whichever strategy produces
+    the largest score (was router-v2 phantom prior to persist-time upper cap).
+    """
     # Fetch all (auction_id, our_score_wei) for solved solutions in the window.
-    our_q = await session.execute(
+    q = (
         select(ShadowSolution.auction_id, ShadowSolution.our_score_wei)
         .join(ShadowAuction, ShadowAuction.auction_id == ShadowSolution.auction_id)
         .where(ShadowSolution.our_score_wei.is_not(None))
         .where(ShadowAuction.polled_at >= since)
     )
+    if strategy is not None:
+        q = q.where(ShadowSolution.strategy == strategy)
+    our_q = await session.execute(q)
     our_rows = our_q.all()
 
     if not our_rows:
@@ -111,8 +127,9 @@ async def _view_ranking_distribution(
             rank_counts["lower"] += 1
 
     total = sum(rank_counts.values())
+    scope = f"strategy={strategy}" if strategy else "best score per auction (all strategies)"
     print(f"\n{'='*60}")
-    print("View 1 — Our score rank distribution (best score per auction)")
+    print(f"View 1 — Our score rank distribution ({scope})")
     print(f"{'='*60}")
     print(f"  Auctions scored  : {len(best_ours)}")
     print(f"  No competitor data: {no_competitor_data}")
@@ -241,15 +258,24 @@ async def _view_winner_by_token_pair(
 async def _view_score_gap(
     session: AsyncSession,
     since: datetime,
+    strategy: str | None = None,
 ) -> None:
-    """Print median / p25 / p75 score gap (winner - ours) for losing auctions."""
+    """Print median / p25 / p75 score gap (winner - ours) for losing auctions.
+
+    When ``strategy`` is given, the per-auction "our score" is restricted to
+    that strategy's solutions.  Without it, the historical max-across-strategies
+    rule applies (biased toward phantom-suspect scores prior to the upper cap).
+    """
     # For each auction, best our_score and winner score.
-    our_q = await session.execute(
+    q = (
         select(ShadowSolution.auction_id, ShadowSolution.our_score_wei)
         .join(ShadowAuction, ShadowAuction.auction_id == ShadowSolution.auction_id)
         .where(ShadowSolution.our_score_wei.is_not(None))
         .where(ShadowAuction.polled_at >= since)
     )
+    if strategy is not None:
+        q = q.where(ShadowSolution.strategy == strategy)
+    our_q = await session.execute(q)
     our_rows = our_q.all()
 
     if not our_rows:
@@ -294,8 +320,9 @@ async def _view_score_gap(
         if w_score > 0:
             diffs_pct.append(diff / w_score * 100)
 
+    scope = f"strategy={strategy}" if strategy else "best score per auction (all strategies)"
     print(f"\n{'='*60}")
-    print("View 3 — Score gap to winner (auctions where we LOST)")
+    print(f"View 3 — Score gap to winner ({scope}, auctions where we LOST)")
     print(f"{'='*60}")
     print(f"  Auctions with our score  : {len(best_ours)}")
     print(f"  No competitor winner data: {no_winner_data}")
@@ -336,27 +363,35 @@ async def _view_score_gap(
 
 async def run_analysis(
     days: int,
+    strategy: str | None = None,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> None:
     factory = session_factory or get_session_factory()
     since = datetime.now(UTC) - timedelta(days=days)
-    print(f"\nCoW Competition Analysis  (last {days} days, since {since:%Y-%m-%d %H:%M} UTC)")
+    scope = f" [strategy={strategy}]" if strategy else ""
+    print(
+        f"\nCoW Competition Analysis  "
+        f"(last {days} days, since {since:%Y-%m-%d %H:%M} UTC){scope}"
+    )
 
     async with factory() as session:
-        await _view_ranking_distribution(session, since)
+        await _view_ranking_distribution(session, since, strategy=strategy)
 
     async with factory() as session:
+        # View 2 (winner-by-token-pair) reads competitors only, not our scores.
+        # Strategy filter does not apply — the competitor landscape is the same
+        # regardless of which of our strategies we're analysing.
         await _view_winner_by_token_pair(session, since)
 
     async with factory() as session:
-        await _view_score_gap(session, since)
+        await _view_score_gap(session, since, strategy=strategy)
 
     print()
 
 
-async def main_async(days: int) -> None:
+async def main_async(days: int, strategy: str | None = None) -> None:
     try:
-        await run_analysis(days=days)
+        await run_analysis(days=days, strategy=strategy)
     except Exception as exc:
         log.error(
             "analyze_competitors_unhandled",
@@ -375,8 +410,20 @@ def main() -> None:
         default=7,
         help="Analysis window in days (default: 7).",
     )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default=None,
+        help=(
+            "Restrict Views 1 and 3 to a single strategy "
+            "(e.g. cow-matching-bipartite, cow-matching-multi-party, router-v2, "
+            "composer). Without this flag the historical max-across-strategies "
+            "behaviour is used, which is biased by phantom-suspect scores "
+            "(router-v2) prior to the persist-time upper cap."
+        ),
+    )
     args = parser.parse_args()
-    asyncio.run(main_async(days=args.days))
+    asyncio.run(main_async(days=args.days, strategy=args.strategy))
 
 
 if __name__ == "__main__":
