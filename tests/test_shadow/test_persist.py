@@ -13,7 +13,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.models.auction import Auction
 from src.persistence.models import ShadowAuction, ShadowSolution
-from src.shadow.persist import EPSILON_WEI, persist_shadow_attempt, persist_shadow_attempt_safe
+from src.shadow.persist import (
+    EPSILON_HIGH_WEI,
+    EPSILON_WEI,
+    persist_shadow_attempt,
+    persist_shadow_attempt_safe,
+)
 from src.solver.orchestrator import AttemptRecord
 
 
@@ -628,3 +633,151 @@ async def test_persist_logs_sub_dust_count(session_factory, monkeypatch) -> None
     dust_logs = [(ev, kw) for ev, kw in log_calls if ev == "sub_dust_solutions_skipped"]
     assert len(dust_logs) == 1, "Exactly one summary log must be emitted"
     assert dust_logs[0][1]["n_sub_dust_skipped"] == 3
+
+
+# ── Phantom upper-cap tests (router-v2 phantom prevention) ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_persist_nulls_score_above_upper_cap(session_factory, monkeypatch) -> None:
+    """Solutions with score >= EPSILON_HIGH_WEI must persist the row but NULL the score.
+
+    Production-observed: router-v2 emits CIP-14 surplus in the 6 ETH range from
+    arb-style high-surplus order limits that no AMM can clear. Pre-fix these
+    polluted estimate_economics + analyze_competitors with phantom revenue.
+    Post-fix: row stays for observability; score is NULL so downstream queries
+    treating NULL as "ignore" automatically filter them out.
+    """
+    phantom_score = int(6 * 10**18)  # 6 ETH — typical router-v2 phantom
+    assert phantom_score >= EPSILON_HIGH_WEI
+
+    _patch_scoring(monkeypatch, phantom_score)
+
+    auction = _auction("3010")
+    attempts = [_attempt_with_solution()]
+    await persist_shadow_attempt(auction, attempts)
+
+    async with session_factory() as s:
+        rows = (await s.execute(select(ShadowSolution))).scalars().all()
+    assert len(rows) == 1, "Row must persist (we want observability of phantom emissions)"
+    assert rows[0].our_score_wei is None, "Score must be NULL for phantom-suspect emissions"
+    assert rows[0].strategy == "router-v2"
+    assert rows[0].status == "solved"
+
+
+@pytest.mark.asyncio
+async def test_persist_nulls_score_exactly_at_upper_cap(session_factory, monkeypatch) -> None:
+    """Filter uses >=, so a score EXACTLY equal to EPSILON_HIGH_WEI is NULL'd.
+
+    1 ETH is itself phantom-suspect on Arbitrum (largest legitimate observation
+    is 0.094 ETH), so the boundary is inclusive on the safe side.
+    """
+    at_cap_score = EPSILON_HIGH_WEI
+
+    _patch_scoring(monkeypatch, at_cap_score)
+
+    auction = _auction("3011")
+    attempts = [_attempt_with_solution()]
+    await persist_shadow_attempt(auction, attempts)
+
+    async with session_factory() as s:
+        rows = (await s.execute(select(ShadowSolution))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].our_score_wei is None, "Score at the cap boundary must also be NULL'd"
+
+
+@pytest.mark.asyncio
+async def test_persist_keeps_score_well_below_upper_cap(session_factory, monkeypatch) -> None:
+    """A score well below the upper cap is persisted verbatim — regression guard.
+
+    Locks in that the cap is surgical: legitimate observations (which currently
+    top out around 0.094 ETH = 10× below the cap) are unaffected.  We use
+    0.5 ETH rather than ``EPSILON_HIGH_WEI - 1`` to avoid SQLite REAL precision
+    loss at the 10**18 boundary (Postgres NUMERIC in prod is exact, but the
+    in-memory aiosqlite backend rounds near 10**18).
+    """
+    half_eth = 5 * 10**17  # 0.5 ETH — well below 1 ETH cap, well above sub-dust
+    assert EPSILON_WEI < half_eth < EPSILON_HIGH_WEI
+
+    _patch_scoring(monkeypatch, half_eth)
+
+    auction = _auction("3012")
+    attempts = [_attempt_with_solution()]
+    await persist_shadow_attempt(auction, attempts)
+
+    async with session_factory() as s:
+        rows = (await s.execute(select(ShadowSolution))).scalars().all()
+    assert len(rows) == 1
+    assert int(rows[0].our_score_wei) == half_eth, (
+        "Score well below the cap must be persisted as-is"
+    )
+
+
+@pytest.mark.asyncio
+async def test_persist_logs_phantom_above_cap_count(session_factory, monkeypatch) -> None:
+    """Summary log fires once per persist call with the phantom count.
+
+    Mirrors the sub_dust_solutions_skipped log pattern — one aggregate log per
+    auction so analytics can grep+jq the rate of phantom suppressions over time.
+    """
+    phantom = int(6 * 10**18)
+    real_score = int(1e15)  # 0.001 ETH — clean bipartite-range win
+
+    monkeypatch.setattr(
+        "src.shadow.persist.orders_by_uid_from_auction",
+        lambda *args, **kwargs: {"0xdummy": object()},
+    )
+    monkeypatch.setattr(
+        "src.shadow.persist.extract_native_prices",
+        lambda *args, **kwargs: {"0xdummy": 1},
+    )
+
+    scores = iter([phantom, phantom, real_score])
+    monkeypatch.setattr(
+        "src.shadow.persist.compute_solution_score",
+        lambda *args, **kwargs: next(scores),
+    )
+
+    log_calls: list[tuple[str, dict]] = []
+
+    def capture_log(event: str, **kwargs: object) -> None:
+        log_calls.append((event, dict(kwargs)))
+
+    monkeypatch.setattr("src.shadow.persist.log.info", capture_log)
+
+    auction = _auction("3013")
+    attempts = [
+        AttemptRecord(
+            strategy=f"router-v2-attempt-{i}",
+            status="solved",
+            latency_ms=10,
+            solution={"id": 9999, "prices": {}, "trades": []},
+            error=None,
+        )
+        for i in range(3)
+    ]
+
+    await persist_shadow_attempt(auction, attempts)
+
+    # All 3 rows persisted (observability) — but 2 with NULL score (phantom),
+    # 1 with the real score.
+    async with session_factory() as s:
+        rows = (await s.execute(select(ShadowSolution))).scalars().all()
+    assert len(rows) == 3
+    null_scores = sum(1 for r in rows if r.our_score_wei is None)
+    real_scores = sum(1 for r in rows if r.our_score_wei is not None)
+    assert null_scores == 2
+    assert real_scores == 1
+
+    # Exactly one per-event log fires per call.  Also fires `shadow_score_above_upper_cap`
+    # twice (once per phantom row) for finer-grained tuning data.
+    summary_logs = [(ev, kw) for ev, kw in log_calls if ev == "phantom_above_cap_nulled"]
+    assert len(summary_logs) == 1
+    assert summary_logs[0][1]["n_phantom_above_cap"] == 2
+
+    per_row_logs = [(ev, kw) for ev, kw in log_calls if ev == "shadow_score_above_upper_cap"]
+    assert len(per_row_logs) == 2
+    # Each per-row log includes the strategy and raw_score_wei for forensics.
+    for _, kw in per_row_logs:
+        assert "strategy" in kw
+        assert "raw_score_wei" in kw

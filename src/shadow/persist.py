@@ -35,6 +35,24 @@ log = get_logger(__name__)
 # losing any economically relevant data.
 EPSILON_WEI = 10**12  # 1 microETH ≈ $0.002 at €1800/ETH
 
+# Upper cap for phantom-suspect surplus.  On Arbitrum One the largest
+# legitimate single-auction surplus we have observed (post-ghost-filter)
+# is 0.094 ETH on USDC/USDT — anything above 1 ETH is virtually certain
+# to be a scoring bug, most commonly router-v2 emitting CIP-14 surplus
+# derived from arb-style high-surplus order limits that no AMM can
+# actually clear at that volume.  Rather than DROP the row (we want
+# observability — every above-cap emission is a phantom we should be
+# able to count), we NULL the score and emit a structured log.
+# analyze_competitors + estimate_economics already treat NULL as
+# "ignore", so this surgically removes the pollution without losing
+# the diagnostic signal.
+#
+# 1 ETH chosen empirically: bipartite max observed = 0.094 ETH,
+# multi-party single solve = 0.027 ETH, real router emissions ~0.01 ETH.
+# Phantom router emissions cluster at 6+ ETH.  A 10× margin between
+# real (0.1 ETH) and cap (1 ETH) is comfortable.
+EPSILON_HIGH_WEI = 10**18  # 1 ETH
+
 
 async def persist_shadow_attempt(
     auction: Auction,
@@ -86,6 +104,7 @@ async def persist_shadow_attempt(
             }
 
         n_sub_dust_skipped = 0
+        n_phantom_above_cap = 0
         for a in attempts:
             score: int | None = None
             if a.strategy == "naive":
@@ -102,9 +121,27 @@ async def persist_shadow_attempt(
             elif a.solution and uid_map and native_prices:
                 with contextlib.suppress(Exception):  # noqa: BLE001
                     raw_score = compute_solution_score(a.solution, uid_map, native_prices)
-                    # Keep 0 as NULL (no real surplus); only store positive scores.
-                    # A score of 0 means the solution is valid but unprofitable.
-                    score = raw_score if raw_score > 0 else None
+                    if raw_score <= 0:
+                        # Zero/negative → NULL: solution is valid but unprofitable.
+                        score = None
+                    elif raw_score >= EPSILON_HIGH_WEI:
+                        # Phantom-suspect upper cap.  Most commonly router-v2
+                        # emitting arb-style scores derived from high-surplus
+                        # order limits (no AMM clears at that volume).  Keep
+                        # the row for observability; NULL the score so it
+                        # doesn't pollute analytics.  Log the original score
+                        # + strategy so we can tune the threshold from data.
+                        score = None
+                        n_phantom_above_cap += 1
+                        log.info(
+                            "shadow_score_above_upper_cap",
+                            auction_id=auction_id,
+                            strategy=a.strategy,
+                            raw_score_wei=str(raw_score),
+                            cap_wei=str(EPSILON_HIGH_WEI),
+                        )
+                    else:
+                        score = raw_score
 
             # Sub-dust filter: skip persisting solutions with a computed score
             # below EPSILON_WEI. These originate from bipartite-matcher downscaling
@@ -133,6 +170,12 @@ async def persist_shadow_attempt(
                 "sub_dust_solutions_skipped",
                 auction_id=auction_id,
                 n_sub_dust_skipped=n_sub_dust_skipped,
+            )
+        if n_phantom_above_cap:
+            log.info(
+                "phantom_above_cap_nulled",
+                auction_id=auction_id,
+                n_phantom_above_cap=n_phantom_above_cap,
             )
 
         await session.commit()
