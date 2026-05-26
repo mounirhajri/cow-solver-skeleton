@@ -318,17 +318,23 @@ def test_lp_full_fill_unchanged_when_no_fractional():
 # ── tolerance_bps_per_leg: align with OTM admission ──────────────────────────
 
 
-def test_ring_feasible_under_per_leg_tolerance():
-    """4-leg ring with Π r_i ≈ 1.03 is feasible under 100 bps/leg slack.
+def test_ring_admitted_by_tolerance_but_zero_volume_rejected():
+    """4-leg ring with Π r_i ≈ 1.03 passes pre-LP filter under 100 bps slack
+    but the LP optimum is x=0 — zero-volume guard rejects.
 
     Math: each r_i = 1007/1000 → log r_i ≈ 0.00698 → Σ log ≈ 0.0279.
-    Per-leg slack at 100 bps: 4 × ln(1.01) ≈ 0.03980 > 0.0279, so the
-    ring fits inside the admitted tolerance band.
+    Per-leg slack at 100 bps: 4 × -ln(1 - 0.01) ≈ 0.04020 > 0.0279, so
+    the pre-LP rate-feasibility check admits the ring.
 
-    Orders are ``partially_fillable=True`` so the LP has bounds slack to
-    land on the tolerance-degenerate fractional fill; non-partial orders
-    with these same volumes would be LP-infeasible by design (all legs
-    pinned to 1000 cannot satisfy the b > s constraint).
+    However, ``Π r_i > 1`` implies the chain ``x_0 >= Π r * x_0`` forces
+    ``x_0 = 0`` (and therefore every ``x_i = 0``). The LP solves but the
+    zero-volume guard correctly rejects it: rings admitted only at the
+    trivial point produce no surplus and would be NULL'd by the downstream
+    sub-dust filter anyway.
+
+    This test locks in the contract: tolerance gates the LP entry but
+    operationally-barren rings are still rejected. Without the guard,
+    such rings would emit zero-amount Solutions that pollute shadow data.
     """
     ring = (
         mk_partial_order("o1", "A", "B", 1000, 1007),
@@ -340,9 +346,41 @@ def test_ring_feasible_under_per_leg_tolerance():
         "A": _mk_token(), "B": _mk_token(), "C": _mk_token(), "D": _mk_token(),
     }
     result = solve_ring_lp(ring, tokens, tolerance_bps_per_leg=100)
-    assert result.feasible, (
-        f"expected feasible under 100 bps/leg slack, got "
+    assert not result.feasible
+    assert result.rejection_reason == "zero_volume", (
+        f"expected zero_volume rejection (Π r > 1 → x=0), got "
         f"rejection_reason={result.rejection_reason!r}"
+    )
+
+
+def test_real_surplus_ring_with_pi_r_below_one_solves():
+    """Π r_i < 1 ring → LP produces positive volume + positive surplus.
+
+    Three orders with b/s = 900/1000 = 0.9 each. Π r_i = 0.729, well below 1.
+    Each user gives up 10% of value (signed buy_amount < sell_amount at
+    parity) — the ring redistributes this slack as surplus. Locks in the
+    contract that the zero-volume guard ONLY rejects degenerate cases, not
+    real money-making rings.
+    """
+    ring = (
+        mk_partial_order("o1", "A", "B", 1000, 900),
+        mk_partial_order("o2", "B", "C", 1000, 900),
+        mk_partial_order("o3", "C", "A", 1000, 900),
+    )
+    tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
+    result = solve_ring_lp(ring, tokens)
+
+    assert result.feasible, (
+        f"Π r < 1 ring with slack must solve, got rejection_reason="
+        f"{result.rejection_reason!r}"
+    )
+    assert result.rejection_reason is None
+    assert max(result.executed_amounts) > 0, (
+        f"expected positive volume on at least one leg, got "
+        f"executed_amounts={result.executed_amounts}"
+    )
+    assert result.surplus_units > 0, (
+        f"slack ring must produce positive surplus, got {result.surplus_units}"
     )
 
 
