@@ -292,6 +292,7 @@ def load_default_strategies() -> list[SolverStrategy]:
 
         from edge.classifier.predict import TokenClassifier
         from edge.matching import BipartiteMatcher, CoWMatchingSolver
+        from edge.matching.ghost_detector import DynamicGhostDetector
         from edge.pool_indexer import LongTailRouter
         from edge.pool_indexer.pool_cache import PoolCache
         from src.persistence.db import get_session_factory
@@ -304,9 +305,11 @@ def load_default_strategies() -> list[SolverStrategy]:
         # — itself a callable that yields an AsyncSession context. The filter
         # opens its own short-lived session via `async with session_factory()`.
         session_factory = get_session_factory()
+        ghost_detector = DynamicGhostDetector(session_factory=session_factory)
         strategies.append(BipartiteMatcher(
             classifier=classifier,
             session_factory=session_factory,
+            ghost_detector=ghost_detector,
         ))
         strategies.append(CoWMatchingSolver(
             classifier=classifier,
@@ -402,15 +405,18 @@ def _load_default_strategies_with_multicall(multicall: Any) -> list[SolverStrate
 
         from edge.classifier.predict import TokenClassifier
         from edge.matching import BipartiteMatcher, CoWMatchingSolver
+        from edge.matching.ghost_detector import DynamicGhostDetector
         from edge.pool_indexer import LongTailRouter
         from edge.pool_indexer.pool_cache import PoolCache
         from src.persistence.db import get_session_factory
 
         classifier = TokenClassifier.load()
         session_factory = get_session_factory()
+        ghost_detector = DynamicGhostDetector(session_factory=session_factory)
         strategies.append(BipartiteMatcher(
             classifier=classifier,
             session_factory=session_factory,
+            ghost_detector=ghost_detector,
         ))
         strategies.append(CoWMatchingSolver(
             classifier=classifier,
