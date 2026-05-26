@@ -400,11 +400,16 @@ async def test_blacklisted_owner_orders_are_filtered(monkeypatch):
         "Ghost-owner pair must not appear in trades"
     )
 
-    # Ghost-filter log must have fired with n_filtered == 2
+    # Ghost-filter log must have fired with n_filtered == 2 and surface
+    # the offending owner(s) so prod debugging doesn't require re-querying.
     filter_events = [kw for ev, kw in calls if ev == "bipartite_ghost_owner_filter"]
     assert filter_events, "bipartite_ghost_owner_filter log was not emitted"
     assert filter_events[0]["n_filtered"] == 2, (
         f"Expected n_filtered=2, got {filter_events[0]['n_filtered']}"
+    )
+    assert filter_events[0]["filtered_owners"] == [_GHOST_OWNER.lower()], (
+        f"Expected filtered_owners=[{_GHOST_OWNER.lower()}], "
+        f"got {filter_events[0]['filtered_owners']}"
     )
 
 
@@ -438,6 +443,89 @@ async def test_non_blacklisted_owners_match_normally(monkeypatch):
     filter_events = [ev for ev, _ in calls if ev == "bipartite_ghost_owner_filter"]
     assert not filter_events, (
         "bipartite_ghost_owner_filter must not fire when no blacklisted owners present"
+    )
+
+
+@pytest.mark.asyncio
+async def test_all_orders_blacklisted_returns_no_solution(monkeypatch):
+    """Auction full of ghost orders → filter drops everything → NoSolution.
+
+    The most plausible production scenario for ghost-rich auctions: every
+    sell-side order is signed by the blacklisted owner. After the filter
+    runs, ``len(sell_orders) < 2`` and the matcher must short-circuit to
+    NoSolution without touching ``_find_matches`` or the RF-filter.
+    """
+    calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "edge.matching.bipartite.log.info",
+        lambda event, **kw: calls.append((event, kw)),
+    )
+
+    o1 = _mk_order_with_owner("oG1", "0xa", "0xb", 1000, 800, _GHOST_OWNER)
+    o2 = _mk_order_with_owner("oG2", "0xb", "0xa", 1000, 800, _GHOST_OWNER)
+
+    m = BipartiteMatcher()
+    result = await m.solve(_mk_auction([o1, o2]))
+
+    assert isinstance(result, NoSolution), (
+        "All-ghost auction must short-circuit to NoSolution"
+    )
+    # Ghost-filter log fires (n_filtered=2), RF-filter log must NOT fire
+    # — the early return happens before the RF-filter gate.
+    events = [ev for ev, _ in calls]
+    assert "bipartite_ghost_owner_filter" in events
+    assert "bipartite_rf_filter" not in events, (
+        "RF-filter must be skipped after ghost-filter empties the order list"
+    )
+
+
+@pytest.mark.asyncio
+async def test_blacklist_matches_checksummed_order_owner(monkeypatch):
+    """Filter is case-insensitive on the order side too.
+
+    Orders fetched from the CoW API often have checksummed owner addresses
+    (mixed-case). The filter must still match them against the lower-case
+    blacklist entries.
+    """
+    calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "edge.matching.bipartite.log.info",
+        lambda event, **kw: calls.append((event, kw)),
+    )
+
+    # Checksum-style: alternating case, semantically equal to _GHOST_OWNER
+    checksummed = "0x" + "".join(
+        c.upper() if i % 2 == 0 else c
+        for i, c in enumerate(_GHOST_OWNER[2:])
+    )
+    assert checksummed != _GHOST_OWNER, "test setup: must differ in casing"
+    assert checksummed.lower() == _GHOST_OWNER, "test setup: must match when lowered"
+
+    oL_sell = _mk_order_with_owner("oL_sell", "0xa", "0xb", 1000, 800, _LEGIT_OWNER)
+    oL_buy  = _mk_order_with_owner("oL_buy",  "0xb", "0xa", 1000, 800, _LEGIT_OWNER)
+    oG_sell = _mk_order_with_owner("oG_sell", "0xa", "0xb", 1000, 800, checksummed)
+    oG_buy  = _mk_order_with_owner("oG_buy",  "0xb", "0xa", 1000, 800, checksummed)
+
+    m = BipartiteMatcher()
+    result = await m.solve(_mk_auction([oL_sell, oL_buy, oG_sell, oG_buy]))
+
+    assert isinstance(result, Solution)
+    trade_uids = {t.order_uid for t in result.trades}
+    assert "oG_sell" not in trade_uids and "oG_buy" not in trade_uids, (
+        "Checksummed ghost-owner orders must still be filtered"
+    )
+
+
+def test_blacklist_is_lowercase_normalized():
+    """All entries in GHOST_OWNER_BLACKLIST are lower-case at module load.
+
+    Guards against a future contributor pasting a checksummed address into
+    the source set — the comprehension at construction time must normalize
+    it, otherwise the filter would silently no-op for that entry.
+    """
+    assert all(addr == addr.lower() for addr in GHOST_OWNER_BLACKLIST), (
+        f"Non-lowercase entry found in GHOST_OWNER_BLACKLIST: "
+        f"{[a for a in GHOST_OWNER_BLACKLIST if a != a.lower()]}"
     )
 
 
