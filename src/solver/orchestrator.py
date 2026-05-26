@@ -265,96 +265,17 @@ def load_default_strategies() -> list[SolverStrategy]:
 
     Order: naive first (always fast, anchors the response), then edge strategies
     (specialized, selective), then router-v2 (slow on-chain quotes, shadow data).
+
+    Delegates to ``_load_default_strategies_with_multicall`` so the strategy
+    construction logic lives in exactly one place.
     """
-    from src.config import settings
     from src.routing.multicall import Multicall3
     from src.routing.rpc import RpcClient
-    from src.solver.naive import NaiveSolver
-    from src.solver.router import RouterSolver
-
-    strategies: list[SolverStrategy] = []
+    from src.config import settings
 
     rpc = RpcClient(settings.rpc_arbitrum)
     multicall = Multicall3(rpc)
-
-    # Naive first: <10 ms to find trades (oracle prices as filter).
-    # With multicall injected, oracle clearing prices are replaced with real
-    # DEX quotes for the specific token pairs touched — typically 3-10 pairs,
-    # done in parallel, adds ~200-500 ms but produces accurate CIP-14 scores.
-    strategies.append(NaiveSolver(
-        multicall=multicall,
-        intermediates=settings.intermediate_tokens,
-        refine_timeout=3.0,
-    ))
-
-    try:
-        import redis.asyncio as aioredis
-
-        from edge.classifier.predict import TokenClassifier
-        from edge.matching import BipartiteMatcher, CoWMatchingSolver
-        from edge.matching.ghost_detector import DynamicGhostDetector
-        from edge.pool_indexer import LongTailRouter
-        from edge.pool_indexer.pool_cache import PoolCache
-        from src.persistence.db import get_session_factory
-
-        # TokenClassifier.load() never raises — when the pickle is missing it
-        # returns an instance whose `.model is None`, which the filter treats
-        # as a no-op. So a missing model degrades gracefully to the old path.
-        classifier = TokenClassifier.load()
-        # `get_session_factory()` returns an `async_sessionmaker[AsyncSession]`
-        # — itself a callable that yields an AsyncSession context. The filter
-        # opens its own short-lived session via `async with session_factory()`.
-        session_factory = get_session_factory()
-        ghost_detector = DynamicGhostDetector(session_factory=session_factory)
-        strategies.append(BipartiteMatcher(
-            classifier=classifier,
-            session_factory=session_factory,
-            ghost_detector=ghost_detector,
-        ))
-        strategies.append(CoWMatchingSolver(
-            classifier=classifier,
-            session_factory=session_factory,
-            otm_tolerance_bps=settings.multi_party_otm_tolerance_bps,
-            ring_cooldown_seconds=settings.multi_party_ring_cooldown_seconds,
-            ghost_detector=ghost_detector,
-        ))
-        # Long-tail router shares the multicall instance with NaiveSolver/RouterSolver
-        # and is backed by a Redis cache (pool addresses ~7d, reserves ~60s).
-        # Gated by settings.long_tail_enabled: when an Alchemy free-tier connection
-        # quota is the bottleneck, the extra concurrent multicalls from LongTail
-        # starve RouterSolver. Set LONG_TAIL_ENABLED=false to disable in prod.
-        if settings.long_tail_enabled:
-            redis_client = aioredis.Redis.from_url(
-                settings.redis_url, decode_responses=False
-            )
-            pool_cache = PoolCache(
-                redis=redis_client,
-                key_prefix=settings.redis_key_prefix,
-                reserves_ttl=settings.pool_cache_ttl_seconds,
-            )
-            strategies.append(LongTailRouter(
-                multicall=multicall,
-                pool_cache=pool_cache,
-            ))
-        log.info(
-            "edge_strategies_loaded",
-            rf_model_loaded=classifier.model is not None,
-            long_tail_enabled=settings.long_tail_enabled,
-        )
-    except ImportError:
-        log.info("edge_strategies_not_present", reason="public_clone_or_phase0")
-
-    # Router-v2 last: on-chain quotes for top-N orders by sell_amount.
-    # Shares the same multicall/rpc instance as NaiveSolver (no extra connections).
-    strategies.append(RouterSolver(
-        multicall=multicall,
-        intermediates=settings.router_intermediate_tokens,
-        max_orders=settings.router_max_orders,
-        max_concurrent=settings.router_max_concurrent,
-        strategy_timeout=settings.router_strategy_timeout,
-    ))
-
-    return strategies
+    return _load_default_strategies_with_multicall(multicall)
 
 
 def load_default_orchestrator() -> SolverOrchestrator:
@@ -384,11 +305,12 @@ def load_default_orchestrator() -> SolverOrchestrator:
 
 
 def _load_default_strategies_with_multicall(multicall: Any) -> list[SolverStrategy]:
-    """Identical to ``load_default_strategies`` but reuses an injected multicall.
+    """Build the strategy chain around an injected multicall instance.
 
-    Internal helper for ``load_default_orchestrator`` — keeps the public
-    ``load_default_strategies`` signature unchanged for tests and docs that
-    still reference it.
+    Single source of truth for strategy construction — both
+    ``load_default_strategies`` (standalone / test use) and
+    ``load_default_orchestrator`` (production) delegate here so changes
+    only need to be made in one place.
     """
     from src.config import settings
     from src.solver.naive import NaiveSolver
@@ -444,7 +366,12 @@ def _load_default_strategies_with_multicall(multicall: Any) -> list[SolverStrate
             rf_model_loaded=classifier.model is not None,
             long_tail_enabled=settings.long_tail_enabled,
         )
-    except ImportError:
+    except (ImportError, TypeError):
+        # ImportError  — edge submodule not present (public clone / phase-0).
+        # TypeError    — edge submodule present but at a mismatched version where
+        #                a strategy constructor doesn't accept a new keyword arg
+        #                (e.g. ghost_detector) yet.  Degrade gracefully instead of
+        #                crashing the server on startup.
         log.info("edge_strategies_not_present", reason="public_clone_or_phase0")
 
     strategies.append(RouterSolver(

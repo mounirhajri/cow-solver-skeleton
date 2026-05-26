@@ -822,7 +822,7 @@ class _FakeGhostDetector:
 async def test_multi_party_drops_ghost_uids_before_ring_enumeration(monkeypatch):
     """Orders whose UID is flagged ghost are dropped before ring enumeration.
 
-    Constructs a 4-order graph that could form a 3-ring (A→B→C→A), but one
+    Constructs a 3-order graph that could form a ring (A→B→C→A), but one
     of the ring legs is a ghost.  After the ghost-filter, only 2 orders remain
     (< MIN_RING_LENGTH), so the solver must short-circuit to NoSolution and
     emit the filter log.
@@ -852,8 +852,9 @@ async def test_multi_party_drops_ghost_uids_before_ring_enumeration(monkeypatch)
 async def test_multi_party_no_detector_is_noop(monkeypatch):
     """No detector injected → solver behaves exactly like the pre-detector code.
 
-    Regression guard for tests / skeleton clones that instantiate
-    CoWMatchingSolver() without arguments.
+    Uses a full 3-ring so the ghost-filter code path is actually reached,
+    matching the bipartite equivalent which also asserts the solver still
+    produces a correct Solution (ring found, no crash) without a detector.
     """
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
@@ -861,14 +862,56 @@ async def test_multi_party_no_detector_is_noop(monkeypatch):
         lambda event, **kw: calls.append((event, kw)),
     )
 
-    o1 = _mk_order("a", "0xA", "0xB")
-    o2 = _mk_order("b", "0xB", "0xC")
+    orders = [
+        _mk_order("a", "0xA", "0xB"),
+        _mk_order("b", "0xB", "0xC"),
+        _mk_order("c", "0xC", "0xA"),
+    ]
     tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
 
     solver = CoWMatchingSolver()  # no ghost_detector
-    await solver.solve(_mk_auction([o1, o2], tokens))
+    result = await solver.solve(_mk_auction(orders, tokens))
+
+    assert isinstance(result, Solution)  # ring still found — no crash, no silent drop
 
     filter_events = [ev for ev, _ in calls if ev == "multi_party_dynamic_ghost_filter"]
     assert not filter_events, (
         "multi_party_dynamic_ghost_filter must not fire when no detector is provided"
     )
+
+
+@pytest.mark.asyncio
+async def test_multi_party_ghost_filter_survivors_form_ring(monkeypatch):
+    """Ghost filter removes one order; the remaining 3 still form a valid ring.
+
+    4 orders: 1 ghost (D→A) plus 3 valid ITM legs (A→B, B→C, C→A).
+    After the ghost-filter the ghost is gone but the ring is intact → Solution
+    containing exactly the 3 real order UIDs.
+    """
+    calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "edge.matching.multi_party.log.info",
+        lambda event, **kw: calls.append((event, kw)),
+    )
+
+    o1 = _mk_order("real_AB", "0xA", "0xB")
+    o2 = _mk_order("real_BC", "0xB", "0xC")
+    o3 = _mk_order("real_CA", "0xC", "0xA")
+    o4 = _mk_order("ghost_DA", "0xD", "0xA")
+    tokens = {
+        "0xA": _mk_token(), "0xB": _mk_token(),
+        "0xC": _mk_token(), "0xD": _mk_token(),
+    }
+
+    detector = _FakeGhostDetector(ghost_uids={"ghost_DA"})
+    solver = CoWMatchingSolver(ghost_detector=detector)
+    result = await solver.solve(_mk_auction([o1, o2, o3, o4], tokens))
+
+    assert isinstance(result, Solution)
+    solved_uids = {t.order_uid for t in result.trades}
+    assert solved_uids == {"real_AB", "real_BC", "real_CA"}
+    assert "ghost_DA" not in solved_uids
+
+    filter_events = [kw for ev, kw in calls if ev == "multi_party_dynamic_ghost_filter"]
+    assert filter_events, "ghost filter log must fire"
+    assert filter_events[0]["n_filtered"] == 1
