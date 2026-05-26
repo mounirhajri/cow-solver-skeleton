@@ -539,6 +539,50 @@ def test_solve_ring_lp_rejects_when_non_partial_gets_zero_fill(monkeypatch):
     assert _solve_ring_lp(ring, tokens) is None
 
 
+def test_all_non_partial_ring_with_matching_volumes_solves():
+    """All-non-partial ring with balanced volumes solves end-to-end.
+
+    With the LP-bounds pinning for non-partial orders, this ring's
+    pinned solution (x = sell_amounts = (1000, 1000, 1000)) satisfies
+    every leg's limit (b/s = 0.9 < 1).  Locks in that pinning bounds
+    does not over-reject legitimate non-partial rings.
+    """
+    tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
+    ring = (
+        _mk_order("o1", "A", "B", sell_amount=1000, buy_amount=900),
+        _mk_order("o2", "B", "C", sell_amount=1000, buy_amount=900),
+        _mk_order("o3", "C", "A", sell_amount=1000, buy_amount=900),
+    )
+    cand = _solve_ring_lp(ring, tokens)
+    assert cand is not None, "balanced all-non-partial ring must solve"
+    # Every leg fully filled.
+    assert cand.executed_amounts == (1000, 1000, 1000)
+    assert cand.surplus_estimate > 0
+
+
+def test_non_partial_ring_volume_cliff_rejected_as_lp_failed():
+    """Non-partial ring with volume cliff is rejected with rejection_reason='lp_failed'.
+
+    Previously this slipped through the LP (which would allocate a
+    fractional fill) and was caught by the ``non_partial_short`` filter,
+    wasting an LP solve.  With pinning, the LP itself reports infeasibility
+    and the rejection reason is ``"lp_failed"``.
+    """
+    from edge.matching.multi_party import _solve_ring_lp_with_reason
+
+    tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
+    ring = (
+        _mk_order("o1", "A", "B", sell_amount=1000, buy_amount=900),
+        _mk_order("o2", "B", "C", sell_amount=10, buy_amount=9),
+        _mk_order("o3", "C", "A", sell_amount=1000, buy_amount=900),
+    )
+    cand, reason = _solve_ring_lp_with_reason(ring, tokens)
+    assert cand is None
+    assert reason == "lp_failed", (
+        f"expected lp_failed (pinned bounds), got {reason!r}"
+    )
+
+
 # ── Ring breakdown instrumentation ────────────────────────────────────────────
 
 
