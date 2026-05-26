@@ -147,11 +147,16 @@ def test_ring_with_one_otm_order_solves_via_derived_prices():
 
     o1 is the OTM order: sell 1000 A for 1005 B (sell_value=1000 < buy_value=1005
     at parity reference prices).  o2 and o3 over-compensate: Π r = 1.005 · 0.9 · 0.9 ≈ 0.814.
+
+    All orders are ``partially_fillable=True`` because, with the volumes
+    chosen here, satisfying the tight leg-0 limit (r=1.005) requires
+    fractional fills on at least one leg.  Pinned non-partial bounds
+    would otherwise force LP-infeasibility despite Π r ≤ 1.
     """
     ring = (
-        _mk_order("o1", "A", "B", 1000, 1005),   # 0.5 % OTM
-        _mk_order("o2", "B", "C", 1000, 900),
-        _mk_order("o3", "C", "A", 1000, 900),
+        mk_partial_order("o1", "A", "B", 1000, 1005),   # 0.5 % OTM
+        mk_partial_order("o2", "B", "C", 1000, 900),
+        mk_partial_order("o3", "C", "A", 1000, 900),
     )
     tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
     result = solve_ring_lp(ring, tokens)
@@ -254,6 +259,42 @@ def test_lp_emits_floor_rounded_executed_for_partial_ring():
     assert result.received_short_fill[2] is False
 
 
+def test_rejection_reason_none_on_success():
+    """A feasible ring returns rejection_reason=None."""
+    ring = (
+        _mk_order("o1", "A", "B", 1000, 900),
+        _mk_order("o2", "B", "C", 1000, 900),
+        _mk_order("o3", "C", "A", 1000, 900),
+    )
+    tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
+    result = solve_ring_lp(ring, tokens)
+    assert result.feasible
+    assert result.rejection_reason is None
+
+
+def test_rejection_reason_rate_infeasible_when_product_above_one():
+    """Π r_i > 1 ⇒ rejection_reason == 'rate_infeasible'."""
+    # r1 = r2 = r3 = 1.5 → Π = 3.375 > 1
+    ring = (
+        _mk_order("o1", "A", "B", 1000, 1500),
+        _mk_order("o2", "B", "C", 1000, 1500),
+        _mk_order("o3", "C", "A", 1000, 1500),
+    )
+    tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
+    result = solve_ring_lp(ring, tokens)
+    assert not result.feasible
+    assert result.rejection_reason == "rate_infeasible"
+
+
+def test_rejection_reason_ring_too_short():
+    """Single-order 'ring' is rejected as too short."""
+    ring = (_mk_order("o1", "A", "B", 1000, 900),)
+    tokens = {"A": _mk_token(), "B": _mk_token()}
+    result = solve_ring_lp(ring, tokens)
+    assert not result.feasible
+    assert result.rejection_reason == "ring_too_short"
+
+
 def test_lp_full_fill_unchanged_when_no_fractional():
     """Regression: fully-filled ring has no short legs and received_short_fill is all False.
 
@@ -272,3 +313,137 @@ def test_lp_full_fill_unchanged_when_no_fractional():
     for i, x in enumerate(result.executed_amounts):
         assert x == ring[i].sell_amount, f"leg {i} should be fully filled"
     assert result.received_short_fill == (False, False, False)
+
+
+# ── tolerance_bps_per_leg: align with OTM admission ──────────────────────────
+
+
+def test_ring_feasible_under_per_leg_tolerance():
+    """4-leg ring with Π r_i ≈ 1.03 is feasible under 100 bps/leg slack.
+
+    Math: each r_i = 1007/1000 → log r_i ≈ 0.00698 → Σ log ≈ 0.0279.
+    Per-leg slack at 100 bps: 4 × ln(1.01) ≈ 0.03980 > 0.0279, so the
+    ring fits inside the admitted tolerance band.
+
+    Orders are ``partially_fillable=True`` so the LP has bounds slack to
+    land on the tolerance-degenerate fractional fill; non-partial orders
+    with these same volumes would be LP-infeasible by design (all legs
+    pinned to 1000 cannot satisfy the b > s constraint).
+    """
+    ring = (
+        mk_partial_order("o1", "A", "B", 1000, 1007),
+        mk_partial_order("o2", "B", "C", 1000, 1007),
+        mk_partial_order("o3", "C", "D", 1000, 1007),
+        mk_partial_order("o4", "D", "A", 1000, 1007),
+    )
+    tokens = {
+        "A": _mk_token(), "B": _mk_token(), "C": _mk_token(), "D": _mk_token(),
+    }
+    result = solve_ring_lp(ring, tokens, tolerance_bps_per_leg=100)
+    assert result.feasible, (
+        f"expected feasible under 100 bps/leg slack, got "
+        f"rejection_reason={result.rejection_reason!r}"
+    )
+
+
+def test_ring_rate_infeasible_under_strict_default():
+    """Regression guard: the same Π r_i > 1 ring is rejected with tol=0.
+
+    Locks in the contract that the default ``tolerance_bps_per_leg=0``
+    preserves the strict pre-relax behaviour — unaware callers see no
+    change.
+    """
+    ring = (
+        _mk_order("o1", "A", "B", 1000, 1007),
+        _mk_order("o2", "B", "C", 1000, 1007),
+        _mk_order("o3", "C", "D", 1000, 1007),
+        _mk_order("o4", "D", "A", 1000, 1007),
+    )
+    tokens = {
+        "A": _mk_token(), "B": _mk_token(), "C": _mk_token(), "D": _mk_token(),
+    }
+    result = solve_ring_lp(ring, tokens)  # default tolerance_bps_per_leg=0
+    assert not result.feasible
+    assert result.rejection_reason == "rate_infeasible"
+
+
+# ── Per-leg LP bounds for non-partial orders ─────────────────────────────────
+
+
+def test_non_partial_ring_with_volume_cliff_is_lp_infeasible():
+    """Non-partial ring with a volume mismatch is rejected at LP time.
+
+    Order 0 sells 1000 A but order 1 only sells 10 B.  With
+    ``partially_fillable=False`` everywhere, the LP pins x_0 = 1000 and
+    x_1 = 10, which cannot satisfy ``b_0 * x_0 <= s_0 * x_1`` (900 * 1000
+    !<= 1000 * 10).  Expected: ``feasible=False``, ``rejection_reason="lp_failed"``.
+
+    This previously slipped through the LP (which allocated x_0 ≈ 11
+    and triggered the downstream ``non_partial_short`` filter); pinning
+    bounds up front saves the wasted LP solve.
+    """
+    ring = (
+        _mk_order("o1", "A", "B", 1000, 900),
+        _mk_order("o2", "B", "C", 10, 9),
+        _mk_order("o3", "C", "A", 1000, 900),
+    )
+    tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
+    result = solve_ring_lp(ring, tokens)
+    assert not result.feasible
+    assert result.rejection_reason == "lp_failed", (
+        f"expected lp_failed (pinned bounds infeasible), got {result.rejection_reason!r}"
+    )
+
+
+def test_partial_ring_with_volume_cliff_solves_proportionally():
+    """Same volume cliff as above, but all-partial — LP solves by under-filling.
+
+    With ``partially_fillable=True`` the LP can allocate x_0 ≈ 11
+    proportionally to balance the cliff in leg 1.  This proves the
+    non-partial-vs-partial branch in the bounds logic is wired correctly.
+    """
+    ring = (
+        mk_partial_order("o1", "A", "B", 1000, 900),
+        mk_partial_order("o2", "B", "C", 10, 9),
+        mk_partial_order("o3", "C", "A", 1000, 900),
+    )
+    tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
+    result = solve_ring_lp(ring, tokens)
+    assert result.feasible, (
+        f"expected feasible (partial fills allowed), got {result.rejection_reason!r}"
+    )
+    # Leg 1 is the bottleneck and should fill fully (10 atoms).
+    assert result.executed_amounts[1] == 10
+    # Leg 0 should be heavily under-filled to balance leg 1's cliff.
+    assert result.executed_amounts[0] < 50
+    assert result.received_short_fill[0] is True
+
+
+def test_mixed_partial_and_non_partial_bounds_per_leg():
+    """Mixed ring: 1 partial + 2 non-partial — bounds applied per leg.
+
+    Leg 0 (non-partial, sell=1000) and leg 2 (non-partial, sell=1000)
+    are pinned to their sell_amounts; leg 1 (partial, sell=2000) is
+    free to under-fill.  The LP must balance the ring by setting
+    x_1 to the value that satisfies both pinned-leg constraints.
+    Limits are loose (r_i = 0.9) so a balanced full-fill on the
+    pinned legs is feasible.
+    """
+    ring = (
+        _mk_order("o1", "A", "B", 1000, 900),                  # non-partial
+        mk_partial_order("o2", "B", "C", 2000, 1800),          # partial
+        _mk_order("o3", "C", "A", 1000, 900),                  # non-partial
+    )
+    tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
+    result = solve_ring_lp(ring, tokens)
+    assert result.feasible, (
+        f"expected feasible, got {result.rejection_reason!r}"
+    )
+    # Non-partial legs must be pinned to sell_amount.
+    assert result.executed_amounts[0] == 1000
+    assert result.executed_amounts[2] == 1000
+    # Partial leg is free to under-fill (<= 2000).
+    assert 0 < result.executed_amounts[1] <= 2000
+    # Sanity: non-partial legs report no short-fill.
+    assert result.received_short_fill[0] is False
+    assert result.received_short_fill[2] is False

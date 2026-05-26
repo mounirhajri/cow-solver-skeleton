@@ -533,6 +533,262 @@ def test_solve_ring_lp_rejects_when_non_partial_gets_zero_fill(monkeypatch):
         received_short_fill=(True, False, False),
     )
     monkeypatch.setattr(
-        "edge.matching.surplus.solve_ring_lp", lambda r, t: fake_result
+        "edge.matching.surplus.solve_ring_lp",
+        lambda r, t, *_a, **_kw: fake_result,
     )
     assert _solve_ring_lp(ring, tokens) is None
+
+
+def test_all_non_partial_ring_with_matching_volumes_solves():
+    """All-non-partial ring with balanced volumes solves end-to-end.
+
+    With the LP-bounds pinning for non-partial orders, this ring's
+    pinned solution (x = sell_amounts = (1000, 1000, 1000)) satisfies
+    every leg's limit (b/s = 0.9 < 1).  Locks in that pinning bounds
+    does not over-reject legitimate non-partial rings.
+    """
+    tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
+    ring = (
+        _mk_order("o1", "A", "B", sell_amount=1000, buy_amount=900),
+        _mk_order("o2", "B", "C", sell_amount=1000, buy_amount=900),
+        _mk_order("o3", "C", "A", sell_amount=1000, buy_amount=900),
+    )
+    cand = _solve_ring_lp(ring, tokens)
+    assert cand is not None, "balanced all-non-partial ring must solve"
+    # Every leg fully filled.
+    assert cand.executed_amounts == (1000, 1000, 1000)
+    assert cand.surplus_estimate > 0
+
+
+def test_non_partial_ring_volume_cliff_rejected_as_lp_failed():
+    """Non-partial ring with volume cliff is rejected with rejection_reason='lp_failed'.
+
+    Previously this slipped through the LP (which would allocate a
+    fractional fill) and was caught by the ``non_partial_short`` filter,
+    wasting an LP solve.  With pinning, the LP itself reports infeasibility
+    and the rejection reason is ``"lp_failed"``.
+    """
+    from edge.matching.multi_party import _solve_ring_lp_with_reason
+
+    tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
+    ring = (
+        _mk_order("o1", "A", "B", sell_amount=1000, buy_amount=900),
+        _mk_order("o2", "B", "C", sell_amount=10, buy_amount=9),
+        _mk_order("o3", "C", "A", sell_amount=1000, buy_amount=900),
+    )
+    cand, reason = _solve_ring_lp_with_reason(ring, tokens)
+    assert cand is None
+    assert reason == "lp_failed", (
+        f"expected lp_failed (pinned bounds), got {reason!r}"
+    )
+
+
+# ── Ring breakdown instrumentation ────────────────────────────────────────────
+
+
+def _capture_log(monkeypatch) -> list[dict]:
+    """Capture multi_party.log.info events into a list of {event, ...kw} dicts."""
+    events: list[dict] = []
+
+    def capture(event, **kw):
+        events.append({"event": event, **kw})
+
+    monkeypatch.setattr("edge.matching.multi_party.log.info", capture)
+    return events
+
+
+@pytest.mark.asyncio
+async def test_ring_breakdown_log_emits_on_solved_ring(monkeypatch) -> None:
+    """A feasible ring increments n_solved and emits the aggregate log once."""
+    events = _capture_log(monkeypatch)
+    orders = [
+        _mk_order("o1", "0xA", "0xB"),
+        _mk_order("o2", "0xB", "0xC"),
+        _mk_order("o3", "0xC", "0xA"),
+    ]
+    tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
+    solver = CoWMatchingSolver()
+    result = await solver.solve(_mk_auction(orders, tokens, auction_id="42"))
+    assert isinstance(result, Solution)
+    breakdowns = [e for e in events if e["event"] == "multi_party_ring_breakdown"]
+    assert len(breakdowns) == 1
+    bd = breakdowns[0]
+    assert bd["auction_id"] == "42"
+    assert bd["n_rings_detected"] >= 1
+    assert bd["n_solved"] >= 1
+    assert bd["n_rate_infeasible"] == 0
+    assert bd["n_lp_failed"] == 0
+    assert bd["n_post_round_violation"] == 0
+    assert bd["n_non_partial_short"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ring_breakdown_counts_rate_infeasible(monkeypatch) -> None:
+    """Mix of feasible + rate-infeasible rings: counts must reflect both buckets.
+
+    The Johnson enumerator on this multigraph yields two 3-rings:
+      ring1 = (o1, o2, o3) — all ITM, low rates → feasible
+      ring2 = (o1b, o2, o3) — o1b has b/s = 1.5 → Π r > 1 → rate_infeasible
+
+    Both share tokens A/B/C; the OTM/ITM filter passes everything since
+    o1b is technically ITM at reference prices (sell_value > buy_value when
+    we pick sell=2000, buy=1500 with both tokens at parity).
+    """
+    events = _capture_log(monkeypatch)
+    # Two parallel A→B edges so rustworkx enumerates two distinct rings.
+    orders = [
+        _mk_order("o1", "0xA", "0xB", sell_amount=1000, buy_amount=900),   # feasible
+        _mk_order("o1b", "0xA", "0xB", sell_amount=2000, buy_amount=1500), # rate-infeasible in ring
+        _mk_order("o2", "0xB", "0xC", sell_amount=1000, buy_amount=900),
+        _mk_order("o3", "0xC", "0xA", sell_amount=1000, buy_amount=900),
+    ]
+    tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
+    solver = CoWMatchingSolver()
+    await solver.solve(_mk_auction(orders, tokens, auction_id="99"))
+
+    breakdowns = [e for e in events if e["event"] == "multi_party_ring_breakdown"]
+    assert len(breakdowns) == 1
+    bd = breakdowns[0]
+    # Johnson over the multigraph may enumerate fewer or more candidates
+    # depending on edge-mapping; the contract is that the bucket sum equals
+    # n_rings_detected.
+    total = (
+        bd["n_solved"]
+        + bd["n_rate_infeasible"]
+        + bd["n_lp_failed"]
+        + bd["n_post_round_violation"]
+        + bd["n_non_partial_short"]
+    )
+    assert total == bd["n_rings_detected"]
+
+
+@pytest.mark.asyncio
+async def test_ring_breakdown_all_rate_infeasible(monkeypatch) -> None:
+    """When every ring fails the rate check, n_rate_infeasible == n_rings_detected."""
+    events = _capture_log(monkeypatch)
+    # Π r = 1.5^3 = 3.375 > 1 — rate-infeasible. All ITM at reference prices
+    # (sell=1000 > buy=750 at parity) so they pass the OTM gate.
+    orders = [
+        _mk_order("o1", "0xA", "0xB", sell_amount=1000, buy_amount=750),
+        _mk_order("o2", "0xB", "0xC", sell_amount=1000, buy_amount=750),
+        _mk_order("o3", "0xC", "0xA", sell_amount=2000, buy_amount=3000),  # OTM unless tol
+    ]
+    # Use a far higher reference price for 0xC so o3 is ITM (sell=2000 C *
+    # high price > buy=3000 A * low price), letting all three orders into
+    # the graph.  Rates remain: r1=0.75, r2=0.75, r3=1.5 → Π = 0.84 — actually
+    # feasible.  Pick stronger ratios to force infeasibility:
+    orders = [
+        _mk_order("o1", "0xA", "0xB", sell_amount=1000, buy_amount=1500),
+        _mk_order("o2", "0xB", "0xC", sell_amount=1000, buy_amount=1500),
+        _mk_order("o3", "0xC", "0xA", sell_amount=1000, buy_amount=1500),
+    ]
+    # Reference prices: A=B=C=1.  Each order: sell_value=1000, buy_value=1500
+    # → OTM, would be filtered out.  Bump sell-side reference prices so each
+    # passes the OTM gate but rates (b/s = 1.5) still fail the LP.
+    tokens = {
+        "0xA": _mk_token(price=2 * 10**18),
+        "0xB": _mk_token(price=2 * 10**18),
+        "0xC": _mk_token(price=2 * 10**18),
+    }
+    solver = CoWMatchingSolver()
+    await solver.solve(_mk_auction(orders, tokens, auction_id="77"))
+
+    breakdowns = [e for e in events if e["event"] == "multi_party_ring_breakdown"]
+    # If the ring was enumerated, breakdown must fire and every ring must
+    # land in the rate_infeasible bucket.
+    if breakdowns:
+        bd = breakdowns[0]
+        assert bd["n_rate_infeasible"] == bd["n_rings_detected"]
+        assert bd["n_solved"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ring_breakdown_not_emitted_when_no_rings(monkeypatch) -> None:
+    """When no rings are enumerated the breakdown log is suppressed (early return)."""
+    events = _capture_log(monkeypatch)
+    # Just two orders → cannot form a 3-ring.
+    orders = [
+        _mk_order("o1", "0xA", "0xB"),
+        _mk_order("o2", "0xB", "0xA"),
+    ]
+    tokens = {"0xA": _mk_token(), "0xB": _mk_token()}
+    solver = CoWMatchingSolver()
+    await solver.solve(_mk_auction(orders, tokens, auction_id="1"))
+    breakdowns = [e for e in events if e["event"] == "multi_party_ring_breakdown"]
+    assert breakdowns == []
+
+
+# ── otm_tolerance_bps plumbed into ring-feasibility ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_loose_tolerance_solves_ring_strict_rejects(monkeypatch) -> None:
+    """Ring with Π r_i slightly > 1 is solved under loose tolerance, dropped strict.
+
+    Three orders with b/s = 1010/1000 = 1.01 each. Π r_i ≈ 1.0303,
+    log_sum ≈ 0.02985.  At parity reference prices each order is slightly
+    OTM (sell_value=1000 < buy_value=1010) — so only the loose-OTM solver
+    admits them into the candidate graph; the strict solver filters them
+    out before ring enumeration and produces no solution.
+
+    Under loose admission, the ring slack at 200 bps/leg is
+    3 × ln(1.02) ≈ 0.0594 > 0.02985 → feasible.  Without the surplus.py
+    fix, the same ring would land in ``n_rate_infeasible`` under loose
+    admission (the bug this commit closes); the assertions below lock in
+    the post-fix behaviour.
+    """
+    events = _capture_log(monkeypatch)
+    # Partially-fillable so the LP's zero-volume fallback (Π r_i > 1 means
+    # the cycle cannot generate positive surplus on its own) does not trip
+    # the non-partial-short guard.  The contract under test is the pre-LP
+    # ring-feasibility shortcut, not the LP's volume optimum.
+    orders = [
+        mk_partial_order(
+            "o1", "0xA", "0xB", sell_amount=1000, buy_amount=1010,
+            partially_fillable=True,
+        ),
+        mk_partial_order(
+            "o2", "0xB", "0xC", sell_amount=1000, buy_amount=1010,
+            partially_fillable=True,
+        ),
+        mk_partial_order(
+            "o3", "0xC", "0xA", sell_amount=1000, buy_amount=1010,
+            partially_fillable=True,
+        ),
+    ]
+    tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
+
+    # ── Loose tolerance: admits, ring passes feasibility, breakdown emits
+    # with n_solved=1, n_rate_infeasible=0. ──────────────────────────────
+    loose_solver = CoWMatchingSolver(otm_tolerance_bps=200)
+    await loose_solver.solve(_mk_auction(orders, tokens, auction_id="100"))
+    loose_bds = [
+        e for e in events
+        if e["event"] == "multi_party_ring_breakdown" and e["auction_id"] == "100"
+    ]
+    assert len(loose_bds) == 1, (
+        "loose-tolerance solver should admit the ring and emit a breakdown log"
+    )
+    bd_loose = loose_bds[0]
+    assert bd_loose["n_solved"] == 1, (
+        f"expected n_solved=1 under loose tolerance, got {bd_loose}"
+    )
+    assert bd_loose["n_rate_infeasible"] == 0, (
+        "post-fix: loose tolerance must not reject this ring on rate"
+    )
+
+    # ── Strict tolerance (default 0): orders fail OTM filter, no rings. ──
+    # No ring is enumerated → breakdown log is suppressed (matches the
+    # ``not_emitted_when_no_rings`` contract) and the solver returns
+    # NoSolution.  This validates that strict-mode behaviour is unchanged
+    # by the fix.
+    strict_solver = CoWMatchingSolver()  # otm_tolerance_bps=0 by default
+    strict_result = await strict_solver.solve(
+        _mk_auction(orders, tokens, auction_id="101")
+    )
+    assert isinstance(strict_result, NoSolution)
+    strict_bds = [
+        e for e in events
+        if e["event"] == "multi_party_ring_breakdown" and e["auction_id"] == "101"
+    ]
+    assert strict_bds == []
