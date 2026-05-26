@@ -254,6 +254,42 @@ def test_lp_emits_floor_rounded_executed_for_partial_ring():
     assert result.received_short_fill[2] is False
 
 
+def test_rejection_reason_none_on_success():
+    """A feasible ring returns rejection_reason=None."""
+    ring = (
+        _mk_order("o1", "A", "B", 1000, 900),
+        _mk_order("o2", "B", "C", 1000, 900),
+        _mk_order("o3", "C", "A", 1000, 900),
+    )
+    tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
+    result = solve_ring_lp(ring, tokens)
+    assert result.feasible
+    assert result.rejection_reason is None
+
+
+def test_rejection_reason_rate_infeasible_when_product_above_one():
+    """Π r_i > 1 ⇒ rejection_reason == 'rate_infeasible'."""
+    # r1 = r2 = r3 = 1.5 → Π = 3.375 > 1
+    ring = (
+        _mk_order("o1", "A", "B", 1000, 1500),
+        _mk_order("o2", "B", "C", 1000, 1500),
+        _mk_order("o3", "C", "A", 1000, 1500),
+    )
+    tokens = {"A": _mk_token(), "B": _mk_token(), "C": _mk_token()}
+    result = solve_ring_lp(ring, tokens)
+    assert not result.feasible
+    assert result.rejection_reason == "rate_infeasible"
+
+
+def test_rejection_reason_ring_too_short():
+    """Single-order 'ring' is rejected as too short."""
+    ring = (_mk_order("o1", "A", "B", 1000, 900),)
+    tokens = {"A": _mk_token(), "B": _mk_token()}
+    result = solve_ring_lp(ring, tokens)
+    assert not result.feasible
+    assert result.rejection_reason == "ring_too_short"
+
+
 def test_lp_full_fill_unchanged_when_no_fractional():
     """Regression: fully-filled ring has no short legs and received_short_fill is all False.
 
