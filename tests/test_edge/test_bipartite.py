@@ -1,7 +1,7 @@
 """Tests for bipartite CoW matcher."""
 import pytest
 
-from edge.matching.bipartite import BipartiteMatcher
+from edge.matching.bipartite import GHOST_OWNER_BLACKLIST, BipartiteMatcher
 from src.models.auction import Auction
 from src.models.order import Order
 from src.models.solution import Solution
@@ -335,6 +335,109 @@ async def test_bipartite_skips_pair_when_both_non_partial_and_volumes_differ():
     result = await m.solve(auction)
     assert isinstance(result, NoSolution), (
         "Expected NoSolution for non-partial volume mismatch, got a match"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ghost-owner blacklist filter tests (2026-05-26)
+# ---------------------------------------------------------------------------
+
+_GHOST_OWNER = next(iter(GHOST_OWNER_BLACKLIST))  # "0x58e41e53..."
+_LEGIT_OWNER = "0x" + "b" * 40
+
+
+def _mk_order_with_owner(
+    uid: str,
+    sell_token: str,
+    buy_token: str,
+    sell_amount: int,
+    buy_amount: int,
+    owner: str,
+) -> Order:
+    return Order(
+        uid=uid,
+        sellToken=sell_token,
+        buyToken=buy_token,
+        sellAmount=sell_amount,
+        buyAmount=buy_amount,
+        feePolicies=[],
+        validTo=999999,
+        kind="sell",
+        owner=owner,
+        partiallyFillable=False,
+        **{"class": "limit"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_blacklisted_owner_orders_are_filtered(monkeypatch):
+    """Orders signed by a blacklisted owner are dropped before bipartite matching.
+
+    Auction has two sell/buy pairs that would both match bipartite-style:
+      - Legit pair  (oL_sell, oL_buy):  owner = non-blacklisted  → should match
+      - Ghost pair  (oG_sell, oG_buy):  owner = blacklisted       → must NOT match
+
+    Also verifies the ghost-filter log fires with n_filtered == 2.
+    """
+    calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "edge.matching.bipartite.log.info",
+        lambda event, **kw: calls.append((event, kw)),
+    )
+
+    oL_sell = _mk_order_with_owner("oL_sell", "0xa", "0xb", 1000, 800, _LEGIT_OWNER)
+    oL_buy  = _mk_order_with_owner("oL_buy",  "0xb", "0xa", 1000, 800, _LEGIT_OWNER)
+    oG_sell = _mk_order_with_owner("oG_sell", "0xa", "0xb", 1000, 800, _GHOST_OWNER)
+    oG_buy  = _mk_order_with_owner("oG_buy",  "0xb", "0xa", 1000, 800, _GHOST_OWNER)
+
+    m = BipartiteMatcher()
+    result = await m.solve(_mk_auction([oL_sell, oL_buy, oG_sell, oG_buy]))
+
+    assert isinstance(result, Solution), "Legit pair should still produce a solution"
+    trade_uids = {t.order_uid for t in result.trades}
+    assert "oL_sell" in trade_uids and "oL_buy" in trade_uids, "Legit pair must match"
+    assert "oG_sell" not in trade_uids and "oG_buy" not in trade_uids, (
+        "Ghost-owner pair must not appear in trades"
+    )
+
+    # Ghost-filter log must have fired with n_filtered == 2
+    filter_events = [kw for ev, kw in calls if ev == "bipartite_ghost_owner_filter"]
+    assert filter_events, "bipartite_ghost_owner_filter log was not emitted"
+    assert filter_events[0]["n_filtered"] == 2, (
+        f"Expected n_filtered=2, got {filter_events[0]['n_filtered']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_blacklisted_owners_match_normally(monkeypatch):
+    """Regression guard: no blacklisted owners → ghost filter does not fire, matches work.
+
+    Same auction shape as the previous test but ALL orders owned by a legit address.
+    Both pairs should match and the ghost-filter log must NOT be emitted.
+    """
+    calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "edge.matching.bipartite.log.info",
+        lambda event, **kw: calls.append((event, kw)),
+    )
+
+    oA_sell = _mk_order_with_owner("oA_sell", "0xa", "0xb", 1000, 800, _LEGIT_OWNER)
+    oA_buy  = _mk_order_with_owner("oA_buy",  "0xb", "0xa", 1000, 800, _LEGIT_OWNER)
+    oB_sell = _mk_order_with_owner("oB_sell", "0xa", "0xb", 500,  400, _LEGIT_OWNER)
+    oB_buy  = _mk_order_with_owner("oB_buy",  "0xb", "0xa", 500,  400, _LEGIT_OWNER)
+
+    m = BipartiteMatcher()
+    result = await m.solve(_mk_auction([oA_sell, oA_buy, oB_sell, oB_buy]))
+
+    assert isinstance(result, Solution), "All-legit auction must produce a solution"
+    assert len(result.trades) == 4, (
+        f"Expected 4 trades (both pairs), got {len(result.trades)}"
+    )
+
+    # Ghost-filter log must NOT have been emitted (n_filtered == 0 → no log)
+    filter_events = [ev for ev, _ in calls if ev == "bipartite_ghost_owner_filter"]
+    assert not filter_events, (
+        "bipartite_ghost_owner_filter must not fire when no blacklisted owners present"
     )
 
 
