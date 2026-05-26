@@ -43,7 +43,38 @@ This doc is the single source of truth for "what's running, what's broken, what'
 
 Post-fix verification (2026-05-25 18:00 UTC, clean TRUNCATE baseline): bipartite max score ≤ 0.0000 ETH (cap working), naive scored=0 (NULL enforced), multi-party honest no_solution, router-v2 + composer ~6 ETH (legit V3 AMM arb on persistent loose-limit orders). All 5 strategies persisting rows; no timeouts.
 
-### 1.4 Raw shadow data vs. aggregate analytics
+### 1.4 Dynamic Ghost-Order Detection (2026-05-26)
+
+**Discovery:** the clean post-TRUNCATE baseline above was **99.4% ghost-polluted**. SQL forensics (n=524 bipartite solutions, 7d window) found:
+- 100% ghost trades: 100 solutions (19.1%)
+- Mixed (≥1 ghost): 421 solutions (80.3%)
+- Ghost-clean: 3 solutions (0.6%)
+
+A "ghost-order" is a CoW orderbook order that no live solver ever settles — typically EIP-1271 contracts that reject signature validation at settle-time, abandoned bots, or addresses with broken approval/balance.  CoW Protocol broadcasts them to all solvers regardless; real solvers filter via onchain simulation.  Our paper-trading bipartite matcher matched against them, producing CIP-14-valid scores that no AMM could realise.
+
+**Effect on prior baseline numbers:**
+- Avg score ghost-involved: 0.005088 ETH
+- Avg score ghost-clean: 0.000005 ETH (1000× lower)
+- → claimed "median 0.008 ETH" was ~99% ghost-driven
+- → claimed "12.9% bipartite win-rate (n=101)" cannot be reproduced on ghost-clean data (true n=3, statistically meaningless)
+- → §4.1 `estimate_economics` €45/Mo NET ran on polluted data — needs re-evaluation after detector rolls out
+
+**Fix shipped 2026-05-26:**
+
+| Commit | Layer | What |
+|---|---|---|
+| `7c4ad9e3b821` | migration | new table `ghost_orders` (uid PK, owner, sell/buy_token, n_auctions_seen, first/last_seen_at, detected_at, last_refreshed_at) |
+| (this commit) | script | `scripts/refresh_ghost_set.py` — detects UIDs seen ≥20 in 24h with 0 winner-settlements in 7d; upserts to `ghost_orders`; self-corrects false-positives by re-evaluating each cycle; stale-cleanup after 14d |
+| (this commit) | sidecar | `docker-compose.yml` — new `ghost-refresh` container, `--loop` mode, 30-min interval |
+| (this commit) | detector | `edge/matching/ghost_detector.py` — `DynamicGhostDetector` with 5-min TTL cache, graceful fallback on DB errors |
+| (this commit) | matcher | `edge/matching/bipartite.py` — injects ghost-detector filter BEFORE static `GHOST_OWNER_BLACKLIST` (kept as defense-in-depth) and RF-filter |
+| (this commit) | orchestrator | `src/solver/orchestrator.py` — wires `DynamicGhostDetector(session_factory)` into both `BipartiteMatcher` instantiation points |
+
+**False-positive analysis on detection rule (`seen ≥ 20 in 24h, 0 settled in 7d`):** verified at 0.8% empirically (10 settled UIDs of 1257 candidates).  18 of those 23 settlement-FPs sit at 100+ visibility — irreducible slow-fill institutional orders that no visibility-based heuristic can separate from ghosts.  The detector's self-correction step removes these from `ghost_orders` on the next refresh cycle after they settle, bounding their FP-lifetime to ~30 min.
+
+**Conceptual gap that remains:** the matcher still doesn't run onchain simulation, which is what real solvers (helixbox, kaisersolver, wraxyn) use to deterministically catch ghosts.  Phase B will add `eth_call`-based pre-flight before going live — needed regardless of the dynamic detector because settlement TXs that revert burn gas.
+
+### 1.5 Raw shadow data vs. aggregate analytics
 
 `shadow_solutions.our_score_wei` is a PER-ATTEMPT score. The same persistent order (e.g. an off-market loose-limit buy that keeps appearing in successive auctions) can be matched by the same strategy across many auctions — each emission is a separate row with its own score, but only ONE such fill could actually settle on-chain.
 
@@ -154,6 +185,8 @@ Naive's score is NULL'd at persistence (`src/shadow/persist.py`) because the pri
 ## 4. Realistic Revenue Expectations
 
 **Important:** Earlier Memory/spec projections of €1090-2600/mo NET were based on inflated phantom scores that did not survive the 2026-05-25 bipartite + scoring + cap fixes. The numbers below are from the clean post-fix shadow baseline.
+
+**Pending re-evaluation (2026-05-26):** the figures in §4.1–4.2 were computed BEFORE the ghost-detector deploy (see §1.4) — meaning 99.4% of bipartite contributions came from non-fillable ghost-pairs.  Once the detector has run for 24+ hours on production data, `estimate_economics` should be re-run.  The likely outcome is that the bipartite floor drops further (its 8 of 9 attributed wins were almost certainly ghost-pollution); router-v2 and multi-party numbers are independent of ghosts and unchanged.
 
 ### 4.1 Verified Conservative Floor (`estimate_economics --days 1`, n=9 after dedup + p99 outlier-cap)
 

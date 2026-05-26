@@ -161,3 +161,29 @@ class ShadowCompetitor(Base):
             "auction_id", "solver_address", name="uq_shadow_competitors_auction_solver"
         ),
     )
+
+
+class GhostOrder(Base):
+    """Order UIDs identified as ghost-orders.
+
+    A ghost-order is an order signed and broadcast through the CoW orderbook
+    that no live solver ever settles — typically EIP-1271 contracts that
+    reject signature validation at settle-time, or addresses without
+    sufficient approval/balance.  Populated by ``scripts/refresh_ghost_set.py``
+    and read by ``edge.matching.bipartite.DynamicGhostDetector`` to filter
+    these UIDs out before pair-matching.
+    """
+
+    __tablename__ = "ghost_orders"
+
+    uid: Mapped[str] = mapped_column(String(114), primary_key=True)
+    owner: Mapped[str] = mapped_column(String(42), index=True)
+    sell_token: Mapped[str] = mapped_column(String(42))
+    buy_token: Mapped[str] = mapped_column(String(42))
+    n_auctions_seen: Mapped[int] = mapped_column(Integer)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    last_refreshed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
+    )

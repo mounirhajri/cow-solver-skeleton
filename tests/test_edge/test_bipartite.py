@@ -566,3 +566,104 @@ def test_bipartite_score_proportional_to_executed():
     assert abs(score_half * 2 - score_full) <= 1, (
         f"Surplus not proportional: full={score_full}, half={score_half}, 2*half={score_half * 2}"
     )
+
+
+# ---------------------------------------------------------------------------
+# DynamicGhostDetector integration tests (2026-05-26)
+# ---------------------------------------------------------------------------
+
+
+class _FakeGhostDetector:
+    """In-memory GhostDetector stub for tests — no DB required."""
+
+    def __init__(self, ghost_uids: set[str]) -> None:
+        self._ghost_uids = ghost_uids
+
+    async def is_ghost(self, order: Order) -> bool:
+        return order.uid in self._ghost_uids
+
+
+@pytest.mark.asyncio
+async def test_dynamic_ghost_detector_filters_uids(monkeypatch):
+    """UIDs flagged by the injected GhostDetector are dropped before matching.
+
+    Mirrors the static-blacklist test but uses the dynamic-detector path.
+    Two pairs in the auction: one with UIDs in the ghost set, one without.
+    Only the non-ghost pair should appear in the result.
+    """
+    calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "edge.matching.bipartite.log.info",
+        lambda event, **kw: calls.append((event, kw)),
+    )
+
+    oG_sell = _mk_order_with_owner("oG_sell", "0xa", "0xb", 1000, 800, _LEGIT_OWNER)
+    oG_buy  = _mk_order_with_owner("oG_buy",  "0xb", "0xa", 1000, 800, _LEGIT_OWNER)
+    oL_sell = _mk_order_with_owner("oL_sell", "0xa", "0xb", 500, 400, _LEGIT_OWNER)
+    oL_buy  = _mk_order_with_owner("oL_buy",  "0xb", "0xa", 500, 400, _LEGIT_OWNER)
+
+    detector = _FakeGhostDetector(ghost_uids={"oG_sell", "oG_buy"})
+    m = BipartiteMatcher(ghost_detector=detector)
+    result = await m.solve(_mk_auction([oG_sell, oG_buy, oL_sell, oL_buy]))
+
+    assert isinstance(result, Solution), "Non-ghost pair should still match"
+    trade_uids = {t.order_uid for t in result.trades}
+    assert "oL_sell" in trade_uids and "oL_buy" in trade_uids
+    assert "oG_sell" not in trade_uids and "oG_buy" not in trade_uids
+
+    filter_events = [kw for ev, kw in calls if ev == "bipartite_dynamic_ghost_filter"]
+    assert filter_events, "bipartite_dynamic_ghost_filter log was not emitted"
+    assert filter_events[0]["n_filtered"] == 2
+
+
+@pytest.mark.asyncio
+async def test_dynamic_ghost_detector_none_is_noop(monkeypatch):
+    """No detector injected → matcher behaves exactly like the pre-detector code.
+
+    Regression guard for the public skeleton / tests that instantiate
+    ``BipartiteMatcher()`` without arguments.
+    """
+    calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "edge.matching.bipartite.log.info",
+        lambda event, **kw: calls.append((event, kw)),
+    )
+
+    o1 = _mk_order_with_owner("o1", "0xa", "0xb", 1000, 800, _LEGIT_OWNER)
+    o2 = _mk_order_with_owner("o2", "0xb", "0xa", 1000, 800, _LEGIT_OWNER)
+
+    m = BipartiteMatcher()  # no ghost_detector
+    result = await m.solve(_mk_auction([o1, o2]))
+    assert isinstance(result, Solution)
+
+    filter_events = [ev for ev, _ in calls if ev == "bipartite_dynamic_ghost_filter"]
+    assert not filter_events, (
+        "Dynamic ghost-filter must not fire when no detector is provided"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dynamic_ghost_detector_all_filtered_returns_no_solution(monkeypatch):
+    """Every UID flagged → < 2 orders remain → short-circuit to NoSolution.
+
+    Verifies the matcher returns before reaching the static blacklist + RF-filter.
+    """
+    calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "edge.matching.bipartite.log.info",
+        lambda event, **kw: calls.append((event, kw)),
+    )
+
+    o1 = _mk_order_with_owner("o1", "0xa", "0xb", 1000, 800, _LEGIT_OWNER)
+    o2 = _mk_order_with_owner("o2", "0xb", "0xa", 1000, 800, _LEGIT_OWNER)
+
+    detector = _FakeGhostDetector(ghost_uids={"o1", "o2"})
+    m = BipartiteMatcher(ghost_detector=detector)
+    result = await m.solve(_mk_auction([o1, o2]))
+
+    assert isinstance(result, NoSolution)
+    events = [ev for ev, _ in calls]
+    assert "bipartite_dynamic_ghost_filter" in events
+    assert "bipartite_rf_filter" not in events, (
+        "RF-filter must not run when ghost-filter short-circuited"
+    )

@@ -30,6 +30,20 @@ services:
     volumes:
       - ./shadow_data:/data
 
+  ghost-refresh:
+    build: .
+    image: cow-solver:dev
+    container_name: cow-ghost-refresh
+    restart: unless-stopped
+    command: ["python", "-m", "scripts.refresh_ghost_set", "--loop"]
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./shadow_data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
   redis:
     image: redis:7-alpine
     container_name: cow-solver-redis
