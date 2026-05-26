@@ -308,3 +308,50 @@ def test_lp_full_fill_unchanged_when_no_fractional():
     for i, x in enumerate(result.executed_amounts):
         assert x == ring[i].sell_amount, f"leg {i} should be fully filled"
     assert result.received_short_fill == (False, False, False)
+
+
+# ── tolerance_bps_per_leg: align with OTM admission ──────────────────────────
+
+
+def test_ring_feasible_under_per_leg_tolerance():
+    """4-leg ring with Π r_i ≈ 1.03 is feasible under 100 bps/leg slack.
+
+    Math: each r_i = 1007/1000 → log r_i ≈ 0.00698 → Σ log ≈ 0.0279.
+    Per-leg slack at 100 bps: 4 × ln(1.01) ≈ 0.03980 > 0.0279, so the
+    ring fits inside the admitted tolerance band.
+    """
+    ring = (
+        _mk_order("o1", "A", "B", 1000, 1007),
+        _mk_order("o2", "B", "C", 1000, 1007),
+        _mk_order("o3", "C", "D", 1000, 1007),
+        _mk_order("o4", "D", "A", 1000, 1007),
+    )
+    tokens = {
+        "A": _mk_token(), "B": _mk_token(), "C": _mk_token(), "D": _mk_token(),
+    }
+    result = solve_ring_lp(ring, tokens, tolerance_bps_per_leg=100)
+    assert result.feasible, (
+        f"expected feasible under 100 bps/leg slack, got "
+        f"rejection_reason={result.rejection_reason!r}"
+    )
+
+
+def test_ring_rate_infeasible_under_strict_default():
+    """Regression guard: the same Π r_i > 1 ring is rejected with tol=0.
+
+    Locks in the contract that the default ``tolerance_bps_per_leg=0``
+    preserves the strict pre-relax behaviour — unaware callers see no
+    change.
+    """
+    ring = (
+        _mk_order("o1", "A", "B", 1000, 1007),
+        _mk_order("o2", "B", "C", 1000, 1007),
+        _mk_order("o3", "C", "D", 1000, 1007),
+        _mk_order("o4", "D", "A", 1000, 1007),
+    )
+    tokens = {
+        "A": _mk_token(), "B": _mk_token(), "C": _mk_token(), "D": _mk_token(),
+    }
+    result = solve_ring_lp(ring, tokens)  # default tolerance_bps_per_leg=0
+    assert not result.feasible
+    assert result.rejection_reason == "rate_infeasible"

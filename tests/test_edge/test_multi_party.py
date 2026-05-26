@@ -533,7 +533,8 @@ def test_solve_ring_lp_rejects_when_non_partial_gets_zero_fill(monkeypatch):
         received_short_fill=(True, False, False),
     )
     monkeypatch.setattr(
-        "edge.matching.surplus.solve_ring_lp", lambda r, t: fake_result
+        "edge.matching.surplus.solve_ring_lp",
+        lambda r, t, *_a, **_kw: fake_result,
     )
     assert _solve_ring_lp(ring, tokens) is None
 
@@ -671,3 +672,79 @@ async def test_ring_breakdown_not_emitted_when_no_rings(monkeypatch) -> None:
     await solver.solve(_mk_auction(orders, tokens, auction_id="1"))
     breakdowns = [e for e in events if e["event"] == "multi_party_ring_breakdown"]
     assert breakdowns == []
+
+
+# ── otm_tolerance_bps plumbed into ring-feasibility ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_loose_tolerance_solves_ring_strict_rejects(monkeypatch) -> None:
+    """Ring with Π r_i slightly > 1 is solved under loose tolerance, dropped strict.
+
+    Three orders with b/s = 1010/1000 = 1.01 each. Π r_i ≈ 1.0303,
+    log_sum ≈ 0.02985.  At parity reference prices each order is slightly
+    OTM (sell_value=1000 < buy_value=1010) — so only the loose-OTM solver
+    admits them into the candidate graph; the strict solver filters them
+    out before ring enumeration and produces no solution.
+
+    Under loose admission, the ring slack at 200 bps/leg is
+    3 × ln(1.02) ≈ 0.0594 > 0.02985 → feasible.  Without the surplus.py
+    fix, the same ring would land in ``n_rate_infeasible`` under loose
+    admission (the bug this commit closes); the assertions below lock in
+    the post-fix behaviour.
+    """
+    events = _capture_log(monkeypatch)
+    # Partially-fillable so the LP's zero-volume fallback (Π r_i > 1 means
+    # the cycle cannot generate positive surplus on its own) does not trip
+    # the non-partial-short guard.  The contract under test is the pre-LP
+    # ring-feasibility shortcut, not the LP's volume optimum.
+    orders = [
+        mk_partial_order(
+            "o1", "0xA", "0xB", sell_amount=1000, buy_amount=1010,
+            partially_fillable=True,
+        ),
+        mk_partial_order(
+            "o2", "0xB", "0xC", sell_amount=1000, buy_amount=1010,
+            partially_fillable=True,
+        ),
+        mk_partial_order(
+            "o3", "0xC", "0xA", sell_amount=1000, buy_amount=1010,
+            partially_fillable=True,
+        ),
+    ]
+    tokens = {"0xA": _mk_token(), "0xB": _mk_token(), "0xC": _mk_token()}
+
+    # ── Loose tolerance: admits, ring passes feasibility, breakdown emits
+    # with n_solved=1, n_rate_infeasible=0. ──────────────────────────────
+    loose_solver = CoWMatchingSolver(otm_tolerance_bps=200)
+    await loose_solver.solve(_mk_auction(orders, tokens, auction_id="100"))
+    loose_bds = [
+        e for e in events
+        if e["event"] == "multi_party_ring_breakdown" and e["auction_id"] == "100"
+    ]
+    assert len(loose_bds) == 1, (
+        "loose-tolerance solver should admit the ring and emit a breakdown log"
+    )
+    bd_loose = loose_bds[0]
+    assert bd_loose["n_solved"] == 1, (
+        f"expected n_solved=1 under loose tolerance, got {bd_loose}"
+    )
+    assert bd_loose["n_rate_infeasible"] == 0, (
+        "post-fix: loose tolerance must not reject this ring on rate"
+    )
+
+    # ── Strict tolerance (default 0): orders fail OTM filter, no rings. ──
+    # No ring is enumerated → breakdown log is suppressed (matches the
+    # ``not_emitted_when_no_rings`` contract) and the solver returns
+    # NoSolution.  This validates that strict-mode behaviour is unchanged
+    # by the fix.
+    strict_solver = CoWMatchingSolver()  # otm_tolerance_bps=0 by default
+    strict_result = await strict_solver.solve(
+        _mk_auction(orders, tokens, auction_id="101")
+    )
+    assert isinstance(strict_result, NoSolution)
+    strict_bds = [
+        e for e in events
+        if e["event"] == "multi_party_ring_breakdown" and e["auction_id"] == "101"
+    ]
+    assert strict_bds == []
