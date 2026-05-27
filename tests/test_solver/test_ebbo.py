@@ -15,8 +15,6 @@ Behaviour the tests lock in:
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from src.models.auction import Auction
@@ -69,29 +67,22 @@ def _solution(trades: list[Trade], prices: dict[str, int]) -> Solution:
     return Solution(id=1, prices=prices, trades=trades, interactions=[])
 
 
-def _hop(amount_out: int) -> Any:
-    """Minimal duck for HopQuote used at end of path; only amount_out read."""
-
-    class _H:
-        def __init__(self, ao: int) -> None:
-            self.amount_out = ao
-
-    return _H(amount_out)
-
-
 @pytest.fixture
 def quoter(monkeypatch):
-    """Replace quote_best_path with a tunable mock keyed by (sell, buy, amount)."""
+    """Replace _quote_best_exact_input with a tunable mock keyed by
+    (sell, buy, amount_in). Returns the buy-token output for the given
+    sell-token input, or None when no route exists.
+
+    Mirrors the V3-only EBBO sell-branch helper introduced when EBBO's
+    scope was tightened to match Router's actual venue set.
+    """
     table: dict[tuple[str, str, int], int | None] = {}
 
     async def _stub(_mc, sell_token, buy_token, amount_in, _intermediates):
         key = (sell_token.lower(), buy_token.lower(), amount_in)
-        amt = table.get(key)
-        if amt is None:
-            return None
-        return [_hop(amt)]
+        return table.get(key)
 
-    monkeypatch.setattr("src.solver.ebbo.quote_best_path", _stub)
+    monkeypatch.setattr("src.solver.ebbo._quote_best_exact_input", _stub)
     return table
 
 
@@ -374,7 +365,7 @@ async def test_quoter_exception_does_not_fail(monkeypatch) -> None:
     async def _boom(*a, **k):
         raise RuntimeError("rpc timeout")
 
-    monkeypatch.setattr("src.solver.ebbo.quote_best_path", _boom)
+    monkeypatch.setattr("src.solver.ebbo._quote_best_exact_input", _boom)
 
     r = await validate_solution_ebbo(solution, auction, multicall=None, intermediates=[])
     assert r.passes

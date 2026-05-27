@@ -13,6 +13,14 @@ This module checks **before** we submit:
     give the user a worse deal than external V3 routing (minus tolerance),
     fail the validation and fall back to no-solution.
 
+**Scope: V3-only.** EBBO queries the same candidate set RouterSolver emits
+(``FEE_TIERS`` direct + same-fee 2-hops per intermediate) — comparing
+apples to apples. The earlier ``quote_best_path`` path mixed V2 and V3,
+which rejected valid V3-only Router solutions whenever Camelot or Sushi
+had a better pool that Router couldn't route through anyway. When
+V2Source is wired into Router (Phase 0b.5), broaden EBBO's scope to
+V2+V3 again so both sides see the same venue set.
+
 Sell trades: user sells ``executed_amount`` of sell_token.  We compute
     ``our_buy_amount = ceil(executed × cp_sell / cp_buy)`` and require it
     to meet or beat the external ``quoteExactInput`` result.
@@ -42,7 +50,6 @@ from src.models.auction import Auction
 from src.models.solution import Solution
 from src.routing.amm_v3 import FEE_TIERS
 from src.routing.multicall import Multicall3
-from src.routing.multihop import quote_best_path
 from src.routing.v3_batched import V3Path, batched_v3_quote
 from src.shadow.scoring import _ceil_div
 
@@ -57,6 +64,63 @@ DEFAULT_TOLERANCE_BPS = 50
 # Hard cap on trades per solution.  Exceeded → REJECT (not truncate+pass).
 # Submitting unvalidated trades is the exact failure mode EBBO prevents.
 _MAX_TRADES_PER_CHECK = 20
+
+
+async def _quote_best_exact_input(
+    multicall: Multicall3,
+    sell_token: str,
+    buy_token: str,
+    amount_in: int,
+    intermediates: list[str],
+) -> int | None:
+    """Return the largest buy-token output for the given sell-token input.
+
+    V3-only mirror of ``_quote_best_exact_output``. Builds the same
+    candidate set Router emits (4 direct fee tiers + same-fee 2-hops per
+    intermediate) and picks the maximum ``amount_out`` across the batch.
+
+    Returning the V3-only best — rather than ``quote_best_path``'s mixed
+    V2+V3 search — keeps EBBO's scope aligned with what RouterSolver
+    actually emits today. If Router is V3-only but EBBO checked V2+V3,
+    a better Camelot pool would reject a Router solution that V3-best
+    can't beat by definition. When V2Source lands in Router (Phase 0b.5),
+    swap this helper for one that searches V2+V3 again.
+    """
+    paths: list[V3Path] = []
+    for fee in FEE_TIERS:
+        paths.append(
+            V3Path(
+                order_uid="",
+                token_in=sell_token,
+                token_out=buy_token,
+                amount_in=amount_in,
+                fee_tier_in=fee,
+                exact_output=False,
+            )
+        )
+    for mid in intermediates:
+        if mid.lower() in (sell_token.lower(), buy_token.lower()):
+            continue
+        for fee in FEE_TIERS:
+            paths.append(
+                V3Path(
+                    order_uid="",
+                    token_in=sell_token,
+                    token_out=buy_token,
+                    amount_in=amount_in,
+                    fee_tier_in=fee,
+                    intermediate=mid,
+                    fee_tier_out=fee,
+                    exact_output=False,
+                )
+            )
+
+    quotes = await batched_v3_quote(multicall, paths)
+    best: int | None = None
+    for q in quotes:
+        if q.amount_out > 0 and (best is None or q.amount_out > best):
+            best = q.amount_out
+    return best
 
 
 async def _quote_best_exact_output(
@@ -193,7 +257,7 @@ async def validate_solution_ebbo(
             our_buy_amount = _ceil_div(executed * int(cp_sell), int(cp_buy))
 
             try:
-                ext_path = await quote_best_path(
+                ext_buy_amount_opt = await _quote_best_exact_input(
                     multicall,
                     order.sell_token,
                     order.buy_token,
@@ -210,14 +274,10 @@ async def validate_solution_ebbo(
                 n_skipped += 1
                 continue
 
-            if ext_path is None or not ext_path:
+            if ext_buy_amount_opt is None or ext_buy_amount_opt <= 0:
                 n_skipped += 1
                 continue
-
-            ext_buy_amount = int(ext_path[-1].amount_out)
-            if ext_buy_amount <= 0:
-                n_skipped += 1
-                continue
+            ext_buy_amount = ext_buy_amount_opt
 
             # Pass if our_buy >= ext_buy × (1 - tolerance).
             threshold = (ext_buy_amount * (10_000 - tolerance_bps)) // 10_000
