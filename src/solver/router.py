@@ -27,6 +27,7 @@ import time
 from src.config import settings
 from src.encoder.interactions import Interaction
 from src.encoder.v3 import encode_v3_swap
+from src.liquidity.base import LiquiditySource, SwapRequest
 from src.log import get_logger
 from src.models.auction import Auction
 from src.models.order import Order
@@ -121,6 +122,12 @@ class RouterSolver:
         gpv2_settlement: str | None = None,
         v3_router_address: str | None = None,
         slippage_bps: int | None = None,
+        # V2 fallback: optional list of V2-style LiquiditySources. When
+        # provided AND settings.router_v2_fallback_enabled is True, orders
+        # the V3-batched pass couldn't fill get one more chance through V2
+        # quoting. Sources stay None on default-instantiation so existing
+        # tests don't pick up the new behaviour.
+        v2_sources: list[LiquiditySource] | None = None,
     ) -> None:
         self._multicall = multicall
         self._intermediates = intermediates
@@ -141,6 +148,10 @@ class RouterSolver:
         self._slippage_bps = (
             settings.encoder_slippage_bps if slippage_bps is None else slippage_bps
         )
+        # Empty list (not None) is the default so iteration is safe without
+        # a None check on the hot path. The fallback is gated on this list
+        # being non-empty AND the settings flag — either off → V3-only as before.
+        self._v2_sources = v2_sources or []
         # Advertise a custom timeout so the orchestrator gives us more headroom
         # than the default 5 s per-strategy limit.
         self.timeout: float = strategy_timeout
@@ -303,6 +314,9 @@ class RouterSolver:
         # 30 s, the swap deadline buffer is _SWAP_DEADLINE_SECONDS = 60 s, so
         # every Interaction inside this Solution shares a single timestamp.
         deadline = int(time.time()) + _SWAP_DEADLINE_SECONDS
+        # Track filled UIDs so the V2 fallback (below) only retries genuine
+        # misses — not orders we already covered via the V3 batched pass.
+        filled_uids: set[str] = set()
         for order in orders:
             best = best_per_order.get(order.uid)
             if order.kind == "buy":
@@ -337,6 +351,7 @@ class RouterSolver:
                         deadline=deadline,
                     ).to_gpv2_dict()
                 )
+                filled_uids.add(order.uid)
             else:
                 # Sell order: try full amount first.
                 if best is not None and best.amount_out >= order.buy_amount:
@@ -361,6 +376,7 @@ class RouterSolver:
                             deadline=deadline,
                         ).to_gpv2_dict()
                     )
+                    filled_uids.add(order.uid)
                 elif order.partially_fillable:
                     # Full amount missed limit. Try partial fractions in
                     # descending order (0.75x then 0.5x) — emit at the
@@ -410,6 +426,7 @@ class RouterSolver:
                                     deadline=deadline,
                                 ).to_gpv2_dict()
                             )
+                            filled_uids.add(order.uid)
                             log.info(
                                 "router_partial_fill_emitted",
                                 auction_id=auction.id,
@@ -425,6 +442,25 @@ class RouterSolver:
                 else:
                     # Non-partial sell order misses limit → skip (no trade).
                     continue
+
+        # V2 fallback: orders the V3-batched pass couldn't fill (no pool,
+        # limit miss, or partial-fraction miss) get one more chance via
+        # V2 sources. Gated on both the settings flag AND a non-empty
+        # sources list — disabled by default to keep production behaviour
+        # unchanged until the path has fork-test coverage.
+        if (
+            settings.router_v2_fallback_enabled
+            and self._v2_sources
+            and len(filled_uids) < len(orders)
+        ):
+            await self._fill_v2_fallback(
+                auction=auction,
+                orders=orders,
+                filled_uids=filled_uids,
+                trades=trades,
+                prices=prices,
+                intra_interactions=intra_interactions,
+            )
 
         if not trades:
             return NoSolution()
@@ -528,6 +564,121 @@ class RouterSolver:
             trades=trades,
             interactions=[],
         )
+
+    # ── V2 fallback ───────────────────────────────────────────────────────────
+
+    async def _fill_v2_fallback(
+        self,
+        *,
+        auction: Auction,
+        orders: list[Order],
+        filled_uids: set[str],
+        trades: list[Trade],
+        prices: dict[str, int],
+        intra_interactions: list[dict[str, object]],
+    ) -> None:
+        """Try V2 sources for every order V3 missed; mutate state in place.
+
+        Per-order fan-out (not all-orders-at-once batched like V3) because
+        V2 quoting needs two RPC round-trips per pair (getPair → getReserves)
+        — batching across orders would blow up the multi-round-trip count.
+        At Phase 0b scale, a handful of unfilled orders per auction is the
+        norm, so the per-order cost is acceptable.
+
+        Skips smart-wallet-signed orders defensively: V2 routes for these
+        would need extra approval-check logic we haven't built yet.
+        """
+        # Use a short timeout per source — V2 quoting must not blow the
+        # strategy budget on slow RPCs. The total per-order budget is
+        # min(N_sources × 800ms) running in parallel.
+        per_source_timeout_ms = 800
+        deadline = int(time.time()) + _SWAP_DEADLINE_SECONDS
+
+        for order in orders:
+            if order.uid in filled_uids:
+                continue
+
+            req_kind = order.kind
+            if req_kind == "sell":
+                sell_amount = order.sell_amount
+                buy_amount = 0
+            else:
+                sell_amount = 0
+                buy_amount = order.buy_amount
+            try:
+                req = SwapRequest(
+                    sell_token=order.sell_token,
+                    buy_token=order.buy_token,
+                    sell_amount=sell_amount,
+                    buy_amount=buy_amount,
+                    kind=req_kind,
+                    chain_id=getattr(order, "sell_chain_id", 42161),
+                )
+            except ValueError:
+                # Same-token or zero-amount — skip defensively.
+                continue
+
+            # Fan out across all configured V2 sources in parallel.
+            quote_tasks = [
+                src.quote(req, timeout_ms=per_source_timeout_ms)
+                for src in self._v2_sources
+            ]
+            results = await asyncio.gather(*quote_tasks, return_exceptions=True)
+
+            best_quote = None
+            best_source = None
+            for src, q in zip(self._v2_sources, results, strict=True):
+                if isinstance(q, BaseException) or q is None:
+                    continue
+                # Limit-price check before considering — same predicate as V3.
+                if order.kind == "sell" and q.buy_amount < order.buy_amount:
+                    continue
+                if order.kind == "buy" and q.sell_amount > order.sell_amount:
+                    continue
+                # Pick across sources: max buy for sell, min sell for buy.
+                if best_quote is None:
+                    best_quote, best_source = q, src
+                elif order.kind == "sell" and q.buy_amount > best_quote.buy_amount:
+                    best_quote, best_source = q, src
+                elif order.kind == "buy" and q.sell_amount < best_quote.sell_amount:
+                    best_quote, best_source = q, src
+
+            if best_quote is None or best_source is None:
+                continue
+
+            # Emit the trade + interaction.
+            if order.kind == "sell":
+                executed_amount = order.sell_amount
+                executed_buy = best_quote.buy_amount
+                executed_sell = order.sell_amount
+            else:
+                executed_amount = order.buy_amount
+                executed_buy = order.buy_amount
+                executed_sell = best_quote.sell_amount
+
+            trades.append(
+                Trade(
+                    kind="fulfillment",
+                    order_uid=order.uid,
+                    executed_amount=executed_amount,
+                )
+            )
+            self._register_prices(
+                prices, order,
+                executed_buy=executed_buy,
+                executed_sell=executed_sell,
+            )
+            interaction = best_source.encode_interaction(
+                best_quote, self._gpv2_settlement
+            )
+            intra_interactions.append(interaction.to_gpv2_dict())
+            filled_uids.add(order.uid)
+            log.info(
+                "router_v2_fallback_emitted",
+                auction_id=auction.id,
+                order_uid=order.uid,
+                source=best_source.name,
+            )
 
     # ── Interaction encoding ──────────────────────────────────────────────────
 

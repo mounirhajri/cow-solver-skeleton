@@ -65,6 +65,14 @@ class Settings(BaseSettings):
     # RPC load (~80x) but loses access to V2-only pools (rare on Arbitrum).
     router_v3_only_batched: bool = True
 
+    # V2 fallback: when set, RouterSolver also instantiates one V2Source per
+    # configured V2 router and falls back to V2 quoting for orders the
+    # V3-batched pass couldn't fill. Off by default — V2 routing adds RPC
+    # round-trips (getPair + getReserves per pair) and Phase 0b ships V3
+    # encoding as the primary path. Enable in shadow first to observe the
+    # incremental fill rate before flipping in prod.
+    router_v2_fallback_enabled: bool = False
+
     # Multi-Party CoW Matching: OTM-tolerance (in basis points) widens the
     # viable-order graph beyond strict reference-price-ITM. At 100 bps (1 %)
     # the graph grows ~3-5×; Johnson stays cheap, more ring candidates reach
