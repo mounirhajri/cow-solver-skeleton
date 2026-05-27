@@ -79,6 +79,12 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["eth_abi", "eth_abi.*"]
 ignore_missing_imports = true
+implicit_reexport = true
+
+[[tool.mypy.overrides]]
+module = ["eth_utils", "eth_utils.*"]
+ignore_missing_imports = true
+implicit_reexport = true
 
 [[tool.mypy.overrides]]
 module = ["lightgbm", "lightgbm.*"]

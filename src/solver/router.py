@@ -22,8 +22,12 @@ Performance (legacy mode, kept for context):
 from __future__ import annotations
 
 import asyncio
+import time
 
 from src.config import settings
+from src.encoder.interactions import Interaction
+from src.encoder.v3 import encode_v3_swap
+from src.liquidity.base import LiquiditySource, SwapRequest
 from src.log import get_logger
 from src.models.auction import Auction
 from src.models.order import Order
@@ -33,6 +37,9 @@ from src.routing.multicall import Multicall3
 from src.routing.multihop import HopQuote, quote_best_path
 from src.routing.v3_batched import V3BatchedQuote, V3Path, batched_v3_quote
 from src.solver.base import NoSolution
+
+# Deadline grace window encoded into the swap call.
+_SWAP_DEADLINE_SECONDS = 60
 
 log = get_logger(__name__)
 
@@ -109,6 +116,18 @@ class RouterSolver:
         max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
         strategy_timeout: float = _DEFAULT_STRATEGY_TIMEOUT,
         v3_only_batched: bool | None = None,
+        # Encoder configuration — addresses + slippage default from
+        # settings but exposed as constructor params so tests can override
+        # without touching the global Settings instance.
+        gpv2_settlement: str | None = None,
+        v3_router_address: str | None = None,
+        slippage_bps: int | None = None,
+        # V2 fallback: optional list of V2-style LiquiditySources. When
+        # provided AND settings.router_v2_fallback_enabled is True, orders
+        # the V3-batched pass couldn't fill get one more chance through V2
+        # quoting. Sources stay None on default-instantiation so existing
+        # tests don't pick up the new behaviour.
+        v2_sources: list[LiquiditySource] | None = None,
     ) -> None:
         self._multicall = multicall
         self._intermediates = intermediates
@@ -120,6 +139,19 @@ class RouterSolver:
         self._v3_only_batched = (
             settings.router_v3_only_batched if v3_only_batched is None else v3_only_batched
         )
+        self._gpv2_settlement = (
+            settings.gpv2_settlement if gpv2_settlement is None else gpv2_settlement
+        )
+        self._v3_router_address = (
+            settings.v3_swap_router if v3_router_address is None else v3_router_address
+        )
+        self._slippage_bps = (
+            settings.encoder_slippage_bps if slippage_bps is None else slippage_bps
+        )
+        # Empty list (not None) is the default so iteration is safe without
+        # a None check on the hot path. The fallback is gated on this list
+        # being non-empty AND the settings flag — either off → V3-only as before.
+        self._v2_sources = v2_sources or []
         # Advertise a custom timeout so the orchestrator gives us more headroom
         # than the default 5 s per-strategy limit.
         self.timeout: float = strategy_timeout
@@ -274,6 +306,17 @@ class RouterSolver:
 
         trades: list[Trade] = []
         prices: dict[str, int] = {}
+        # GPv2 settles `[pre, intra, post]`; we only populate intra. All V3
+        # interactions land in this list and the Solution publishes
+        # `[[], intra_interactions, []]` at the end.
+        intra_interactions: list[dict[str, object]] = []
+        # One deadline for the whole batch — the auction's solve window is
+        # 30 s, the swap deadline buffer is _SWAP_DEADLINE_SECONDS = 60 s, so
+        # every Interaction inside this Solution shares a single timestamp.
+        deadline = int(time.time()) + _SWAP_DEADLINE_SECONDS
+        # Track filled UIDs so the V2 fallback (below) only retries genuine
+        # misses — not orders we already covered via the V3 batched pass.
+        filled_uids: set[str] = set()
         for order in orders:
             best = best_per_order.get(order.uid)
             if order.kind == "buy":
@@ -288,6 +331,16 @@ class RouterSolver:
                 # `executedAmount` is the EXACT side, which for a buy order
                 # is buy_amount. The variable amount_in is communicated via
                 # clearing prices, not via executedAmount.
+                # Register prices BEFORE appending the trade — if a prior
+                # trade in this Solution already pinned an incompatible
+                # rate for either token, _register_prices returns False
+                # and we silently drop this order (CIP-67 invariant).
+                if not self._register_prices(
+                    prices, order,
+                    executed_buy=order.buy_amount,
+                    executed_sell=amount_in,
+                ):
+                    continue
                 trades.append(
                     Trade(
                         kind="fulfillment",
@@ -295,15 +348,27 @@ class RouterSolver:
                         executed_amount=order.buy_amount,
                     )
                 )
-                self._register_prices(
-                    prices, order,
-                    executed_buy=order.buy_amount,
-                    executed_sell=amount_in,
+                intra_interactions.append(
+                    self._encode_path_interaction(
+                        best.path,
+                        executed_sell=amount_in,
+                        executed_buy=order.buy_amount,
+                        deadline=deadline,
+                    ).to_gpv2_dict()
                 )
+                filled_uids.add(order.uid)
             else:
                 # Sell order: try full amount first.
                 if best is not None and best.amount_out >= order.buy_amount:
-                    # Full quote clears — emit at full sell_amount.
+                    # Full quote clears — emit at full sell_amount, but only
+                    # if the rate is CIP-67-compatible with the in-progress
+                    # clearing-price map. See the comment in the buy branch.
+                    if not self._register_prices(
+                        prices, order,
+                        executed_buy=best.amount_out,
+                        executed_sell=order.sell_amount,
+                    ):
+                        continue
                     trades.append(
                         Trade(
                             kind="fulfillment",
@@ -311,11 +376,15 @@ class RouterSolver:
                             executed_amount=order.sell_amount,
                         )
                     )
-                    self._register_prices(
-                        prices, order,
-                        executed_buy=best.amount_out,
-                        executed_sell=order.sell_amount,
+                    intra_interactions.append(
+                        self._encode_path_interaction(
+                            best.path,
+                            executed_sell=order.sell_amount,
+                            executed_buy=best.amount_out,
+                            deadline=deadline,
+                        ).to_gpv2_dict()
                     )
+                    filled_uids.add(order.uid)
                 elif order.partially_fillable:
                     # Full amount missed limit. Try partial fractions in
                     # descending order (0.75x then 0.5x) — emit at the
@@ -345,6 +414,17 @@ class RouterSolver:
                             quotes, filter_amount_in=partial_sell
                         ).get(order.uid)
                         if frac_best is not None and frac_best.amount_out >= partial_buy_limit:
+                            # Same CIP-67 register-first guard as the full
+                            # path above. If the fraction's rate conflicts
+                            # with an in-progress price map we move on to
+                            # the next fraction (or fall through to skip)
+                            # rather than dropping the whole order.
+                            if not self._register_prices(
+                                prices, order,
+                                executed_buy=frac_best.amount_out,
+                                executed_sell=partial_sell,
+                            ):
+                                continue
                             trades.append(
                                 Trade(
                                     kind="fulfillment",
@@ -352,11 +432,15 @@ class RouterSolver:
                                     executed_amount=partial_sell,
                                 )
                             )
-                            self._register_prices(
-                                prices, order,
-                                executed_buy=frac_best.amount_out,
-                                executed_sell=partial_sell,
+                            intra_interactions.append(
+                                self._encode_path_interaction(
+                                    frac_best.path,
+                                    executed_sell=partial_sell,
+                                    executed_buy=frac_best.amount_out,
+                                    deadline=deadline,
+                                ).to_gpv2_dict()
                             )
+                            filled_uids.add(order.uid)
                             log.info(
                                 "router_partial_fill_emitted",
                                 auction_id=auction.id,
@@ -373,6 +457,25 @@ class RouterSolver:
                     # Non-partial sell order misses limit → skip (no trade).
                     continue
 
+        # V2 fallback: orders the V3-batched pass couldn't fill (no pool,
+        # limit miss, or partial-fraction miss) get one more chance via
+        # V2 sources. Gated on both the settings flag AND a non-empty
+        # sources list — disabled by default to keep production behaviour
+        # unchanged until the path has fork-test coverage.
+        if (
+            settings.router_v2_fallback_enabled
+            and self._v2_sources
+            and len(filled_uids) < len(orders)
+        ):
+            await self._fill_v2_fallback(
+                auction=auction,
+                orders=orders,
+                filled_uids=filled_uids,
+                trades=trades,
+                prices=prices,
+                intra_interactions=intra_interactions,
+            )
+
         if not trades:
             return NoSolution()
 
@@ -382,13 +485,17 @@ class RouterSolver:
             n_quoted=len(orders),
             n_paths=len(paths),
             n_filled=len(trades),
+            n_interactions=len(intra_interactions),
             mode="v3_batched",
         )
+        # All V3 swap calls go in the flat ``interactions`` list. The CoW
+        # driver maps each entry into the GPv2 settle() intra-interaction
+        # slot — pre/post stages aren't needed for vanilla AMM routing.
         return Solution(
             id=int(auction.id),
             prices=prices,
             trades=trades,
-            interactions=[],
+            interactions=intra_interactions,
         )
 
     # ── Legacy per-order asyncio.gather path ──────────────────────────────────
@@ -442,17 +549,19 @@ class RouterSolver:
             executed_buy = path[-1].amount_out
             if executed_buy < order.buy_amount:  # type: ignore[attr-defined]
                 continue
+            # Same CIP-67 register-first guard as the V3-batched path.
+            if not self._register_prices(
+                prices, order,  # type: ignore[arg-type]
+                executed_buy=executed_buy,
+                executed_sell=order.sell_amount,  # type: ignore[attr-defined]
+            ):
+                continue
             trades.append(
                 Trade(
                     kind="fulfillment",
                     order_uid=order.uid,  # type: ignore[attr-defined]
                     executed_amount=order.sell_amount,  # type: ignore[attr-defined]
                 )
-            )
-            self._register_prices(
-                prices, order,  # type: ignore[arg-type]
-                executed_buy=executed_buy,
-                executed_sell=order.sell_amount,  # type: ignore[attr-defined]
             )
 
         if not trades:
@@ -472,6 +581,167 @@ class RouterSolver:
             interactions=[],
         )
 
+    # ── V2 fallback ───────────────────────────────────────────────────────────
+
+    async def _fill_v2_fallback(
+        self,
+        *,
+        auction: Auction,
+        orders: list[Order],
+        filled_uids: set[str],
+        trades: list[Trade],
+        prices: dict[str, int],
+        intra_interactions: list[dict[str, object]],
+    ) -> None:
+        """Try V2 sources for every order V3 missed; mutate state in place.
+
+        Per-order fan-out (not all-orders-at-once batched like V3) because
+        V2 quoting needs two RPC round-trips per pair (getPair → getReserves)
+        — batching across orders would blow up the multi-round-trip count.
+        At Phase 0b scale, a handful of unfilled orders per auction is the
+        norm, so the per-order cost is acceptable.
+
+        Smart-wallet vs EOA orders are handled identically — GPv2 Settlement
+        uses the same VaultRelayer.transferFromAccounts mechanism for both
+        signature schemes, so there is no extra allowance-check path
+        unique to EIP-1271 orders. Same scope as the V3 batched path above.
+        """
+        # Use a short timeout per source — V2 quoting must not blow the
+        # strategy budget on slow RPCs. The total per-order budget is
+        # min(N_sources × 800ms) running in parallel.
+        per_source_timeout_ms = 800
+
+        for order in orders:
+            if order.uid in filled_uids:
+                continue
+
+            req_kind = order.kind
+            if req_kind == "sell":
+                sell_amount = order.sell_amount
+                buy_amount = 0
+            else:
+                sell_amount = 0
+                buy_amount = order.buy_amount
+            try:
+                req = SwapRequest(
+                    sell_token=order.sell_token,
+                    buy_token=order.buy_token,
+                    sell_amount=sell_amount,
+                    buy_amount=buy_amount,
+                    kind=req_kind,
+                    chain_id=getattr(order, "sell_chain_id", 42161),
+                )
+            except ValueError:
+                # Same-token or zero-amount — skip defensively.
+                continue
+
+            # Fan out across all configured V2 sources in parallel.
+            quote_tasks = [
+                src.quote(req, timeout_ms=per_source_timeout_ms)
+                for src in self._v2_sources
+            ]
+            results = await asyncio.gather(*quote_tasks, return_exceptions=True)
+
+            best_quote = None
+            best_source = None
+            for src, q in zip(self._v2_sources, results, strict=True):
+                if isinstance(q, BaseException) or q is None:
+                    continue
+                # Limit-price check before considering — same predicate as V3.
+                if order.kind == "sell" and q.buy_amount < order.buy_amount:
+                    continue
+                if order.kind == "buy" and q.sell_amount > order.sell_amount:
+                    continue
+                # Pick across sources: max buy for sell, min sell for buy.
+                is_better = (
+                    best_quote is None
+                    or (
+                        order.kind == "sell"
+                        and q.buy_amount > best_quote.buy_amount
+                    )
+                    or (
+                        order.kind == "buy"
+                        and q.sell_amount < best_quote.sell_amount
+                    )
+                )
+                if is_better:
+                    best_quote, best_source = q, src
+
+            if best_quote is None or best_source is None:
+                continue
+
+            # Emit the trade + interaction.
+            if order.kind == "sell":
+                executed_amount = order.sell_amount
+                executed_buy = best_quote.buy_amount
+                executed_sell = order.sell_amount
+            else:
+                executed_amount = order.buy_amount
+                executed_buy = order.buy_amount
+                executed_sell = best_quote.sell_amount
+
+            # Same CIP-67 register-first guard as the V3-batched path.
+            # V2 fallback orders are particularly likely to trip this since
+            # they're often shared-token with the V3 fills above (USDC is
+            # the common denominator for both venue families).
+            if not self._register_prices(
+                prices, order,
+                executed_buy=executed_buy,
+                executed_sell=executed_sell,
+            ):
+                continue
+            trades.append(
+                Trade(
+                    kind="fulfillment",
+                    order_uid=order.uid,
+                    executed_amount=executed_amount,
+                )
+            )
+            interaction = best_source.encode_interaction(
+                best_quote, self._gpv2_settlement
+            )
+            intra_interactions.append(interaction.to_gpv2_dict())
+            filled_uids.add(order.uid)
+            log.info(
+                "router_v2_fallback_emitted",
+                auction_id=auction.id,
+                order_uid=order.uid,
+                source=best_source.name,
+            )
+
+    # ── Interaction encoding ──────────────────────────────────────────────────
+
+    def _encode_path_interaction(
+        self,
+        path: V3Path,
+        *,
+        executed_sell: int,
+        executed_buy: int,
+        deadline: int,
+    ) -> Interaction:
+        """Encode the winning V3 path into a settle-able GPv2 Interaction.
+
+        Lives here (not in V3Source) so the v3_only_batched path can encode
+        directly from its V3BatchedQuote pick without going through the
+        LiquidityAggregator round-trip. Both call sites share the same
+        ``src.encoder.v3.encode_v3_swap`` dispatch — slippage math and the
+        single/multi/sell/buy table are defined once.
+        """
+        return encode_v3_swap(
+            token_in=path.token_in,
+            token_out=path.token_out,
+            fee_in=path.fee_tier_in,
+            intermediate=path.intermediate,
+            fee_out=path.fee_tier_out,
+            exact_output=path.exact_output,
+            executed_sell=executed_sell,
+            executed_buy=executed_buy,
+            recipient=self._gpv2_settlement,
+            deadline=deadline,
+            slippage_bps=self._slippage_bps,
+            router_address=self._v3_router_address,
+        )
+
     # ── Shared clearing-price logic ───────────────────────────────────────────
 
     @staticmethod
@@ -481,7 +751,7 @@ class RouterSolver:
         *,
         executed_buy: int,
         executed_sell: int,
-    ) -> None:
+    ) -> bool:
         """Register clearing prices reflecting the AMM-realised execution ratio.
 
         Uses ``cp_sell / cp_buy = executed_buy / executed_sell`` (the rate the
@@ -497,6 +767,18 @@ class RouterSolver:
         oracle persisted score=6.6 ETH per fill, dominated by 134 fills in
         24 h, driving an €67M/Mo phantom projection. See
         ``docs/superpowers/specs/2026-05-26-router-and-logging-followups.md``.
+
+        Returns ``True`` when the rates were registered (or were already
+        present at consistent values); ``False`` when a previously-seen
+        token's clearing price would conflict with this order's rate.
+        Callers must drop the offending trade + interaction on ``False``
+        — submitting a Solution with inconsistent prices for the same
+        token guarantees a ``settle()`` revert (CIP-67 enforces a single
+        uniform clearing price per token across the whole batch).
+
+        Implements Option A from
+        ``docs/archive/specs/2026-05-26-router-and-logging-followups.md`` §1:
+        first-rate enforcement with explicit drop on mismatch.
         """
         # Forensic log: surplus rate (AMM clearing vs order's limit ratio).
         # >100bps means the order's limit price sits well off-market — either
@@ -518,5 +800,31 @@ class RouterSolver:
                         kind=order.kind,
                     )
 
-        prices.setdefault(order.sell_token, executed_buy)
-        prices.setdefault(order.buy_token, executed_sell)
+        # CIP-67 invariant: ONE clearing price per token across the whole
+        # batch. If a previous trade in this Solution already registered a
+        # different price for either of our tokens, our AMM-realised rate
+        # is incompatible — we must drop this trade rather than emit
+        # inconsistent prices that would revert at settlement.
+        existing_sell = prices.get(order.sell_token)
+        existing_buy = prices.get(order.buy_token)
+        if existing_sell is not None and existing_sell != executed_buy:
+            log.info(
+                "router_clearing_price_conflict",
+                order_uid=order.uid,
+                token=order.sell_token,
+                existing=str(existing_sell),
+                attempted=str(executed_buy),
+            )
+            return False
+        if existing_buy is not None and existing_buy != executed_sell:
+            log.info(
+                "router_clearing_price_conflict",
+                order_uid=order.uid,
+                token=order.buy_token,
+                existing=str(existing_buy),
+                attempted=str(executed_sell),
+            )
+            return False
+        prices[order.sell_token] = executed_buy
+        prices[order.buy_token] = executed_sell
+        return True

@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from eth_abi import decode, encode  # type: ignore[attr-defined]
+from eth_abi import decode, encode
 
 from src.log import get_logger
 from src.routing.amm_v3 import (

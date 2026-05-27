@@ -25,8 +25,8 @@ from src.solver.base import NoSolution  # noqa: F401 (used via isinstance in tes
 def _make_order(**kwargs: object) -> Order:
     defaults: dict[str, object] = {
         "uid": "o1",
-        "sellToken": "0xa",
-        "buyToken": "0xb",
+        "sellToken": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "buyToken": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "sellAmount": 1000,
         "buyAmount": 900,
         "feePolicies": [],
