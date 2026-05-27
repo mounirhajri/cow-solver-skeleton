@@ -76,11 +76,19 @@ def encode_v3_swap(
     else:
         if fee_out is None:
             raise ValueError("fee_out required when intermediate is set")
-        packed = pack_v3_path(
-            tokens=[token_in, intermediate, token_out],
-            fees=[fee_in, fee_out],
-        )
         if exact_output:
+            # Uniswap V3 SwapRouter.exactOutputInternal decodes the FIRST
+            # pool entry of the packed path as ``(tokenOut, tokenIn, fee)``
+            # — opposite of exactInputInternal's ``(tokenIn, tokenOut,
+            # fee)``. For multi-hop exactOutput the path must therefore
+            # start with the final output token and walk back to the
+            # input. Mirrors the reversal in src/routing/v3_batched.py's
+            # ``_build_call`` so the quote that drove this swap and the
+            # swap itself traverse the same pools.
+            packed = pack_v3_path(
+                tokens=[token_out, intermediate, token_in],
+                fees=[fee_out, fee_in],
+            )
             calldata = encode_exact_output(
                 path=packed,
                 recipient=recipient,
@@ -89,6 +97,10 @@ def encode_v3_swap(
                 amount_in_maximum=apply_slippage_up(executed_sell, slippage_bps),
             )
         else:
+            packed = pack_v3_path(
+                tokens=[token_in, intermediate, token_out],
+                fees=[fee_in, fee_out],
+            )
             calldata = encode_exact_input(
                 path=packed,
                 recipient=recipient,

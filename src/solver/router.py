@@ -331,17 +331,22 @@ class RouterSolver:
                 # `executedAmount` is the EXACT side, which for a buy order
                 # is buy_amount. The variable amount_in is communicated via
                 # clearing prices, not via executedAmount.
+                # Register prices BEFORE appending the trade — if a prior
+                # trade in this Solution already pinned an incompatible
+                # rate for either token, _register_prices returns False
+                # and we silently drop this order (CIP-67 invariant).
+                if not self._register_prices(
+                    prices, order,
+                    executed_buy=order.buy_amount,
+                    executed_sell=amount_in,
+                ):
+                    continue
                 trades.append(
                     Trade(
                         kind="fulfillment",
                         order_uid=order.uid,
                         executed_amount=order.buy_amount,
                     )
-                )
-                self._register_prices(
-                    prices, order,
-                    executed_buy=order.buy_amount,
-                    executed_sell=amount_in,
                 )
                 intra_interactions.append(
                     self._encode_path_interaction(
@@ -355,18 +360,21 @@ class RouterSolver:
             else:
                 # Sell order: try full amount first.
                 if best is not None and best.amount_out >= order.buy_amount:
-                    # Full quote clears — emit at full sell_amount.
+                    # Full quote clears — emit at full sell_amount, but only
+                    # if the rate is CIP-67-compatible with the in-progress
+                    # clearing-price map. See the comment in the buy branch.
+                    if not self._register_prices(
+                        prices, order,
+                        executed_buy=best.amount_out,
+                        executed_sell=order.sell_amount,
+                    ):
+                        continue
                     trades.append(
                         Trade(
                             kind="fulfillment",
                             order_uid=order.uid,
                             executed_amount=order.sell_amount,
                         )
-                    )
-                    self._register_prices(
-                        prices, order,
-                        executed_buy=best.amount_out,
-                        executed_sell=order.sell_amount,
                     )
                     intra_interactions.append(
                         self._encode_path_interaction(
@@ -406,17 +414,23 @@ class RouterSolver:
                             quotes, filter_amount_in=partial_sell
                         ).get(order.uid)
                         if frac_best is not None and frac_best.amount_out >= partial_buy_limit:
+                            # Same CIP-67 register-first guard as the full
+                            # path above. If the fraction's rate conflicts
+                            # with an in-progress price map we move on to
+                            # the next fraction (or fall through to skip)
+                            # rather than dropping the whole order.
+                            if not self._register_prices(
+                                prices, order,
+                                executed_buy=frac_best.amount_out,
+                                executed_sell=partial_sell,
+                            ):
+                                continue
                             trades.append(
                                 Trade(
                                     kind="fulfillment",
                                     order_uid=order.uid,
                                     executed_amount=partial_sell,
                                 )
-                            )
-                            self._register_prices(
-                                prices, order,
-                                executed_buy=frac_best.amount_out,
-                                executed_sell=partial_sell,
                             )
                             intra_interactions.append(
                                 self._encode_path_interaction(
@@ -535,17 +549,19 @@ class RouterSolver:
             executed_buy = path[-1].amount_out
             if executed_buy < order.buy_amount:  # type: ignore[attr-defined]
                 continue
+            # Same CIP-67 register-first guard as the V3-batched path.
+            if not self._register_prices(
+                prices, order,  # type: ignore[arg-type]
+                executed_buy=executed_buy,
+                executed_sell=order.sell_amount,  # type: ignore[attr-defined]
+            ):
+                continue
             trades.append(
                 Trade(
                     kind="fulfillment",
                     order_uid=order.uid,  # type: ignore[attr-defined]
                     executed_amount=order.sell_amount,  # type: ignore[attr-defined]
                 )
-            )
-            self._register_prices(
-                prices, order,  # type: ignore[arg-type]
-                executed_buy=executed_buy,
-                executed_sell=order.sell_amount,  # type: ignore[attr-defined]
             )
 
         if not trades:
@@ -585,14 +601,15 @@ class RouterSolver:
         At Phase 0b scale, a handful of unfilled orders per auction is the
         norm, so the per-order cost is acceptable.
 
-        Skips smart-wallet-signed orders defensively: V2 routes for these
-        would need extra approval-check logic we haven't built yet.
+        Smart-wallet vs EOA orders are handled identically — GPv2 Settlement
+        uses the same VaultRelayer.transferFromAccounts mechanism for both
+        signature schemes, so there is no extra allowance-check path
+        unique to EIP-1271 orders. Same scope as the V3 batched path above.
         """
         # Use a short timeout per source — V2 quoting must not blow the
         # strategy budget on slow RPCs. The total per-order budget is
         # min(N_sources × 800ms) running in parallel.
         per_source_timeout_ms = 800
-        deadline = int(time.time()) + _SWAP_DEADLINE_SECONDS
 
         for order in orders:
             if order.uid in filled_uids:
@@ -656,17 +673,22 @@ class RouterSolver:
                 executed_buy = order.buy_amount
                 executed_sell = best_quote.sell_amount
 
+            # Same CIP-67 register-first guard as the V3-batched path.
+            # V2 fallback orders are particularly likely to trip this since
+            # they're often shared-token with the V3 fills above (USDC is
+            # the common denominator for both venue families).
+            if not self._register_prices(
+                prices, order,
+                executed_buy=executed_buy,
+                executed_sell=executed_sell,
+            ):
+                continue
             trades.append(
                 Trade(
                     kind="fulfillment",
                     order_uid=order.uid,
                     executed_amount=executed_amount,
                 )
-            )
-            self._register_prices(
-                prices, order,
-                executed_buy=executed_buy,
-                executed_sell=executed_sell,
             )
             interaction = best_source.encode_interaction(
                 best_quote, self._gpv2_settlement
@@ -722,7 +744,7 @@ class RouterSolver:
         *,
         executed_buy: int,
         executed_sell: int,
-    ) -> None:
+    ) -> bool:
         """Register clearing prices reflecting the AMM-realised execution ratio.
 
         Uses ``cp_sell / cp_buy = executed_buy / executed_sell`` (the rate the
@@ -738,6 +760,18 @@ class RouterSolver:
         oracle persisted score=6.6 ETH per fill, dominated by 134 fills in
         24 h, driving an €67M/Mo phantom projection. See
         ``docs/superpowers/specs/2026-05-26-router-and-logging-followups.md``.
+
+        Returns ``True`` when the rates were registered (or were already
+        present at consistent values); ``False`` when a previously-seen
+        token's clearing price would conflict with this order's rate.
+        Callers must drop the offending trade + interaction on ``False``
+        — submitting a Solution with inconsistent prices for the same
+        token guarantees a ``settle()`` revert (CIP-67 enforces a single
+        uniform clearing price per token across the whole batch).
+
+        Implements Option A from
+        ``docs/archive/specs/2026-05-26-router-and-logging-followups.md`` §1:
+        first-rate enforcement with explicit drop on mismatch.
         """
         # Forensic log: surplus rate (AMM clearing vs order's limit ratio).
         # >100bps means the order's limit price sits well off-market — either
@@ -759,5 +793,31 @@ class RouterSolver:
                         kind=order.kind,
                     )
 
-        prices.setdefault(order.sell_token, executed_buy)
-        prices.setdefault(order.buy_token, executed_sell)
+        # CIP-67 invariant: ONE clearing price per token across the whole
+        # batch. If a previous trade in this Solution already registered a
+        # different price for either of our tokens, our AMM-realised rate
+        # is incompatible — we must drop this trade rather than emit
+        # inconsistent prices that would revert at settlement.
+        existing_sell = prices.get(order.sell_token)
+        existing_buy = prices.get(order.buy_token)
+        if existing_sell is not None and existing_sell != executed_buy:
+            log.info(
+                "router_clearing_price_conflict",
+                order_uid=order.uid,
+                token=order.sell_token,
+                existing=str(existing_sell),
+                attempted=str(executed_buy),
+            )
+            return False
+        if existing_buy is not None and existing_buy != executed_sell:
+            log.info(
+                "router_clearing_price_conflict",
+                order_uid=order.uid,
+                token=order.buy_token,
+                existing=str(existing_buy),
+                attempted=str(executed_sell),
+            )
+            return False
+        prices[order.sell_token] = executed_buy
+        prices[order.buy_token] = executed_sell
+        return True

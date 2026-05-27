@@ -95,12 +95,22 @@ def test_exact_input_roundtrips_through_abi_decode() -> None:
 
 
 def test_exact_output_roundtrips_through_abi_decode() -> None:
-    """V3 exactOutput uses the SAME path direction as exactInput — token A
-    is still the input even though the router walks the path backwards.
-    Reversing it (a tempting "fix") would route the swap wrong."""
-    path = pack_v3_path(tokens=[USDC, WETH, DAI], fees=[500, 3000])
+    """``encode_exact_output`` is a thin ABI wrapper — it serialises
+    whatever path bytes the caller provides. Direction (forward for
+    exactInput, reversed for exactOutput) is the *caller's*
+    responsibility; this test only verifies the ABI round-trip.
+
+    The high-level ``encode_v3_swap`` dispatcher in ``src/encoder/v3.py``
+    is what flips the path direction for the exactOutput case; that
+    behaviour is covered separately in
+    ``tests/test_encoder/test_v3_dispatch.py``.
+    """
+    # Build a "reversed" exactOutput path the caller would actually use:
+    # token_out → intermediate → token_in (DAI → WETH → USDC for a
+    # USDC → DAI buy).
+    reversed_path = pack_v3_path(tokens=[DAI, WETH, USDC], fees=[3000, 500])
     cd = encode_exact_output(
-        path=path,
+        path=reversed_path,
         recipient=SETTLEMENT,
         deadline=1_900_000_000,
         amount_out=99_000_000_000_000_000_000,
@@ -110,6 +120,6 @@ def test_exact_output_roundtrips_through_abi_decode() -> None:
 
     (params,) = decode(["(bytes,address,uint256,uint256,uint256)"], cd[4:])
     decoded_path, recipient, deadline, amount_out, amount_in_maximum = params
-    assert decoded_path == path  # direction is NOT reversed
+    assert decoded_path == reversed_path
     assert amount_out == 99_000_000_000_000_000_000
     assert amount_in_maximum == 200_000_000

@@ -10,10 +10,15 @@ buy-kind multi-hop we call ``exactOutput(ExactOutputParams)``. The struct
 shapes differ only in the meaning of the last two amount fields, mirroring
 the single-hop pair.
 
-The path direction is **the same in both cases** in Uniswap V3 — token A
-is always the input token, the last token is always the output. There is
-no need to reverse the path for exactOutput; the router walks it backwards
-internally.
+**Path direction differs between the two functions.** SwapRouter's
+``exactInputInternal`` decodes the first pool of the packed path as
+``(tokenIn, tokenOut, fee)``, while ``exactOutputInternal`` decodes it
+as ``(tokenOut, tokenIn, fee)``. Practically: an exactInput path runs
+``token_in → … → token_out``; the matching exactOutput path runs
+``token_out → … → token_in`` (reversed end-to-end including the fee
+ordering). Both ``pack_v3_path`` and ``encode_exact_output`` below
+operate on raw bytes — direction is the caller's responsibility; see
+``src/encoder/v3.py``'s ``encode_v3_swap`` for the dispatch.
 """
 
 from __future__ import annotations
@@ -87,9 +92,11 @@ def encode_exact_output(
 ) -> bytes:
     """Encode ``ISwapRouter.exactOutput((path, recipient, deadline, amountOut, amountInMaximum))``.
 
-    For buy-kind multi-hop. Path direction is identical to ``exactInput`` —
-    do not reverse it; the V3 router walks backwards from the last token
-    when settling exactOutput.
+    For buy-kind multi-hop. **Path direction is reversed vs exactInput**
+    — the first token in ``path`` must be the swap's output token, not
+    its input. Callers building paths manually should run
+    ``token_out → intermediate → token_in`` with fees in the matching
+    backwards order. See the module docstring for the on-chain rationale.
     """
     params = encode(
         [_PARAMS_STRUCT],

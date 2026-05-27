@@ -714,8 +714,12 @@ async def test_router_skips_buy_when_amount_in_exceeds_sell_limit(
 
 @pytest.mark.asyncio
 async def test_buy_and_sell_mixed_auction(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Mixed auction: 1 sell + 1 buy, both quoteable, both emitted with the
-    correct executedAmount semantic per kind."""
+    """Mixed auction: 1 sell + 1 buy on DIFFERENT token pairs, both
+    quoteable, both emitted with the correct executedAmount semantic per
+    kind. Disjoint pairs ensure the CIP-67 single-clearing-price-per-token
+    invariant in ``_register_prices`` doesn't conflate the two trades —
+    for shared-token consistency see
+    ``test_register_prices_drops_trade_on_clearing_price_conflict``."""
     from src.routing.v3_batched import V3BatchedQuote, V3Path
 
     async def mock_batched(
@@ -731,8 +735,14 @@ async def test_buy_and_sell_mixed_auction(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
 
-    sell = _make_order(uid="s1", kind="sell", sellAmount=1000, buyAmount=900)
-    buy = _make_order(uid="b1", kind="buy", sellAmount=1000, buyAmount=500)
+    sell = _make_order(
+        uid="s1", kind="sell", sellAmount=1000, buyAmount=900,
+        sellToken="0x" + "a" * 40, buyToken="0x" + "b" * 40,
+    )
+    buy = _make_order(
+        uid="b1", kind="buy", sellAmount=1000, buyAmount=500,
+        sellToken="0x" + "c" * 40, buyToken="0x" + "d" * 40,
+    )
 
     multicall = AsyncMock()
     router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
@@ -743,6 +753,59 @@ async def test_buy_and_sell_mixed_auction(monkeypatch: pytest.MonkeyPatch) -> No
     by_uid = {t.order_uid: t for t in result.trades}
     assert by_uid["s1"].executed_amount == 1000  # sell: sellAmount (exact)
     assert by_uid["b1"].executed_amount == 500   # buy:  buyAmount  (exact)
+
+
+@pytest.mark.asyncio
+async def test_register_prices_drops_trade_on_clearing_price_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CIP-67 invariant: a single uniform clearing price per token across
+    the whole batch. If two trades in the same Solution would write
+    different prices for a shared token, the second trade must be dropped
+    — submitting both would emit inconsistent prices and revert at
+    settlement.
+
+    Setup: two sell orders on the SAME pair (A → B) but with mismatched
+    mock AMM rates (1.1× for one, 0.7× for the other). Only the first
+    trade should land; the second is silently dropped via the
+    ``router_clearing_price_conflict`` log.
+
+    Regression for the bug surfaced by ultrareview 2026-05-27 — see
+    spec §1 of ``docs/archive/specs/2026-05-26-router-and-logging-followups.md``.
+    """
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    # Two orders with identical UIDs would dedupe — keep them distinct.
+    # Mock returns different amount_out depending on the order_uid so the
+    # second order picks up a conflicting rate.
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        out: list[V3BatchedQuote] = []
+        for p in paths:
+            # First order: 1100 out for 1000 in (rate 1.1)
+            # Second order: 700 out for 1000 in (rate 0.7 — still clears the
+            #   user limit of 600, but produces a different cp)
+            amt = 1100 if p.order_uid == "s1" else 700
+            out.append(V3BatchedQuote(path=p, amount_out=amt))
+        return out
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    s1 = _make_order(uid="s1", kind="sell", sellAmount=1000, buyAmount=900)
+    s2 = _make_order(uid="s2", kind="sell", sellAmount=1000, buyAmount=600)
+
+    multicall = AsyncMock()
+    router = RouterSolver(multicall=multicall, intermediates=[], v3_only_batched=True)
+    result = await router.solve(_make_auction([s1, s2]))
+
+    assert isinstance(result, Solution)
+    # First-emitted wins (it registers prices first); second is rejected.
+    assert len(result.trades) == 1
+    assert result.trades[0].order_uid == "s1"
+    # Exactly one Interaction, matching the surviving trade — never ship
+    # an interaction for a dropped trade.
+    assert len(result.interactions) == 1
 
 
 @pytest.mark.asyncio
