@@ -52,8 +52,13 @@ class Interaction:
         if not (self.target.startswith("0x") and len(self.target) == 42):
             raise ValueError(f"target must be a 0x-prefixed 20-byte address, got {self.target!r}")
 
-    def to_gpv2_dict(self) -> dict[str, str]:
-        """Serialise to the dict shape the CoW driver expects."""
+    def to_gpv2_dict(self) -> dict[str, object]:
+        """Serialise to the dict shape the CoW driver expects.
+
+        Return type is ``dict[str, object]`` (not ``dict[str, str]``) so the
+        result is assignment-compatible with ``Solution.interactions``,
+        whose Pydantic field declares the same variance-friendly type.
+        """
         return {
             "target": self.target,
             "value": str(self.value),

@@ -13,8 +13,8 @@ from src.solver.router import RouterSolver
 def _make_order(**kwargs: object) -> Order:
     defaults: dict[str, object] = {
         "uid": "o1",
-        "sellToken": "0xa",
-        "buyToken": "0xb",
+        "sellToken": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "buyToken": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "sellAmount": 1000,
         "buyAmount": 900,
         "feePolicies": [],
@@ -78,8 +78,8 @@ async def test_router_emits_trade_when_path_beats_limit(
             HopQuote(
                 factory="sushi",
                 pool="0x" + "0" * 40,
-                token_in="0xa",
-                token_out="0xb",
+                token_in="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                token_out="0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 amount_in=1000,
                 amount_out=1100,
             )
@@ -105,8 +105,8 @@ async def test_router_skips_order_below_limit(monkeypatch: pytest.MonkeyPatch) -
             HopQuote(
                 factory="sushi",
                 pool="0x" + "0" * 40,
-                token_in="0xa",
-                token_out="0xb",
+                token_in="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                token_out="0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 amount_in=1000,
                 amount_out=800,  # below buy_amount=900
             )
@@ -607,8 +607,8 @@ async def test_router_falls_back_to_legacy_when_flag_off(
             HopQuote(
                 factory="sushi",
                 pool="0x" + "0" * 40,
-                token_in="0xa",
-                token_out="0xb",
+                token_in="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                token_out="0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 amount_in=1000,
                 amount_out=1100,
             )
@@ -686,8 +686,8 @@ async def test_router_emits_buy_order_with_quoteexactoutput(
     )
     # Fallback clearing prices (no reference prices in this auction) preserve
     # the AMM's executed ratio: cp_sell/cp_buy = buy_amount/amount_in.
-    assert result.prices["0xa"] == 500  # buy_amount as price of sell-token
-    assert result.prices["0xb"] == 900  # amount_in as price of buy-token
+    assert result.prices["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] == 500  # buy_amount as price of sell-token
+    assert result.prices["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"] == 900  # amount_in as price of buy-token
 
 
 @pytest.mark.asyncio
@@ -877,8 +877,8 @@ async def test_clearing_prices_zero_surplus_when_amm_at_limit(
     from src.routing.v3_batched import V3BatchedQuote, V3Path
     from src.shadow.scoring import compute_solution_score
 
-    sell_token = "0xa"
-    buy_token = "0xb"
+    sell_token = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    buy_token = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
     # AMM charges exactly the full signed_sell → zero surplus
     async def mock_batched(
@@ -974,11 +974,11 @@ async def test_partial_quote_search_emits_at_75pct_when_full_misses(
         f"expected executed_amount=750 (0.75x), got {trade.executed_amount}"
     )
     # Clearing prices reflect AMM output at partial amount
-    assert result.prices["0xa"] == 700, (
-        f"expected cp[sell_token]=700 (amm output at 0.75x), got {result.prices['0xa']}"
+    assert result.prices["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] == 700, (
+        f"expected cp[sell_token]=700 (amm output at 0.75x), got {result.prices['0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']}"
     )
-    assert result.prices["0xb"] == 750, (
-        f"expected cp[buy_token]=750 (partial sell), got {result.prices['0xb']}"
+    assert result.prices["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"] == 750, (
+        f"expected cp[buy_token]=750 (partial sell), got {result.prices['0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb']}"
     )
 
 

@@ -19,15 +19,7 @@ import time
 from dataclasses import dataclass
 
 from src.encoder.interactions import Interaction
-from src.encoder.v3_calldata import (
-    encode_exact_input_single,
-    encode_exact_output_single,
-)
-from src.encoder.v3_path import (
-    encode_exact_input,
-    encode_exact_output,
-    pack_v3_path,
-)
+from src.encoder.v3 import encode_v3_swap
 from src.liquidity.base import Quote, SwapRequest
 from src.log import get_logger
 from src.routing.amm_v3 import FEE_TIERS, QUOTER_V2_ADDRESS
@@ -118,14 +110,20 @@ class V3Source:
             )
 
         path = meta.path
-        deadline = meta.deadline
-
-        if path.intermediate is None:
-            calldata = self._encode_single_hop(path, quote, recipient, deadline)
-        else:
-            calldata = self._encode_multi_hop(path, quote, recipient, deadline)
-
-        return Interaction(target=self._router_address, value=0, call_data=calldata)
+        return encode_v3_swap(
+            token_in=path.token_in,
+            token_out=path.token_out,
+            fee_in=path.fee_tier_in,
+            intermediate=path.intermediate,
+            fee_out=path.fee_tier_out,
+            exact_output=path.exact_output,
+            executed_sell=quote.sell_amount,
+            executed_buy=quote.buy_amount,
+            recipient=recipient,
+            deadline=meta.deadline,
+            slippage_bps=self._slippage_bps,
+            router_address=self._router_address,
+        )
 
     def required_allowances(self, quote: Quote) -> list[tuple[str, str]]:
         meta = quote.route_metadata["v3_route"]
@@ -245,62 +243,3 @@ class V3Source:
             gas_estimate=gas_estimate,
         )
 
-    def _encode_single_hop(
-        self, path: V3Path, quote: Quote, recipient: str, deadline: int
-    ) -> bytes:
-        if path.exact_output:
-            return encode_exact_output_single(
-                token_in=path.token_in,
-                token_out=path.token_out,
-                fee=path.fee_tier_in,
-                recipient=recipient,
-                deadline=deadline,
-                amount_out=quote.buy_amount,
-                amount_in_maximum=_apply_slippage_up(quote.sell_amount, self._slippage_bps),
-            )
-        return encode_exact_input_single(
-            token_in=path.token_in,
-            token_out=path.token_out,
-            fee=path.fee_tier_in,
-            recipient=recipient,
-            deadline=deadline,
-            amount_in=quote.sell_amount,
-            amount_out_minimum=_apply_slippage_down(quote.buy_amount, self._slippage_bps),
-        )
-
-    def _encode_multi_hop(
-        self, path: V3Path, quote: Quote, recipient: str, deadline: int
-    ) -> bytes:
-        assert path.intermediate is not None and path.fee_tier_out is not None
-        packed = pack_v3_path(
-            tokens=[path.token_in, path.intermediate, path.token_out],
-            fees=[path.fee_tier_in, path.fee_tier_out],
-        )
-        if path.exact_output:
-            return encode_exact_output(
-                path=packed,
-                recipient=recipient,
-                deadline=deadline,
-                amount_out=quote.buy_amount,
-                amount_in_maximum=_apply_slippage_up(quote.sell_amount, self._slippage_bps),
-            )
-        return encode_exact_input(
-            path=packed,
-            recipient=recipient,
-            deadline=deadline,
-            amount_in=quote.sell_amount,
-            amount_out_minimum=_apply_slippage_down(quote.buy_amount, self._slippage_bps),
-        )
-
-
-def _apply_slippage_down(amount: int, slippage_bps: int) -> int:
-    """Reduce ``amount`` by ``slippage_bps`` — used for amountOutMinimum on
-    sell-kind swaps. We accept up to this much less buy_token than quoted."""
-    return amount * (10_000 - slippage_bps) // 10_000
-
-
-def _apply_slippage_up(amount: int, slippage_bps: int) -> int:
-    """Increase ``amount`` by ``slippage_bps`` — used for amountInMaximum on
-    buy-kind swaps. We accept consuming up to this much more sell_token."""
-    # Round up so the cap doesn't become tighter than intended by integer truncation.
-    return (amount * (10_000 + slippage_bps) + 9_999) // 10_000

@@ -9,6 +9,13 @@ external aggregator and RFQ sources in later phases without touching the
 solver core.
 """
 
+from src.liquidity.aggregator import LiquidityAggregator
 from src.liquidity.base import LiquiditySource, Quote, SwapKind, SwapRequest
 
-__all__ = ["LiquiditySource", "Quote", "SwapKind", "SwapRequest"]
+__all__ = [
+    "LiquidityAggregator",
+    "LiquiditySource",
+    "Quote",
+    "SwapKind",
+    "SwapRequest",
+]

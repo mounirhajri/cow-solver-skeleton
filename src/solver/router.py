@@ -22,8 +22,11 @@ Performance (legacy mode, kept for context):
 from __future__ import annotations
 
 import asyncio
+import time
 
 from src.config import settings
+from src.encoder.interactions import Interaction
+from src.encoder.v3 import encode_v3_swap
 from src.log import get_logger
 from src.models.auction import Auction
 from src.models.order import Order
@@ -33,6 +36,9 @@ from src.routing.multicall import Multicall3
 from src.routing.multihop import HopQuote, quote_best_path
 from src.routing.v3_batched import V3BatchedQuote, V3Path, batched_v3_quote
 from src.solver.base import NoSolution
+
+# Deadline grace window encoded into the swap call.
+_SWAP_DEADLINE_SECONDS = 60
 
 log = get_logger(__name__)
 
@@ -109,6 +115,12 @@ class RouterSolver:
         max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
         strategy_timeout: float = _DEFAULT_STRATEGY_TIMEOUT,
         v3_only_batched: bool | None = None,
+        # Encoder configuration — addresses + slippage default from
+        # settings but exposed as constructor params so tests can override
+        # without touching the global Settings instance.
+        gpv2_settlement: str | None = None,
+        v3_router_address: str | None = None,
+        slippage_bps: int | None = None,
     ) -> None:
         self._multicall = multicall
         self._intermediates = intermediates
@@ -119,6 +131,15 @@ class RouterSolver:
         # short-circuit the global.
         self._v3_only_batched = (
             settings.router_v3_only_batched if v3_only_batched is None else v3_only_batched
+        )
+        self._gpv2_settlement = (
+            settings.gpv2_settlement if gpv2_settlement is None else gpv2_settlement
+        )
+        self._v3_router_address = (
+            settings.v3_swap_router if v3_router_address is None else v3_router_address
+        )
+        self._slippage_bps = (
+            settings.encoder_slippage_bps if slippage_bps is None else slippage_bps
         )
         # Advertise a custom timeout so the orchestrator gives us more headroom
         # than the default 5 s per-strategy limit.
@@ -274,6 +295,14 @@ class RouterSolver:
 
         trades: list[Trade] = []
         prices: dict[str, int] = {}
+        # GPv2 settles `[pre, intra, post]`; we only populate intra. All V3
+        # interactions land in this list and the Solution publishes
+        # `[[], intra_interactions, []]` at the end.
+        intra_interactions: list[dict[str, object]] = []
+        # One deadline for the whole batch — the auction's solve window is
+        # 30 s, the swap deadline buffer is _SWAP_DEADLINE_SECONDS = 60 s, so
+        # every Interaction inside this Solution shares a single timestamp.
+        deadline = int(time.time()) + _SWAP_DEADLINE_SECONDS
         for order in orders:
             best = best_per_order.get(order.uid)
             if order.kind == "buy":
@@ -300,6 +329,14 @@ class RouterSolver:
                     executed_buy=order.buy_amount,
                     executed_sell=amount_in,
                 )
+                intra_interactions.append(
+                    self._encode_path_interaction(
+                        best.path,
+                        executed_sell=amount_in,
+                        executed_buy=order.buy_amount,
+                        deadline=deadline,
+                    ).to_gpv2_dict()
+                )
             else:
                 # Sell order: try full amount first.
                 if best is not None and best.amount_out >= order.buy_amount:
@@ -315,6 +352,14 @@ class RouterSolver:
                         prices, order,
                         executed_buy=best.amount_out,
                         executed_sell=order.sell_amount,
+                    )
+                    intra_interactions.append(
+                        self._encode_path_interaction(
+                            best.path,
+                            executed_sell=order.sell_amount,
+                            executed_buy=best.amount_out,
+                            deadline=deadline,
+                        ).to_gpv2_dict()
                     )
                 elif order.partially_fillable:
                     # Full amount missed limit. Try partial fractions in
@@ -357,6 +402,14 @@ class RouterSolver:
                                 executed_buy=frac_best.amount_out,
                                 executed_sell=partial_sell,
                             )
+                            intra_interactions.append(
+                                self._encode_path_interaction(
+                                    frac_best.path,
+                                    executed_sell=partial_sell,
+                                    executed_buy=frac_best.amount_out,
+                                    deadline=deadline,
+                                ).to_gpv2_dict()
+                            )
                             log.info(
                                 "router_partial_fill_emitted",
                                 auction_id=auction.id,
@@ -382,13 +435,17 @@ class RouterSolver:
             n_quoted=len(orders),
             n_paths=len(paths),
             n_filled=len(trades),
+            n_interactions=len(intra_interactions),
             mode="v3_batched",
         )
+        # All V3 swap calls go in the flat ``interactions`` list. The CoW
+        # driver maps each entry into the GPv2 settle() intra-interaction
+        # slot — pre/post stages aren't needed for vanilla AMM routing.
         return Solution(
             id=int(auction.id),
             prices=prices,
             trades=trades,
-            interactions=[],
+            interactions=intra_interactions,
         )
 
     # ── Legacy per-order asyncio.gather path ──────────────────────────────────
@@ -470,6 +527,39 @@ class RouterSolver:
             prices=prices,
             trades=trades,
             interactions=[],
+        )
+
+    # ── Interaction encoding ──────────────────────────────────────────────────
+
+    def _encode_path_interaction(
+        self,
+        path: V3Path,
+        *,
+        executed_sell: int,
+        executed_buy: int,
+        deadline: int,
+    ) -> Interaction:
+        """Encode the winning V3 path into a settle-able GPv2 Interaction.
+
+        Lives here (not in V3Source) so the v3_only_batched path can encode
+        directly from its V3BatchedQuote pick without going through the
+        LiquidityAggregator round-trip. Both call sites share the same
+        ``src.encoder.v3.encode_v3_swap`` dispatch — slippage math and the
+        single/multi/sell/buy table are defined once.
+        """
+        return encode_v3_swap(
+            token_in=path.token_in,
+            token_out=path.token_out,
+            fee_in=path.fee_tier_in,
+            intermediate=path.intermediate,
+            fee_out=path.fee_tier_out,
+            exact_output=path.exact_output,
+            executed_sell=executed_sell,
+            executed_buy=executed_buy,
+            recipient=self._gpv2_settlement,
+            deadline=deadline,
+            slippage_bps=self._slippage_bps,
+            router_address=self._v3_router_address,
         )
 
     # ── Shared clearing-price logic ───────────────────────────────────────────
