@@ -20,13 +20,13 @@ SETTLEMENT = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
 
 def test_exact_input_selector_matches_keccak() -> None:
     sig = "exactInput((bytes,address,uint256,uint256,uint256))"
-    assert EXACT_INPUT_SELECTOR == keccak(text=sig)[:4]
+    assert keccak(text=sig)[:4] == EXACT_INPUT_SELECTOR
     assert EXACT_INPUT_SELECTOR.hex() == "c04b8d59"
 
 
 def test_exact_output_selector_matches_keccak() -> None:
     sig = "exactOutput((bytes,address,uint256,uint256,uint256))"
-    assert EXACT_OUTPUT_SELECTOR == keccak(text=sig)[:4]
+    assert keccak(text=sig)[:4] == EXACT_OUTPUT_SELECTOR
     assert EXACT_OUTPUT_SELECTOR.hex() == "f28c0498"
 
 

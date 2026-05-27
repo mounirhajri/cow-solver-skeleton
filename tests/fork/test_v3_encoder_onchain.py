@@ -18,8 +18,8 @@ Anvil or Tenderly — and live behind a separate marker.
 
 from __future__ import annotations
 
-import urllib.request
 import json
+import urllib.request
 
 import pytest
 

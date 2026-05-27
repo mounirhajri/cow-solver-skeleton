@@ -21,13 +21,13 @@ _ARG_TYPES = ["uint256", "uint256", "address[]", "address", "uint256"]
 
 def test_swap_exact_tokens_for_tokens_selector_matches_keccak() -> None:
     sig = "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)"
-    assert SWAP_EXACT_TOKENS_FOR_TOKENS_SELECTOR == keccak(text=sig)[:4]
+    assert keccak(text=sig)[:4] == SWAP_EXACT_TOKENS_FOR_TOKENS_SELECTOR
     assert SWAP_EXACT_TOKENS_FOR_TOKENS_SELECTOR.hex() == "38ed1739"
 
 
 def test_swap_tokens_for_exact_tokens_selector_matches_keccak() -> None:
     sig = "swapTokensForExactTokens(uint256,uint256,address[],address,uint256)"
-    assert SWAP_TOKENS_FOR_EXACT_TOKENS_SELECTOR == keccak(text=sig)[:4]
+    assert keccak(text=sig)[:4] == SWAP_TOKENS_FOR_EXACT_TOKENS_SELECTOR
     assert SWAP_TOKENS_FOR_EXACT_TOKENS_SELECTOR.hex() == "8803dbee"
 
 

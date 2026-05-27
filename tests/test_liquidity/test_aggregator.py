@@ -210,5 +210,7 @@ async def test_timeout_is_forwarded_to_each_source() -> None:
     s2.quote.assert_called_once()
     _, kwargs1 = s1.quote.call_args
     _, kwargs2 = s2.quote.call_args
-    assert kwargs1.get("timeout_ms", s1.quote.call_args.args[1]) == 750 or s1.quote.call_args.args[1] == 750
-    assert kwargs2.get("timeout_ms", s2.quote.call_args.args[1]) == 750 or s2.quote.call_args.args[1] == 750
+    t1 = kwargs1.get("timeout_ms", s1.quote.call_args.args[1])
+    t2 = kwargs2.get("timeout_ms", s2.quote.call_args.args[1])
+    assert t1 == 750
+    assert t2 == 750

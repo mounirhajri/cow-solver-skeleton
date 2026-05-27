@@ -686,8 +686,9 @@ async def test_router_emits_buy_order_with_quoteexactoutput(
     )
     # Fallback clearing prices (no reference prices in this auction) preserve
     # the AMM's executed ratio: cp_sell/cp_buy = buy_amount/amount_in.
-    assert result.prices["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] == 500  # buy_amount as price of sell-token
-    assert result.prices["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"] == 900  # amount_in as price of buy-token
+    # buy_amount as price of sell-token, amount_in as price of buy-token
+    assert result.prices["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] == 500
+    assert result.prices["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"] == 900
 
 
 @pytest.mark.asyncio
@@ -1037,11 +1038,13 @@ async def test_partial_quote_search_emits_at_75pct_when_full_misses(
         f"expected executed_amount=750 (0.75x), got {trade.executed_amount}"
     )
     # Clearing prices reflect AMM output at partial amount
-    assert result.prices["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] == 700, (
-        f"expected cp[sell_token]=700 (amm output at 0.75x), got {result.prices['0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']}"
+    sell_a = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    buy_b = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    assert result.prices[sell_a] == 700, (
+        f"expected cp[sell_token]=700 (amm output at 0.75x), got {result.prices[sell_a]}"
     )
-    assert result.prices["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"] == 750, (
-        f"expected cp[buy_token]=750 (partial sell), got {result.prices['0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb']}"
+    assert result.prices[buy_b] == 750, (
+        f"expected cp[buy_token]=750 (partial sell), got {result.prices[buy_b]}"
     )
 
 

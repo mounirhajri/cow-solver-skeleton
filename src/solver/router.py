@@ -653,11 +653,18 @@ class RouterSolver:
                 if order.kind == "buy" and q.sell_amount > order.sell_amount:
                     continue
                 # Pick across sources: max buy for sell, min sell for buy.
-                if best_quote is None:
-                    best_quote, best_source = q, src
-                elif order.kind == "sell" and q.buy_amount > best_quote.buy_amount:
-                    best_quote, best_source = q, src
-                elif order.kind == "buy" and q.sell_amount < best_quote.sell_amount:
+                is_better = (
+                    best_quote is None
+                    or (
+                        order.kind == "sell"
+                        and q.buy_amount > best_quote.buy_amount
+                    )
+                    or (
+                        order.kind == "buy"
+                        and q.sell_amount < best_quote.sell_amount
+                    )
+                )
+                if is_better:
                     best_quote, best_source = q, src
 
             if best_quote is None or best_source is None:

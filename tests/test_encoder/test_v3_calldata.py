@@ -33,7 +33,7 @@ def test_exact_input_single_selector_matches_keccak() -> None:
         "exactInputSingle((address,address,uint24,address,"
         "uint256,uint256,uint256,uint160))"
     )
-    assert EXACT_INPUT_SINGLE_SELECTOR == keccak(text=sig)[:4]
+    assert keccak(text=sig)[:4] == EXACT_INPUT_SINGLE_SELECTOR
     # Pin the literal too — if the struct shape ever changes (e.g. accidentally
     # adopting SwapRouter02's deadline-less struct) this catches it.
     assert EXACT_INPUT_SINGLE_SELECTOR.hex() == "414bf389"
@@ -44,7 +44,7 @@ def test_exact_output_single_selector_matches_keccak() -> None:
         "exactOutputSingle((address,address,uint24,address,"
         "uint256,uint256,uint256,uint160))"
     )
-    assert EXACT_OUTPUT_SINGLE_SELECTOR == keccak(text=sig)[:4]
+    assert keccak(text=sig)[:4] == EXACT_OUTPUT_SINGLE_SELECTOR
     assert EXACT_OUTPUT_SINGLE_SELECTOR.hex() == "db3e2198"
 
 

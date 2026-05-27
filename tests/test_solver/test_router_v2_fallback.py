@@ -16,10 +16,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.encoder.interactions import Interaction
-from src.liquidity.base import Quote, SwapRequest
+from src.liquidity.base import Quote
 from src.models.auction import Auction
 from src.models.order import Order
-from src.routing.v3_batched import V3BatchedQuote, V3Path
+from src.routing.v3_batched import V3BatchedQuote
 from src.solver.base import NoSolution
 from src.solver.router import RouterSolver
 
@@ -29,7 +29,11 @@ DAI = "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1"
 V2_ROUTER = "0xc873fEcbd354f5A56E00E710B90EF4201db2448d"
 
 
-def _order(uid: str, sell: str, buy: str, sell_amount: int, buy_amount: int, kind: str = "sell") -> Order:
+def _order(
+    uid: str, sell: str, buy: str,
+    sell_amount: int, buy_amount: int,
+    kind: str = "sell",
+) -> Order:
     return Order.model_validate({
         "uid": uid,
         "sellToken": sell, "buyToken": buy,

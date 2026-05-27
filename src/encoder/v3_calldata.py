@@ -8,8 +8,12 @@ own concern.
 **Targets the original SwapRouter** (``0xE592427A0AEce92De3Edee1F18E0157C05861564``),
 NOT SwapRouter02. The two have subtly different struct shapes:
 
-  - SwapRouter:   ``(tokenIn, tokenOut, fee, recipient, deadline, amountIn, amountOutMinimum, sqrtPriceLimitX96)``  → selector 0x414bf389
-  - SwapRouter02: ``(tokenIn, tokenOut, fee, recipient,           amountIn, amountOutMinimum, sqrtPriceLimitX96)``  → selector 0x04e45aaf
+  - SwapRouter:   selector 0x414bf389, struct
+    ``(tokenIn, tokenOut, fee, recipient, deadline,
+       amountIn, amountOutMinimum, sqrtPriceLimitX96)``
+  - SwapRouter02: selector 0x04e45aaf, struct WITHOUT ``deadline``
+    ``(tokenIn, tokenOut, fee, recipient,
+       amountIn, amountOutMinimum, sqrtPriceLimitX96)``
 
 We want the deadline guard, so we use SwapRouter. If you ever switch
 ``settings.v3_swap_router`` to the SwapRouter02 address you must change the

@@ -54,7 +54,10 @@ def _qv2_multi_hop_return(amount_out: int) -> bytes:
     )
 
 
-def _make_source(intermediates: list[str] | None = None, slippage_bps: int = 50) -> tuple[V3Source, AsyncMock]:
+def _make_source(
+    intermediates: list[str] | None = None,
+    slippage_bps: int = 50,
+) -> tuple[V3Source, AsyncMock]:
     """Build a V3Source with a mocked Multicall3.aggregate.
 
     Returns the source and the AsyncMock so tests can configure
@@ -106,7 +109,7 @@ async def test_buy_quote_picks_min_amount_in() -> None:
     source, aggregate = _make_source(intermediates=[])
     aggregate.return_value = [
         CallResult(success=True, return_data=_qv2_single_hop_return(500)),  # tier 100: 500 in
-        CallResult(success=True, return_data=_qv2_single_hop_return(345)),  # tier 500: 345 in (best)
+        CallResult(success=True, return_data=_qv2_single_hop_return(345)),  # tier 500: best
         CallResult(success=True, return_data=_qv2_single_hop_return(400)),  # tier 3000
         CallResult(success=True, return_data=_qv2_single_hop_return(450)),  # tier 10000
     ]
@@ -186,8 +189,8 @@ def test_encode_interaction_uses_exact_input_single_for_sell_direct() -> None:
     target must reflect this; downstream Tenderly tests then verify the
     full byte-level fidelity."""
     source, _ = _make_source(intermediates=[])
-    from src.routing.v3_batched import V3Path
     from src.liquidity.v3 import _V3RouteMetadata
+    from src.routing.v3_batched import V3Path
 
     quote = Quote(
         source="v3",
@@ -212,8 +215,8 @@ def test_encode_interaction_uses_exact_input_single_for_sell_direct() -> None:
 
 def test_encode_interaction_uses_exact_output_single_for_buy_direct() -> None:
     source, _ = _make_source(intermediates=[])
-    from src.routing.v3_batched import V3Path
     from src.liquidity.v3 import _V3RouteMetadata
+    from src.routing.v3_batched import V3Path
 
     quote = Quote(
         source="v3",
@@ -236,8 +239,8 @@ def test_encode_interaction_uses_exact_output_single_for_buy_direct() -> None:
 
 def test_encode_interaction_uses_exact_input_for_multihop_sell() -> None:
     source, _ = _make_source(intermediates=[])
-    from src.routing.v3_batched import V3Path
     from src.liquidity.v3 import _V3RouteMetadata
+    from src.routing.v3_batched import V3Path
 
     quote = Quote(
         source="v3",
@@ -261,8 +264,8 @@ def test_encode_interaction_uses_exact_input_for_multihop_sell() -> None:
 
 def test_encode_interaction_uses_exact_output_for_multihop_buy() -> None:
     source, _ = _make_source(intermediates=[])
-    from src.routing.v3_batched import V3Path
     from src.liquidity.v3 import _V3RouteMetadata
+    from src.routing.v3_batched import V3Path
 
     quote = Quote(
         source="v3",
@@ -287,8 +290,8 @@ def test_encode_interaction_uses_exact_output_for_multihop_buy() -> None:
 def test_slippage_applied_to_amount_out_minimum_on_sell() -> None:
     """50bps slippage → amountOutMinimum is 99.5% of quoted buy_amount."""
     source, _ = _make_source(intermediates=[], slippage_bps=50)
-    from src.routing.v3_batched import V3Path
     from src.liquidity.v3 import _V3RouteMetadata
+    from src.routing.v3_batched import V3Path
 
     quote = Quote(
         source="v3",
@@ -316,8 +319,8 @@ def test_slippage_applied_to_amount_out_minimum_on_sell() -> None:
 
 def test_required_allowances_returns_sell_token_router_pair() -> None:
     source, _ = _make_source(intermediates=[])
-    from src.routing.v3_batched import V3Path
     from src.liquidity.v3 import _V3RouteMetadata
+    from src.routing.v3_batched import V3Path
 
     quote = Quote(
         source="v3",

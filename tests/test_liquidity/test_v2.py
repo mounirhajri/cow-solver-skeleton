@@ -18,7 +18,7 @@ from src.encoder.v2_calldata import (
     SWAP_TOKENS_FOR_EXACT_TOKENS_SELECTOR,
 )
 from src.liquidity.base import Quote, SwapRequest
-from src.liquidity.v2 import V2Source, _V2RouteMetadata, _get_amount_in
+from src.liquidity.v2 import V2Source, _get_amount_in, _V2RouteMetadata
 from src.routing.amm_v2 import quote_v2_swap
 from src.routing.multicall import CallResult
 
@@ -53,7 +53,10 @@ def _token0_return(token: str) -> bytes:
     return b"\x00" * 12 + bytes.fromhex(token[2:].lower())
 
 
-def _make_source(intermediates: list[str] | None = None, slippage_bps: int = 50) -> tuple[V2Source, AsyncMock]:
+def _make_source(
+    intermediates: list[str] | None = None,
+    slippage_bps: int = 50,
+) -> tuple[V2Source, AsyncMock]:
     multicall = MagicMock()
     multicall.aggregate = AsyncMock()
     source = V2Source(
@@ -80,7 +83,10 @@ async def test_sell_quote_direct_path_uses_constant_product() -> None:
         [CallResult(success=True, return_data=_address_return(pool_addr))],
         # call 2: pool.getReserves + pool.token0
         [
-            CallResult(success=True, return_data=_reserves_return(1_000_000_000_000, 500_000_000_000_000_000_000)),
+            CallResult(
+                success=True,
+                return_data=_reserves_return(1_000_000_000_000, 500_000_000_000_000_000_000),
+            ),
             CallResult(success=True, return_data=_token0_return(USDC)),
         ],
     ]
@@ -161,7 +167,10 @@ async def test_buy_kind_uses_closed_form_inverse() -> None:
     aggregate.side_effect = [
         [CallResult(success=True, return_data=_address_return(pool_addr))],
         [
-            CallResult(success=True, return_data=_reserves_return(1_000_000_000_000, 500_000_000_000_000_000_000)),
+            CallResult(
+                success=True,
+                return_data=_reserves_return(1_000_000_000_000, 500_000_000_000_000_000_000),
+            ),
             CallResult(success=True, return_data=_token0_return(USDC)),
         ],
     ]
@@ -263,7 +272,12 @@ def test_get_amount_in_returns_zero_when_output_exceeds_reserve() -> None:
     """Edge case: caller asks for more output than the pool contains.
     Closed-form formula would divide by negative; we explicitly return 0
     so the caller skips the path."""
-    assert _get_amount_in(amount_out=1_000_001, reserve_in=10**18, reserve_out=1_000_000, fee_bps=30) == 0
+    assert _get_amount_in(
+        amount_out=1_000_001,
+        reserve_in=10**18,
+        reserve_out=1_000_000,
+        fee_bps=30,
+    ) == 0
 
 
 def test_get_amount_in_matches_uniswap_v2_formula() -> None:

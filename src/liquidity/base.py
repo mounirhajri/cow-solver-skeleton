@@ -105,7 +105,7 @@ class LiquiditySource(Protocol):
 
     def encode_interaction(
         self, quote: Quote, recipient: str
-    ) -> "Interaction":
+    ) -> Interaction:
         """Build the on-chain call that realises ``quote`` for ``recipient``.
 
         ``recipient`` is the address that receives the buy_token output —
