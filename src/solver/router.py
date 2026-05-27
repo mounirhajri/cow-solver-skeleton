@@ -355,11 +355,29 @@ class RouterSolver:
             best = best_per_order.get(order.uid)
             if order.kind == "buy":
                 if best is None:
+                    log.info(
+                        "router_skip",
+                        auction_id=auction.id,
+                        order_uid=order.uid,
+                        kind="buy",
+                        partially_fillable=order.partially_fillable,
+                        reason="buy_no_v3_quote",
+                    )
                     continue
                 # Quoter returned amount_in (sell-side). Skip if the AMM
                 # demands more sell-token than the user signed away.
                 amount_in = best.amount_out
                 if amount_in > order.sell_amount:
+                    log.info(
+                        "router_skip",
+                        auction_id=auction.id,
+                        order_uid=order.uid,
+                        kind="buy",
+                        partially_fillable=order.partially_fillable,
+                        reason="buy_amm_exceeds_sell",
+                        amm_amount_in=amount_in,
+                        signed_sell=order.sell_amount,
+                    )
                     continue
                 # CoW Trade convention (see shadow.scoring._score_buy_trade):
                 # `executedAmount` is the EXACT side, which for a buy order
@@ -374,6 +392,14 @@ class RouterSolver:
                     executed_buy=order.buy_amount,
                     executed_sell=amount_in,
                 ):
+                    log.info(
+                        "router_skip",
+                        auction_id=auction.id,
+                        order_uid=order.uid,
+                        kind="buy",
+                        partially_fillable=order.partially_fillable,
+                        reason="buy_cip67_conflict",
+                    )
                     continue
                 trades.append(
                     Trade(
@@ -402,6 +428,14 @@ class RouterSolver:
                         executed_buy=best.amount_out,
                         executed_sell=order.sell_amount,
                     ):
+                        log.info(
+                            "router_skip",
+                            auction_id=auction.id,
+                            order_uid=order.uid,
+                            kind="sell",
+                            partially_fillable=order.partially_fillable,
+                            reason="sell_full_cip67_conflict",
+                        )
                         continue
                     trades.append(
                         Trade(
@@ -442,11 +476,23 @@ class RouterSolver:
                         (3 * order.sell_amount // 4, 3 * order.buy_amount // 4),
                         (order.sell_amount // 2, order.buy_amount // 2),
                     ]
+                    # Per-attempt diagnostic: lets the skip log answer which
+                    # fractions had quotes, which cleared limit, and which got
+                    # rejected by the CIP-67 in-progress-price-map guard.
+                    partial_attempts: list[dict[str, object]] = []
                     emitted = False
                     for partial_sell, partial_buy_limit in partial_fractions:
                         frac_best = self._select_best_quote_per_order(
                             quotes, filter_amount_in=partial_sell
                         ).get(order.uid)
+                        attempt: dict[str, object] = {
+                            "fraction": partial_sell / order.sell_amount,
+                            "partial_sell": partial_sell,
+                            "partial_buy_limit": partial_buy_limit,
+                            "quote_amount_out": (
+                                frac_best.amount_out if frac_best is not None else None
+                            ),
+                        }
                         if frac_best is not None and frac_best.amount_out >= partial_buy_limit:
                             # Same CIP-67 register-first guard as the full
                             # path above. If the fraction's rate conflicts
@@ -458,6 +504,8 @@ class RouterSolver:
                                 executed_buy=frac_best.amount_out,
                                 executed_sell=partial_sell,
                             ):
+                                attempt["outcome"] = "cip67_conflict"
+                                partial_attempts.append(attempt)
                                 continue
                             trades.append(
                                 Trade(
@@ -483,12 +531,53 @@ class RouterSolver:
                                 partial_sell=partial_sell,
                                 amm_output=frac_best.amount_out,
                             )
+                            attempt["outcome"] = "emitted"
+                            partial_attempts.append(attempt)
                             emitted = True
                             break
+                        attempt["outcome"] = (
+                            "no_quote" if frac_best is None else "below_limit"
+                        )
+                        partial_attempts.append(attempt)
                     if not emitted:
+                        log.info(
+                            "router_skip",
+                            auction_id=auction.id,
+                            order_uid=order.uid,
+                            kind="sell",
+                            partially_fillable=True,
+                            reason="sell_partial_search_all_missed",
+                            full_quote_amount_out=(
+                                best.amount_out if best is not None else None
+                            ),
+                            full_buy_limit=order.buy_amount,
+                            partial_attempts=partial_attempts,
+                        )
                         continue
                 else:
                     # Non-partial sell order misses limit → skip (no trade).
+                    # Distinguish "no AMM quote at all" from "AMM quoted but
+                    # below user's limit" — both possible, very different fix.
+                    if best is None:
+                        log.info(
+                            "router_skip",
+                            auction_id=auction.id,
+                            order_uid=order.uid,
+                            kind="sell",
+                            partially_fillable=False,
+                            reason="sell_no_v3_quote_non_partial",
+                        )
+                    else:
+                        log.info(
+                            "router_skip",
+                            auction_id=auction.id,
+                            order_uid=order.uid,
+                            kind="sell",
+                            partially_fillable=False,
+                            reason="sell_full_below_limit_non_partial",
+                            quote_amount_out=best.amount_out,
+                            buy_limit=order.buy_amount,
+                        )
                     continue
 
         # V2 fallback: orders the V3-batched pass couldn't fill (no pool,
