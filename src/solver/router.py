@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import TYPE_CHECKING
 
 from src.config import settings
 from src.encoder.interactions import Interaction
@@ -34,6 +35,9 @@ from src.models.order import Order
 from src.models.solution import Solution, Trade
 from src.routing.amm_v3 import FEE_TIERS
 from src.routing.multicall import Multicall3
+
+if TYPE_CHECKING:
+    from edge.matching.ghost_detector import GhostDetector
 from src.routing.multihop import HopQuote, quote_best_path
 from src.routing.v3_batched import V3BatchedQuote, V3Path, batched_v3_quote
 from src.solver.base import NoSolution
@@ -128,6 +132,13 @@ class RouterSolver:
         # quoting. Sources stay None on default-instantiation so existing
         # tests don't pick up the new behaviour.
         v2_sources: list[LiquiditySource] | None = None,
+        # Phase A ghost-order filter — same DynamicGhostDetector instance
+        # the Bipartite + Multi-Party strategies share. Drops UIDs known
+        # not to settle (seen >=20×/24h with 0 winner-fills) before the
+        # surplus-headroom sort, so phantom loose-limit orders (e.g. the
+        # 1-WBTC TWAP at +22 % oracle observed 2026-05-27) don't dominate
+        # the top-N selection.
+        ghost_detector: GhostDetector | None = None,
     ) -> None:
         self._multicall = multicall
         self._intermediates = intermediates
@@ -152,17 +163,40 @@ class RouterSolver:
         # a None check on the hot path. The fallback is gated on this list
         # being non-empty AND the settings flag — either off → V3-only as before.
         self._v2_sources = v2_sources or []
+        self._ghost_detector = ghost_detector
         # Advertise a custom timeout so the orchestrator gives us more headroom
         # than the default 5 s per-strategy limit.
         self.timeout: float = strategy_timeout
 
     async def solve(self, auction: Auction) -> Solution | NoSolution:
+        # Phase A ghost-order filter — drop UIDs known not to settle
+        # before the surplus-headroom sort. Without this gate, persistent
+        # loose-limit phantom orders (e.g. a single +22 % oracle TWAP UID
+        # detected by Phase A as a ghost) would dominate the top-N pick
+        # because their OTM headroom dwarfs every real order's surplus.
+        # Mirror of bipartite.py:152-167 / multi_party.py:151-167.
+        candidate_orders = list(auction.orders)
+        if self._ghost_detector is not None:
+            n_before = len(candidate_orders)
+            kept: list[Order] = []
+            for o in candidate_orders:
+                if not await self._ghost_detector.is_ghost(o):
+                    kept.append(o)
+            candidate_orders = kept
+            if len(candidate_orders) < n_before:
+                log.info(
+                    "router_dynamic_ghost_filter",
+                    auction_id=auction.id,
+                    n_filtered=n_before - len(candidate_orders),
+                    n_remaining=len(candidate_orders),
+                )
+
         # Both sell and buy orders flow through; _expected_surplus_sort_key
         # is symmetric across kinds. The V3-batched path quotes sells with
         # exactInput and buys with exactOutput. The legacy path filters
         # buys out (quote_best_path is exact-input only).
         orders = sorted(
-            auction.orders,
+            candidate_orders,
             key=lambda o: _expected_surplus_sort_key(o, auction),
             reverse=True,
         )[: self._max_orders]

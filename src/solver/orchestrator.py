@@ -277,6 +277,13 @@ def load_default_strategies() -> list[SolverStrategy]:
     rpc = RpcClient(settings.rpc_arbitrum)
     multicall = Multicall3(rpc)
 
+    # ghost_detector starts None and is replaced inside the edge-try-block
+    # when the dynamic detector can be constructed (needs the edge module
+    # for the GhostDetector class and the DB session_factory). Stays None
+    # in the public-clone / Phase-0-only path — RouterSolver's filter
+    # gracefully no-ops on None, matching Bipartite + Multi-Party.
+    ghost_detector: Any = None
+
     # Naive first: <10 ms to find trades (oracle prices as filter).
     # With multicall injected, oracle clearing prices are replaced with real
     # DEX quotes for the specific token pairs touched — typically 3-10 pairs,
@@ -346,12 +353,19 @@ def load_default_strategies() -> list[SolverStrategy]:
 
     # Router-v2 last: on-chain quotes for top-N orders by sell_amount.
     # Shares the same multicall/rpc instance as NaiveSolver (no extra connections).
+    # ghost_detector wiring closes the Phase-A gap discovered 2026-05-27:
+    # without this filter, Router was systematically picking persistent
+    # loose-limit phantom orders (e.g. one user's WBTC TWAP UID seen in
+    # 1451 auctions / 0 settlements over 6 days). The detector instance is
+    # shared with Bipartite + Multi-Party so cache invalidation stays
+    # consistent across strategies.
     strategies.append(RouterSolver(
         multicall=multicall,
         intermediates=settings.router_intermediate_tokens,
         max_orders=settings.router_max_orders,
         max_concurrent=settings.router_max_concurrent,
         strategy_timeout=settings.router_strategy_timeout,
+        ghost_detector=ghost_detector,
     ))
 
     return strategies
@@ -395,6 +409,10 @@ def _load_default_strategies_with_multicall(multicall: Any) -> list[SolverStrate
     from src.solver.router import RouterSolver
 
     strategies: list[SolverStrategy] = []
+    # See companion comment in load_default_strategies: ghost_detector is
+    # constructed inside the edge try-block (needs the GhostDetector class)
+    # and threaded into RouterSolver after the block. None on public clones.
+    ghost_detector: Any = None
     strategies.append(NaiveSolver(
         multicall=multicall,
         intermediates=settings.intermediate_tokens,
@@ -453,5 +471,6 @@ def _load_default_strategies_with_multicall(multicall: Any) -> list[SolverStrate
         max_orders=settings.router_max_orders,
         max_concurrent=settings.router_max_concurrent,
         strategy_timeout=settings.router_strategy_timeout,
+        ghost_detector=ghost_detector,
     ))
     return strategies
