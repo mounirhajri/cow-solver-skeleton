@@ -101,6 +101,29 @@ class Settings(BaseSettings):
     # the EBBO call and the production settlement window.
     ebbo_tolerance_bps: int = 50
 
+    # On-chain settlement & liquidity contract addresses (Arbitrum One).
+    # GPv2Settlement has the same address on every chain CoW supports — it's a
+    # deterministic deploy. V3 uses the original SwapRouter (NOT Universal
+    # Router, which has a different ABI).  V2 routers vary per DEX; the list
+    # below is the order LiquidityAggregator queries.
+    gpv2_settlement: str = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
+    v3_swap_router: str = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+    v2_routers: list[str] = Field(
+        default_factory=lambda: [
+            "0xc873fEcbd354f5A56E00E710B90EF4201db2448d",  # Camelot
+            "0xAAA87963EFeB6f7E0a2711F397663105Acb1805e",  # Ramses
+            "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506",  # SushiSwap
+        ]
+    )
+
+    # Encoder slippage protection — gap between quoted output and the
+    # `amountOutMinimum` we encode into the V3 call. Tight enough to keep
+    # claimed score honest; loose enough to absorb pool drift between the
+    # quote and on-chain settlement. 50bps = 0.5 %. Increase if Tenderly
+    # fork tests show frequent reverts; decrease only with very fresh
+    # quoting and short settle windows.
+    encoder_slippage_bps: int = 50
+
     # Postgres
     database_url: str = "postgresql+asyncpg://solver:solver@localhost:5432/solver"
 
@@ -110,6 +133,18 @@ class Settings(BaseSettings):
     # Observability
     log_level: str = "INFO"
     prometheus_port: int = 8001
+
+    @field_validator("encoder_slippage_bps")
+    @classmethod
+    def _check_slippage(cls, v: int) -> int:
+        # Same shape of footgun as ebbo_tolerance: >=10000 means "accept any
+        # output" (no protection), negative means "require more output than
+        # quoted" (guaranteed revert). Reject at startup.
+        if not (0 <= v < 10_000):
+            raise ValueError(
+                f"encoder_slippage_bps must be in [0, 10000); got {v}"
+            )
+        return v
 
     @field_validator("ebbo_tolerance_bps")
     @classmethod

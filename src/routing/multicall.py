@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from eth_abi import decode, encode  # type: ignore[attr-defined]
+from eth_abi import decode, encode
 
 from src.routing.rpc import RpcClient
 
