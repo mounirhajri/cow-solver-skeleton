@@ -12,14 +12,18 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+    networks:
+      - stack
     environment:
       ONEINCH_API_KEY: ${ONEINCH_API_KEY:-dummy}
       RPC_ARBITRUM: ${RPC_ARBITRUM:-https://arb1.arbitrum.io/rpc}
       REDIS_URL: redis://redis:6379/3
+      DATABASE_URL: ${DATABASE_URL}
+      REWARDS_ADDRESS: ${REWARDS_ADDRESS:-0x0000000000000000000000000000000000000000}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       SHADOW_LOG_PATH: /data/shadow.jsonl
     volumes:
-      - ./shadow_data:/data
+      - ./data:/data
     depends_on:
       redis:
         condition: service_healthy
@@ -35,12 +39,15 @@ services:
     image: ${COW_SOLVER_IMAGE:-cow-solver:dev}
     container_name: cow-reconciler
     restart: unless-stopped
+    networks:
+      - stack
     command: ["python", "-m", "scripts.reconcile_loop"]
     environment:
+      DATABASE_URL: ${DATABASE_URL}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       SHADOW_LOG_PATH: /data/shadow.jsonl
     volumes:
-      - ./shadow_data:/data
+      - ./data:/data
 
   ghost-refresh:
     # Image tag falls back to the local-built ``cow-solver:dev`` for dev /
@@ -53,11 +60,14 @@ services:
     image: ${COW_SOLVER_IMAGE:-cow-solver:dev}
     container_name: cow-ghost-refresh
     restart: unless-stopped
+    networks:
+      - stack
     command: ["python", "-m", "scripts.refresh_ghost_set", "--loop"]
     environment:
+      DATABASE_URL: ${DATABASE_URL}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
-      - ./shadow_data:/data
+      - ./data:/data
     depends_on:
       redis:
         condition: service_healthy
@@ -67,6 +77,8 @@ services:
     container_name: cow-solver-redis
     ports:
       - "6379:6379"
+    networks:
+      - stack
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -188,6 +200,8 @@ services:
     container_name: cow-driver
     profiles: ["cow-stack"]
     restart: unless-stopped
+    networks:
+      - stack
     ports:
       - "11088:11088"
     command: ["driver", "--config", "/etc/driver.config.toml", "--ethrpc", "${RPC_ARBITRUM}"]
@@ -202,6 +216,8 @@ services:
     container_name: cow-autopilot
     profiles: ["cow-stack"]
     restart: unless-stopped
+    networks:
+      - stack
     # Modern autopilot only accepts ``--config <PATH>``; the individual
     # CLI flags from older docs were removed in the v0.x refactor. Auction
     # source (shadow URL), drivers list, native-price-estimators, and
@@ -221,6 +237,8 @@ services:
     image: ghcr.io/cowprotocol/services:latest
     container_name: cow-shadow-driver
     profiles: ["shadow"]
+    networks:
+      - stack
     command: ["driver", "--config", "/etc/driver.shadow.toml", "--shadow"]
     volumes:
       - ./config/driver.shadow.toml:/etc/driver.shadow.toml:ro

@@ -114,6 +114,20 @@ jobs:
             echo "COW_SOLVER_IMAGE=ghcr.io/mounirhajri/cow-solver:latest" >> .env
           fi
 
+          # ── DATABASE_URL hard requirement ───────────────────────────────
+          # All persistence-touching services (cow-solver, reconciler,
+          # ghost-refresh, shadow-poller, cow-solver-comp-sync) read
+          # DATABASE_URL via ``${DATABASE_URL}`` substitution in compose.
+          # No safe default — the postgres password is a secret. Fail the
+          # deploy loudly if absent rather than silently letting alembic
+          # fall back to its localhost:5432 default (which doesn't exist).
+          if ! grep -q '^DATABASE_URL=' .env 2>/dev/null; then
+            echo "ERROR: DATABASE_URL not in /opt/mhagentic/stack/cow-solver/.env" >&2
+            echo "Add it manually before the next deploy:" >&2
+            echo "  echo 'DATABASE_URL=postgresql+asyncpg://USER:PASS@postgres:5432/solver' >> .env" >&2
+            exit 1
+          fi
+
           # ── Pull our service image + the CoW reference stack image ─────
           # All long-running services that share our cow-solver image are
           # pulled together. shadow-poller + cow-solver-comp-sync were
