@@ -115,20 +115,26 @@ jobs:
           fi
 
           # ── Pull our service image + the CoW reference stack image ─────
-          # We pull cowprotocol/services pre-emptively so the cow-stack
-          # profile starts fast when the operator brings it up manually.
-          # The reference image is large (~500 MB); caching it now avoids
-          # a several-minute wait at the moment of activation.
-          sudo docker compose -f docker-compose.yml pull cow-solver reconciler
+          # All long-running services that share our cow-solver image are
+          # pulled together. shadow-poller + cow-solver-comp-sync were
+          # re-added to the compose file from docker-inspect data — they
+          # join the host's stack_stack network to reach the postgres
+          # managed by /opt/mhagentic/stack/.
+          # The CoW reference stack image gets pre-cached so the operator
+          # can ``--profile cow-stack up`` in seconds.
+          sudo docker compose -f docker-compose.yml pull \
+            cow-solver reconciler ghost-refresh shadow-poller cow-solver-comp-sync
           sudo docker pull ghcr.io/cowprotocol/services:latest
 
-          # ── Bring up our own services (unchanged from previous deploys) ─
+          # ── Bring up our own services ─────────────────────────────────
           # cow-stack profile services (cow-driver, cow-autopilot) are NOT
           # started here — they remain operator-triggered to control RPC
           # consumption and verify behavior before sustained runs.
-          sudo docker compose -f docker-compose.yml up -d cow-solver reconciler
+          sudo docker compose -f docker-compose.yml up -d \
+            cow-solver reconciler ghost-refresh shadow-poller cow-solver-comp-sync
           sleep 8
           sudo docker compose -f docker-compose.yml exec -T cow-solver /app/.venv/bin/alembic upgrade head
-          sudo docker compose -f docker-compose.yml ps cow-solver reconciler
+          sudo docker compose -f docker-compose.yml ps \
+            cow-solver reconciler ghost-refresh shadow-poller cow-solver-comp-sync
           curl -fsS http://localhost:8000/health
           ENDSSH

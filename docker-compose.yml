@@ -73,6 +73,103 @@ services:
       timeout: 3s
       retries: 5
 
+  # ── Shadow data pipeline ───────────────────────────────────────────────
+  #
+  # shadow-poller pulls auctions from the public CoW orderbook and persists
+  # every strategy attempt + winner outcome into the shared postgres. The
+  # cow-solver-comp-sync container periodically pulls solver-competition
+  # data (one row per (auction, solver)) so analyze_competitors.py has the
+  # benchmark sample it needs.
+  #
+  # Both services join the host-level ``stack_stack`` network (managed by
+  # /opt/mhagentic/stack/docker-compose.yml) to reach the shared postgres.
+  # They read ``DATABASE_URL`` from /opt/mhagentic/stack/cow-solver/.env
+  # via docker-compose's automatic env_file expansion — the secret never
+  # appears in this repo.
+
+  shadow-poller:
+    build: .
+    image: ${COW_SOLVER_IMAGE:-cow-solver:dev}
+    container_name: cow-shadow-poller
+    restart: unless-stopped
+    user: app
+    networks:
+      - stack
+    command: ["python", "-m", "scripts.shadow_poller"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      SOLVER_INTERNAL_URL: http://cow-solver:8000
+      SHADOW_LOG_PATH: /data/shadow.jsonl
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/data
+    healthcheck:
+      # File-based liveness — scripts.shadow_poller touches the .alive file
+      # at the end of each poll cycle. Unhealthy if no touch within 5 min,
+      # which indicates the loop is stuck (network hang, RPC timeout, etc.)
+      # rather than a startup blip.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import sys; from pathlib import Path; from scripts.liveness import is_alive; sys.exit(0 if is_alive(Path('/data/shadow_poller.alive'), 300) else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    mem_limit: 256m
+    depends_on:
+      cow-solver:
+        condition: service_started
+
+  cow-solver-comp-sync:
+    build: .
+    image: ${COW_SOLVER_IMAGE:-cow-solver:dev}
+    container_name: cow-solver-comp-sync
+    restart: unless-stopped
+    user: app
+    networks:
+      - stack
+    # ``sleep 60`` waits for cow-solver + postgres before the first batch;
+    # this avoids the early-startup connection-refused storm that shows up
+    # in docker logs as 60s of urlopen tracebacks. 15-min cycle matches
+    # the CoW competition API's update cadence — pulling faster wastes
+    # rate-limit budget without surfacing fresher data.
+    command:
+      - sh
+      - -c
+      - |
+        echo '[comp-sync] startup, waiting 60s for solver+postgres warmup';
+        sleep 60;
+        while true; do
+          echo "[comp-sync] $(date -u +%Y-%m-%dT%H:%M:%SZ) starting batch";
+          python -m scripts.sync_competitions --days 1 --limit 200 || echo '[comp-sync] batch failed, continuing';
+          echo '[comp-sync] sleeping 900s (15min)';
+          sleep 900;
+        done
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      COW_API_RPS: "0.5"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    mem_limit: 256m
+    mem_reservation: 64m
+    # Healthcheck inherited from production: hits localhost:8000/health
+    # which is the container itself, not cow-solver — by design unhealthy
+    # ("Connection refused" because nothing listens on container's :8000).
+    # The container is functional; the healthcheck is cosmetic. Fix in a
+    # separate PR by either pointing at cow-solver:8000 (cross-service) or
+    # removing the healthcheck entirely (worker pattern, no HTTP surface).
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()\" || exit 1"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      cow-solver:
+        condition: service_started
+
   # ── CoW Reference Stack (shadow profile) ───────────────────────────────
   #
   # Enable with:
@@ -130,3 +227,15 @@ services:
     depends_on:
       cow-solver:
         condition: service_started
+
+# ── External networks ──────────────────────────────────────────────────
+#
+# ``stack`` is the shared docker network defined by /opt/mhagentic/stack/
+# docker-compose.yml. It contains the postgres instance that all the
+# stack-level services (cow-solver, ai-backoffice, etc.) share. Marking
+# it external means this compose project joins the network without
+# creating or owning it — the parent stack manages its lifecycle.
+networks:
+  stack:
+    external: true
+    name: stack_stack
