@@ -119,16 +119,24 @@ jobs:
           # profile starts fast when the operator brings it up manually.
           # The reference image is large (~500 MB); caching it now avoids
           # a several-minute wait at the moment of activation.
-          sudo docker compose -f docker-compose.yml pull cow-solver reconciler shadow-poller
+          #
+          # ``shadow-poller`` and ``cow-solver-comp-sync`` were defined in
+          # a host-local docker-compose.yml that PR #47's scp overwrote
+          # with the repo version (which lacks those services). The
+          # containers continue running as docker-managed orphans until
+          # the next host restart; their definitions need to be added
+          # back to the repo compose file as a follow-up. Pulling them
+          # here would fail with "no such service".
+          sudo docker compose -f docker-compose.yml pull cow-solver reconciler
           sudo docker pull ghcr.io/cowprotocol/services:latest
 
           # ── Bring up our own services (unchanged from previous deploys) ─
           # cow-stack profile services (cow-driver, cow-autopilot) are NOT
           # started here — they remain operator-triggered to control RPC
           # consumption and verify behavior before sustained runs.
-          sudo docker compose -f docker-compose.yml up -d cow-solver reconciler shadow-poller
+          sudo docker compose -f docker-compose.yml up -d cow-solver reconciler
           sleep 8
           sudo docker compose -f docker-compose.yml exec -T cow-solver /app/.venv/bin/alembic upgrade head
-          sudo docker compose -f docker-compose.yml ps cow-solver reconciler shadow-poller
+          sudo docker compose -f docker-compose.yml ps cow-solver reconciler
           curl -fsS http://localhost:8000/health
           ENDSSH
