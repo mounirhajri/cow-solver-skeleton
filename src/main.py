@@ -47,6 +47,15 @@ def create_app(
         body = await request.json()
         auction = Auction.model_validate(body)
 
+        # Quote-only requests: spec allows ``id=null`` when the driver asks
+        # the solver to price tokens without running an auction. Our
+        # solver does not implement quoting; return empty solutions early
+        # so downstream code paths (persist, naive, orchestrator) never
+        # encounter the unexpected None and need to defensively handle it.
+        if auction.id is None:
+            SOLVE_TOTAL.labels(outcome="no_solution").inc()
+            return _empty_solutions()
+
         # Pre-allocate the attempts list so the orchestrator can mutate it in
         # place; this preserves partial shadow data even when the outer
         # wait_for cancels mid-strategy (e.g. multi-party LP exceeding the

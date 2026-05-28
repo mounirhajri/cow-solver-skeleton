@@ -94,10 +94,15 @@ preset = "uniswap-v3"
 # graph-url = "https://gateway.thegraph.com/api/<API-KEY>/subgraphs/id/..."
 max_pools_to_initialize = 200
 
-# Camelot (Uniswap V2 fork, Arbitrum-native, sizeable USDC/USDT volume)
-[[liquidity.uniswap-v2]]
-router = "0xc873fEcbd354f5A56E00E710B90EF4201db2448d"
-pool-code = "0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f"
+# Camelot (Uniswap V2 fork, Arbitrum-native) — DISABLED.
+# Camelot uses a non-standard CREATE2 init-code hash that we have not
+# yet verified on-chain. Enabling with the wrong hash silently disables
+# the entire liquidity source (driver computes wrong pool addresses and
+# finds no reserves). Re-enable after confirming the correct value from
+# Camelot's factory contract or an authoritative integration source.
+# [[liquidity.uniswap-v2]]
+# router = "0xc873fEcbd354f5A56E00E710B90EF4201db2448d"
+# pool-code = "0x<verified-camelot-init-code-hash>"
 
 # SushiSwap on Arbitrum
 [[liquidity.uniswap-v2]]

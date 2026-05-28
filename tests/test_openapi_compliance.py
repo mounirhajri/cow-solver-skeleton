@@ -114,10 +114,14 @@ def test_solve_response_matches_openapi_shape() -> None:
 def test_solve_accepts_nullable_id() -> None:
     """Spec allows ``id: null`` for non-auction (quote) requests. The driver
     uses this when asking the solver to price a token without running a
-    real auction. We must not 422 on null id."""
+    real auction. We must not 422 on null id, and we must not call into
+    the orchestrator (which would crash on ``int(None)`` in legacy paths
+    that assume an auction is in progress)."""
     payload = _driver_shaped_auction()
     payload["id"] = None
     orch = AsyncMock()
+    # If the orchestrator IS called, the spy will record it — quote-mode
+    # must short-circuit before reaching the solver chain.
     orch.solve.return_value = (NoSolution(), [])
     app = create_app(orchestrator=orch)
     client = TestClient(app)
@@ -125,6 +129,10 @@ def test_solve_accepts_nullable_id() -> None:
     resp = client.post("/solve", json=payload)
     assert resp.status_code == 200
     assert resp.json() == {"solutions": []}
+    # Quote-only requests must NOT trigger a solve attempt — the
+    # downstream persist + naive code paths assume a non-None auction.id
+    # and the spec semantics of quote-mode is "price tokens, don't solve".
+    orch.solve.assert_not_called()
 
 
 def test_solve_ignores_unknown_driver_fields() -> None:
