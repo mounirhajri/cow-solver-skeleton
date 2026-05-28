@@ -20,10 +20,34 @@ def test_auction_parses_minimal_valid_input(sample_auction_dict: dict) -> None:
     assert auction.orders[0].sell_amount == 10**18
 
 
-def test_auction_rejects_missing_id(sample_auction_dict: dict) -> None:
+def test_auction_accepts_null_id(sample_auction_dict: dict) -> None:
+    # Per CoW solver-engine OpenAPI, ``id`` is nullable to support quote-only
+    # requests where the driver is not running an auction but asks the solver
+    # for token-price estimates. Missing or explicit-null ``id`` both
+    # parse successfully and yield ``auction.id is None``.
     del sample_auction_dict["id"]
-    with pytest.raises(ValueError):
-        Auction.model_validate(sample_auction_dict)
+    auction = Auction.model_validate(sample_auction_dict)
+    assert auction.id is None
+
+    sample_auction_dict["id"] = None
+    auction = Auction.model_validate(sample_auction_dict)
+    assert auction.id is None
+
+
+def test_auction_accepts_cow_driver_extras(sample_auction_dict: dict) -> None:
+    """Driver sends ``effectiveGasPrice``, ``deadline``,
+    ``surplusCapturingJitOrderOwners`` — verify all parse without error
+    and unknown extras are tolerated (extra='ignore')."""
+    sample_auction_dict["effectiveGasPrice"] = "1500000000"
+    sample_auction_dict["deadline"] = "2026-06-01T12:00:00Z"
+    sample_auction_dict["surplusCapturingJitOrderOwners"] = [
+        "0x" + "a" * 40,
+    ]
+    sample_auction_dict["unknownFieldFromFutureDriver"] = {"foo": "bar"}
+    auction = Auction.model_validate(sample_auction_dict)
+    assert auction.effective_gas_price == 1500000000
+    assert auction.deadline == "2026-06-01T12:00:00Z"
+    assert auction.surplus_capturing_jit_order_owners == ["0x" + "a" * 40]
 
 
 def test_auction_tokens_indexed_by_address(sample_auction_dict: dict) -> None:

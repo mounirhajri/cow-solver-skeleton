@@ -132,6 +132,14 @@ class Settings(BaseSettings):
     # quoting and short settle windows.
     encoder_slippage_bps: int = 50
 
+    # CoW solver competition rewards — set via REWARDS_ADDRESS env var.
+    # Single address controlled by us on BOTH Arbitrum and Ethereum mainnet.
+    # COW reward tokens are sent to this address on mainnet; native-token
+    # gas reimbursements are sent on the chain where solving happens.
+    # Validator rejects malformed values at startup rather than letting them
+    # propagate into rewards distribution where misroutes would be irreversible.
+    rewards_address: str = "0x0000000000000000000000000000000000000000"
+
     # Postgres
     database_url: str = "postgresql+asyncpg://solver:solver@localhost:5432/solver"
 
@@ -166,6 +174,16 @@ class Settings(BaseSettings):
                 f"ebbo_tolerance_bps must be in [0, 10000); got {v}"
             )
         return v
+
+    @field_validator("rewards_address")
+    @classmethod
+    def _check_rewards_address(cls, v: str) -> str:
+        import re
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", v):
+            raise ValueError(
+                f"rewards_address must be a 0x-prefixed 40-hex-char address; got {v!r}"
+            )
+        return v.lower()
 
 
 settings = Settings()

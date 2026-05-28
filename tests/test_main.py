@@ -48,8 +48,12 @@ def test_solve_with_solution(auction_payload: dict) -> None:
     resp = client.post("/solve", json=auction_payload)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["id"] == 12345
-    assert len(body["trades"]) == 1
+    # OpenAPI shape: {"solutions": [Solution]}
+    assert "solutions" in body
+    assert len(body["solutions"]) == 1
+    solution = body["solutions"][0]
+    assert solution["id"] == 12345
+    assert len(solution["trades"]) == 1
 
 
 def test_solve_with_no_solution(auction_payload: dict) -> None:
@@ -58,7 +62,22 @@ def test_solve_with_no_solution(auction_payload: dict) -> None:
     app = create_app(orchestrator=orch)
     client = TestClient(app)
     resp = client.post("/solve", json=auction_payload)
-    # CoW driver expects a Solution object; empty solution = no participation
+    # OpenAPI: empty solutions array signals "we don't participate" — distinct
+    # from a Solution with empty trades, which would be interpreted as a
+    # valid (but pointless) settlement attempt.
     assert resp.status_code == 200
     body = resp.json()
-    assert body["trades"] == []
+    assert body == {"solutions": []}
+
+
+def test_notify_endpoint_acknowledges() -> None:
+    """The driver POSTs status notifications after each auction; we must
+    accept them with 200 OK so the driver doesn't retry/queue them."""
+    app = create_app(orchestrator=AsyncMock())
+    client = TestClient(app)
+    resp = client.post("/notify", json={
+        "auctionId": "12345",
+        "solutionId": 1,
+        "kind": "success",
+    })
+    assert resp.status_code == 200
