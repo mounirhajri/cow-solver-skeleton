@@ -128,6 +128,16 @@ jobs:
             exit 1
           fi
 
+          # Source the .env into the shell environment so docker compose's
+          # ``${VAR}`` substitutions resolve at parse time. The auto-loading
+          # docker compose does on the project .env file is partial: it
+          # works for some shell setups and not others. Explicit sourcing
+          # avoids the "variable is not set, defaulting to blank string"
+          # warning that broke the PR #49 deploy.
+          set -a
+          source .env
+          set +a
+
           # ── Pull our service image + the CoW reference stack image ─────
           # All long-running services that share our cow-solver image are
           # pulled together. shadow-poller + cow-solver-comp-sync were
@@ -144,7 +154,14 @@ jobs:
           # cow-stack profile services (cow-driver, cow-autopilot) are NOT
           # started here — they remain operator-triggered to control RPC
           # consumption and verify behavior before sustained runs.
-          sudo docker compose -f docker-compose.yml up -d \
+          #
+          # --remove-orphans is needed because some containers were created
+          # under a different compose project label in the past (manual
+          # edits / earlier docker-compose version). Without the flag,
+          # ``up`` errors with "container name already in use" when it
+          # tries to recreate a service whose container_name matches an
+          # existing orphan (observed on cow-ghost-refresh after PR #49).
+          sudo docker compose -f docker-compose.yml up -d --remove-orphans \
             cow-solver reconciler ghost-refresh shadow-poller cow-solver-comp-sync
           sleep 8
           sudo docker compose -f docker-compose.yml exec -T cow-solver /app/.venv/bin/alembic upgrade head
