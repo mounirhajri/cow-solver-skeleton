@@ -114,19 +114,43 @@ jobs:
             echo "COW_SOLVER_IMAGE=ghcr.io/mounirhajri/cow-solver:latest" >> .env
           fi
 
+          # ── Source secrets from parent + local .env ─────────────────────
+          # The postgres credentials live in /opt/mhagentic/stack/.env
+          # (shared across the broader stack). We source the parent first,
+          # then the local cow-solver/.env so local values override.
+          # Explicit ``set -a; source; set +a`` exports every key/value
+          # into the SSH shell environment so docker-compose's
+          # ``${VAR}`` substitutions resolve at parse time.
+          set -a
+          [ -f /opt/mhagentic/stack/.env ] && source /opt/mhagentic/stack/.env
+          [ -f .env ] && source .env
+          set +a
+
           # ── DATABASE_URL hard requirement ───────────────────────────────
-          # All persistence-touching services (cow-solver, reconciler,
-          # ghost-refresh, shadow-poller, cow-solver-comp-sync) read
-          # DATABASE_URL via ``${DATABASE_URL}`` substitution in compose.
-          # No safe default — the postgres password is a secret. Fail the
-          # deploy loudly if absent rather than silently letting alembic
-          # fall back to its localhost:5432 default (which doesn't exist).
-          if ! grep -q '^DATABASE_URL=' .env 2>/dev/null; then
-            echo "ERROR: DATABASE_URL not in /opt/mhagentic/stack/cow-solver/.env" >&2
-            echo "Add it manually before the next deploy:" >&2
-            echo "  echo 'DATABASE_URL=postgresql+asyncpg://USER:PASS@postgres:5432/solver' >> .env" >&2
+          # Verify the source step actually populated DATABASE_URL. No
+          # safe default — postgres password is a secret. Fail loudly
+          # rather than letting alembic fall back to localhost:5432.
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "ERROR: DATABASE_URL not in /opt/mhagentic/stack/.env or" >&2
+            echo "       /opt/mhagentic/stack/cow-solver/.env" >&2
             exit 1
           fi
+
+          # ── Remove pre-existing orphan containers ──────────────────────
+          # Containers from older compose runs (different project labels,
+          # different docker-compose versions, manual ``docker run``)
+          # block ``compose up`` with "container name already in use"
+          # even when our compose defines the same service name. Force
+          # remove them — compose then re-creates from the current spec.
+          # Idempotent: ``|| true`` so non-existence is not an error.
+          for c in cow-ghost-refresh cow-shadow-poller cow-solver-comp-sync; do
+            proj=$(sudo docker inspect "$c" --format '{{ index .Config.Labels "com.docker.compose.project" }}' 2>/dev/null || true)
+            hash=$(sudo docker inspect "$c" --format '{{ index .Config.Labels "com.docker.compose.config-hash" }}' 2>/dev/null || true)
+            if [ -n "$proj" ]; then
+              echo "Pre-removing $c (project=$proj, config-hash=${hash:0:12}...) to dodge name conflict"
+              sudo docker rm -f "$c" || true
+            fi
+          done
 
           # ── Pull our service image + the CoW reference stack image ─────
           # All long-running services that share our cow-solver image are
@@ -144,7 +168,9 @@ jobs:
           # cow-stack profile services (cow-driver, cow-autopilot) are NOT
           # started here — they remain operator-triggered to control RPC
           # consumption and verify behavior before sustained runs.
-          sudo docker compose -f docker-compose.yml up -d \
+          # --remove-orphans cleans up any orphans we missed in the
+          # pre-removal loop above (e.g. future renames).
+          sudo docker compose -f docker-compose.yml up -d --remove-orphans \
             cow-solver reconciler ghost-refresh shadow-poller cow-solver-comp-sync
           sleep 8
           sudo docker compose -f docker-compose.yml exec -T cow-solver /app/.venv/bin/alembic upgrade head
