@@ -1,26 +1,110 @@
-# Shadow-mode driver config for cow-solver-skeleton.
-# Driver receives real Arbitrum batches from CoW autopilot but does NOT
-# submit settlements on-chain.
+# CoW driver config — Arbitrum One, shadow profile.
+#
+# This config wires the CoW reference driver to our locally-running solver
+# engine (cow-solver on port 8000). The driver receives auctions from the
+# autopilot (running with --shadow against api.cow.fi/arbitrum_one),
+# pre-processes them, calls our /solve endpoint, post-processes solutions
+# (simulating each one), and would submit on-chain IF this were a non-shadow
+# deployment. In shadow mode the driver still simulates but does not submit.
+#
+# Refresh source: https://github.com/cowprotocol/services/blob/main/crates/driver/example.toml
 
-[shadow]
-# Run as observer
-solvers = ["http://cow-solver:8000"]
+# Conservative gas limit; Arbitrum block max is 1.125B gas as of 2026 but
+# real settlements stay well under 45M.
+tx-gas-limit = "45000000"
 
-[liquidity]
-# Driver will index AMM state and provide it to our solver via the auction payload.
-[liquidity.uniswap-v2]
-router = "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24"  # Uniswap V2 router on Arbitrum
-
-[liquidity.uniswap-v3]
-router = "0xE592427A0AEce92De3Edee1F18E0157C05861564"  # Uniswap V3 SwapRouter on Arbitrum
+[[solver]]
+name = "mhagentic"
+# Our solver engine FastAPI app. ``cow-solver`` is the docker compose
+# service name — resolves via the compose default network.
+endpoint = "http://cow-solver:8000"
+# Absolute slippage tolerance in wei (= 0.04 ETH). Generous because
+# bipartite emits at 1% partial slices and pool depth on Arbitrum stables
+# rarely shows >5bps slippage on $100k.
+absolute-slippage = "40000000000000000"
+# Relative slippage = 1% — wider than our internal partial-fill cap so
+# the driver doesn't reject our solutions on tight clearing prices.
+relative-slippage = "0.01"
+# PLACEHOLDER private key — gets replaced by CoW team during Barn onboarding.
+# Until then this account has no on-chain authority and shadow simulations
+# do not require a funded key.
+account = "0x0000000000000000000000000000000000000000000000000000000000000001"
+# Driver merges disjoint solutions for higher aggregate score — we want
+# this because our bipartite + router can produce non-overlapping fills
+# that combine cleanly.
+merge-solutions = true
+# Our /solve response with full V3 interactions is large (~50KB worst-case)
+# — keep response cap generous.
+response-size-limit-max-bytes = 30000000
 
 [submission]
-# Shadow mode: no submission keys needed
-gas-price-cap = "1000000000"  # 1 gwei cap (informational)
+# Gas-price cap for any tx we'd submit. Arbitrum gas is cheap; this is a
+# guardrail against runaway gas markets, not a precision tuning knob.
+gas-price-cap = "1000000000000"
+
+[[submission.mempool]]
+# Public Arbitrum RPC — replace with our paid endpoint in production.
+url = "https://arb1.arbitrum.io/rpc"
+name = "arbitrum-public"
+mines-reverting-txs = false
 
 [contracts]
-# Arbitrum addresses
+# GPv2 Settlement — same address on every chain CoW supports
 gp-v2-settlement = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
+# WETH (Arbitrum One)
+weth = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+# Balance + signature helpers — same address pattern as mainnet; verify
+# during onboarding call.
+balances = "0x3e8C6De9510e7ECad902D005DE3Ab52f35cF4f1b"
+signatures = "0x8262d639c38470F38d2eff15926F7071c28057Af"
+# Flash-loan router — disabled (zero address) until we have a use case
+flashloan-router = "0x0000000000000000000000000000000000000000"
 
-[ethereum]
-node-url = "${RPC_ARBITRUM}"
+[liquidity]
+# Base tokens drive the multi-hop search graph in the reference driver's
+# liquidity pre-fetch step. We pick the high-volume Arbitrum stables +
+# WETH + WBTC; the driver auto-discovers paths through them.
+base-tokens = [
+  "0xaf88d065e77c8cc2239327c5edb3a432268e5831",  # USDC
+  "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",  # USDT
+  "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",  # WETH
+  "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f",  # WBTC
+  "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1",  # DAI
+]
+
+# Order priority strategies — applied in declared order. We use the
+# CoW-default trio: timestamp (FIFO), external-price (ITM bias), and
+# own-quotes (recent quote feedback loop).
+[[order-priority]]
+strategy = "creation-timestamp"
+
+[[order-priority]]
+strategy = "external-price"
+
+[[order-priority]]
+strategy = "own-quotes"
+max-order-age = "1m"
+
+# Uniswap V3 — primary AMM source on Arbitrum.
+[[liquidity.uniswap-v3]]
+preset = "uniswap-v3"
+# Subgraph URL needs Graph API key — leave commented until provisioned.
+# Without subgraph the driver falls back to on-chain factory enumeration
+# which is slower (~30s startup) but works without credentials.
+# graph-url = "https://gateway.thegraph.com/api/<API-KEY>/subgraphs/id/..."
+max_pools_to_initialize = 200
+
+# Camelot (Uniswap V2 fork, Arbitrum-native) — DISABLED.
+# Camelot uses a non-standard CREATE2 init-code hash that we have not
+# yet verified on-chain. Enabling with the wrong hash silently disables
+# the entire liquidity source (driver computes wrong pool addresses and
+# finds no reserves). Re-enable after confirming the correct value from
+# Camelot's factory contract or an authoritative integration source.
+# [[liquidity.uniswap-v2]]
+# router = "0xc873fEcbd354f5A56E00E710B90EF4201db2448d"
+# pool-code = "0x<verified-camelot-init-code-hash>"
+
+# SushiSwap on Arbitrum
+[[liquidity.uniswap-v2]]
+router = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
+pool-code = "0xe18a34eb0e04b04f7a0ac29a6e80748dca96319b42c54d679cb821dca90c6303"

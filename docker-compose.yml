@@ -55,8 +55,51 @@ services:
       timeout: 3s
       retries: 5
 
-  # Shadow driver: only enabled when explicitly started.
-  # Use: docker compose --profile shadow up
+  # ── CoW Reference Stack (shadow profile) ───────────────────────────────
+  #
+  # Enable with:
+  #     docker compose --profile cow-stack up -d cow-driver cow-autopilot
+  #
+  # The driver receives auctions from cow-autopilot, fetches liquidity,
+  # calls our solver engine at http://cow-solver:8000/solve, post-processes
+  # the response (including simulation), and would submit on-chain if not
+  # in shadow mode. The autopilot is configured against Arbitrum One
+  # production orderbook so we see real auction order flow without
+  # actually settling anything — this gives us local Tier-3 verification
+  # data (= which of our shadow solutions would actually settle).
+
+  cow-driver:
+    image: ghcr.io/cowprotocol/services:latest
+    container_name: cow-driver
+    profiles: ["cow-stack"]
+    restart: unless-stopped
+    ports:
+      - "11088:11088"
+    command: ["driver", "--config", "/etc/driver.config.toml", "--ethrpc", "${RPC_ARBITRUM}"]
+    volumes:
+      - ./config/driver.shadow.toml:/etc/driver.config.toml:ro
+    depends_on:
+      cow-solver:
+        condition: service_started
+
+  cow-autopilot:
+    image: ghcr.io/cowprotocol/services:latest
+    container_name: cow-autopilot
+    profiles: ["cow-stack"]
+    restart: unless-stopped
+    command:
+      - autopilot
+      - --skip-event-sync=true
+      - --node-url=${RPC_ARBITRUM}
+      - --shadow=https://api.cow.fi/arbitrum_one
+      - --drivers=mhagentic|http://cow-driver:11088/mhagentic
+      - --native-price-estimators=baseline|http://cow-driver:11088/baseline
+    depends_on:
+      - cow-driver
+
+  # Legacy alias preserved so any existing tooling that references
+  # ``shadow-driver`` keeps working. New deployments should use cow-driver
+  # via the cow-stack profile above.
   shadow-driver:
     image: ghcr.io/cowprotocol/services:latest
     container_name: cow-shadow-driver
@@ -66,4 +109,4 @@ services:
       - ./config/driver.shadow.toml:/etc/driver.shadow.toml:ro
     depends_on:
       cow-solver:
-        condition: service_healthy
+        condition: service_started

@@ -16,3 +16,6 @@ shadow_data/
 .DS_Store
 .vscode/
 .idea/
+
+# Stray binary docs from past sessions — not part of the solver repo
+docs/*.docx
