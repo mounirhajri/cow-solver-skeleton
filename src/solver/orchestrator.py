@@ -63,6 +63,11 @@ class SolverOrchestrator:
         auction: Auction,
         attempts: list[AttemptRecord] | None = None,
     ) -> tuple[Solution | NoSolution, list[AttemptRecord]]:
+        # /solve gates quote-only (id=None) requests before invoking the
+        # orchestrator, so by the time we run here id is guaranteed
+        # non-None. Assert narrows the type for mypy and would fail
+        # loudly if the gate ever regresses.
+        assert auction.id is not None, "orchestrator must not run for quote-only auctions"
         # Callers may pass an attempts list to capture partial state across an
         # outer cancellation (e.g. main.py's wait_for timeout) — the list is
         # mutated in place so the caller can persist whatever was collected
