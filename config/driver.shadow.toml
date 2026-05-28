@@ -107,7 +107,11 @@ max-order-age = "1m"
 # router = "0xc873fEcbd354f5A56E00E710B90EF4201db2448d"
 # pool-code = "0x<verified-camelot-init-code-hash>"
 
-# SushiSwap on Arbitrum
+# SushiSwap on Arbitrum — using preset variant.
+# Custom variant (router + pool-code only) fails schema validation in
+# cowprotocol/services:latest with "data did not match any variant of
+# untagged enum UniswapV2Config" (verified via TOML_TRACE_ERROR 2026-05-28).
+# The preset variant uses the driver's built-in router/pool-code table for
+# the named fork, which is the supported path for well-known V2 forks.
 [[liquidity.uniswap-v2]]
-router = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
-pool-code = "0xe18a34eb0e04b04f7a0ac29a6e80748dca96319b42c54d679cb821dca90c6303"
+preset = "sushi-swap"

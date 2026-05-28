@@ -6,7 +6,11 @@ from src.models.order import Order
 class Token(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
-    decimals: int
+    # Per solver-engine OpenAPI: decimals is OPTIONAL ("may be missing for
+    # ERC20 tokens that don't implement the optional metadata extension").
+    # Driver forwards null when its token-info table has no entry — verified
+    # 2026-05-28 against shadow_auctions/7401439 (DAI on Arbitrum).
+    decimals: int | None = None
     symbol: str | None = None
     reference_price: int | None = Field(alias="referencePrice", default=None)
     available_balance: int = Field(alias="availableBalance", default=0)
