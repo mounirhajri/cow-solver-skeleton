@@ -101,6 +101,16 @@ jobs:
             echo "::warning::REWARDS_ADDRESS not set; using placeholder zero address. Set a real address before Barn onboarding."
           fi
 
+          # ── COW_SOLVER_IMAGE pin ────────────────────────────────────────
+          # docker-compose.yml uses ``${COW_SOLVER_IMAGE:-cow-solver:dev}``
+          # so local builds can keep using the legacy tag. On the production
+          # host we pin to the GHCR image so ``docker compose up`` for any
+          # service that depends_on cow-solver (cow-driver, cow-autopilot,
+          # ...) doesn't try to rebuild from a Dockerfile that isn't there.
+          if ! grep -q '^COW_SOLVER_IMAGE=' .env 2>/dev/null; then
+            echo "COW_SOLVER_IMAGE=ghcr.io/mounirhajri/cow-solver:latest" >> .env
+          fi
+
           # ── Pull our service image + the CoW reference stack image ─────
           # We pull cowprotocol/services pre-emptively so the cow-stack
           # profile starts fast when the operator brings it up manually.
