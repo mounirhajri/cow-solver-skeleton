@@ -114,29 +114,34 @@ jobs:
             echo "COW_SOLVER_IMAGE=ghcr.io/mounirhajri/cow-solver:latest" >> .env
           fi
 
+          # ── Source secrets from parent + local .env ─────────────────────
+          # The postgres credentials live in /opt/mhagentic/stack/.env
+          # (shared across the broader stack). We source the parent first,
+          # then the local cow-solver/.env so local values override.
+          # Explicit ``set -a; source; set +a`` exports every key/value
+          # into the SSH shell environment so docker-compose's
+          # ``${VAR}`` substitutions resolve at parse time.
+          #
+          # Docker compose's auto .env loading from the compose directory
+          # is partial across shell setups; relying on it broke the PR #49
+          # deploy with "variable is not set, defaulting to blank string".
+          set -a
+          [ -f /opt/mhagentic/stack/.env ] && source /opt/mhagentic/stack/.env
+          [ -f .env ] && source .env
+          set +a
+
           # ── DATABASE_URL hard requirement ───────────────────────────────
-          # All persistence-touching services (cow-solver, reconciler,
-          # ghost-refresh, shadow-poller, cow-solver-comp-sync) read
-          # DATABASE_URL via ``${DATABASE_URL}`` substitution in compose.
-          # No safe default — the postgres password is a secret. Fail the
-          # deploy loudly if absent rather than silently letting alembic
-          # fall back to its localhost:5432 default (which doesn't exist).
-          if ! grep -q '^DATABASE_URL=' .env 2>/dev/null; then
-            echo "ERROR: DATABASE_URL not in /opt/mhagentic/stack/cow-solver/.env" >&2
+          # Verify the source step actually populated DATABASE_URL. No
+          # safe default — postgres password is a secret. Fail loudly
+          # rather than letting alembic fall back to localhost:5432.
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "ERROR: DATABASE_URL not in /opt/mhagentic/stack/.env or" >&2
+            echo "       /opt/mhagentic/stack/cow-solver/.env" >&2
             echo "Add it manually before the next deploy:" >&2
-            echo "  echo 'DATABASE_URL=postgresql+asyncpg://USER:PASS@postgres:5432/solver' >> .env" >&2
+            echo "  echo 'DATABASE_URL=postgresql+asyncpg://USER:PASS@postgres:5432/solver' \\" >&2
+            echo "    >> /opt/mhagentic/stack/.env" >&2
             exit 1
           fi
-
-          # Source the .env into the shell environment so docker compose's
-          # ``${VAR}`` substitutions resolve at parse time. The auto-loading
-          # docker compose does on the project .env file is partial: it
-          # works for some shell setups and not others. Explicit sourcing
-          # avoids the "variable is not set, defaulting to blank string"
-          # warning that broke the PR #49 deploy.
-          set -a
-          source .env
-          set +a
 
           # ── Pull our service image + the CoW reference stack image ─────
           # All long-running services that share our cow-solver image are
