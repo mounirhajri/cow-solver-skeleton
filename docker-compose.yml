@@ -1,7 +1,13 @@
 services:
   cow-solver:
+    # Image tag falls back to the local-built ``cow-solver:dev`` for dev /
+    # CI / tests where the GHCR image is unreachable. Production deploys
+    # override via the ``COW_SOLVER_IMAGE`` env var (set in /opt/.../​.env
+    # by the deploy step) to ``ghcr.io/mounirhajri/cow-solver:latest`` so
+    # ``docker compose pull`` and ``up`` resolve the registry image
+    # without trying to build a Dockerfile that isn't present on the host.
     build: .
-    image: cow-solver:dev
+    image: ${COW_SOLVER_IMAGE:-cow-solver:dev}
     container_name: cow-solver
     restart: unless-stopped
     ports:
@@ -19,8 +25,14 @@ services:
         condition: service_healthy
 
   reconciler:
+    # Image tag falls back to the local-built ``cow-solver:dev`` for dev /
+    # CI / tests where the GHCR image is unreachable. Production deploys
+    # override via the ``COW_SOLVER_IMAGE`` env var (set in /opt/.../​.env
+    # by the deploy step) to ``ghcr.io/mounirhajri/cow-solver:latest`` so
+    # ``docker compose pull`` and ``up`` resolve the registry image
+    # without trying to build a Dockerfile that isn't present on the host.
     build: .
-    image: cow-solver:dev
+    image: ${COW_SOLVER_IMAGE:-cow-solver:dev}
     container_name: cow-reconciler
     restart: unless-stopped
     command: ["python", "-m", "scripts.reconcile_loop"]
@@ -31,8 +43,14 @@ services:
       - ./shadow_data:/data
 
   ghost-refresh:
+    # Image tag falls back to the local-built ``cow-solver:dev`` for dev /
+    # CI / tests where the GHCR image is unreachable. Production deploys
+    # override via the ``COW_SOLVER_IMAGE`` env var (set in /opt/.../​.env
+    # by the deploy step) to ``ghcr.io/mounirhajri/cow-solver:latest`` so
+    # ``docker compose pull`` and ``up`` resolve the registry image
+    # without trying to build a Dockerfile that isn't present on the host.
     build: .
-    image: cow-solver:dev
+    image: ${COW_SOLVER_IMAGE:-cow-solver:dev}
     container_name: cow-ghost-refresh
     restart: unless-stopped
     command: ["python", "-m", "scripts.refresh_ghost_set", "--loop"]
@@ -87,13 +105,15 @@ services:
     container_name: cow-autopilot
     profiles: ["cow-stack"]
     restart: unless-stopped
-    command:
-      - autopilot
-      - --skip-event-sync=true
-      - --node-url=${RPC_ARBITRUM}
-      - --shadow=https://api.cow.fi/arbitrum_one
-      - --drivers=mhagentic|http://cow-driver:11088/mhagentic
-      - --native-price-estimators=baseline|http://cow-driver:11088/baseline
+    # Modern autopilot only accepts ``--config <PATH>``; the individual
+    # CLI flags from older docs were removed in the v0.x refactor. Auction
+    # source (shadow URL), drivers list, native-price-estimators, and
+    # node-url all live in the toml now.
+    command: ["autopilot", "--config", "/etc/autopilot.config.toml"]
+    environment:
+      RPC_ARBITRUM: ${RPC_ARBITRUM:-https://arb1.arbitrum.io/rpc}
+    volumes:
+      - ./config/autopilot.shadow.toml:/etc/autopilot.config.toml:ro
     depends_on:
       - cow-driver
 

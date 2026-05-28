@@ -85,14 +85,17 @@ strategy = "external-price"
 strategy = "own-quotes"
 max-order-age = "1m"
 
-# Uniswap V3 — primary AMM source on Arbitrum.
-[[liquidity.uniswap-v3]]
-preset = "uniswap-v3"
-# Subgraph URL needs Graph API key — leave commented until provisioned.
-# Without subgraph the driver falls back to on-chain factory enumeration
-# which is slower (~30s startup) but works without credentials.
+# Uniswap V3 — DISABLED until we have a Graph API key.
+# The current driver schema (cowprotocol/services:latest) requires the
+# preset variant to carry ``graph-url`` AND ``max_pools_to_initialize``
+# together; providing only the latter triggers "data did not match any
+# variant of untagged enum UniswapV3Config". Verified by TOML_TRACE_ERROR.
+# Re-enable once a Graph API endpoint is provisioned, OR switch to the
+# custom (router-based) variant of UniswapV3Config.
+# [[liquidity.uniswap-v3]]
+# preset = "uniswap-v3"
 # graph-url = "https://gateway.thegraph.com/api/<API-KEY>/subgraphs/id/..."
-max_pools_to_initialize = 200
+# max_pools_to_initialize = 200
 
 # Camelot (Uniswap V2 fork, Arbitrum-native) — DISABLED.
 # Camelot uses a non-standard CREATE2 init-code hash that we have not

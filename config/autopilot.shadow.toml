@@ -1,0 +1,58 @@
+# CoW autopilot config — Arbitrum One, shadow profile.
+#
+# Shadow mode: autopilot pulls live auctions from the production
+# orderbook (``shadow = "..."``) and runs solver competition against
+# our local cow-driver without executing settlements on-chain.
+#
+# Schema reference: cowprotocol/services playground/configs/autopilot.toml
+# and crates/configs/src/autopilot/mod.rs. ``shadow`` is the top-level
+# enabler — present URL → shadow run-loop, absent → normal autopilot
+# (which would require a write-capable database we don't run).
+
+# Arbitrum One RPC endpoint. ``${RPC_ARBITRUM}`` substituted at compose
+# parse time from /opt/mhagentic/stack/.env on the host.
+node-url = "${RPC_ARBITRUM}"
+simulation-node-url = "${RPC_ARBITRUM}"
+
+# Pull auctions from CoW production orderbook on Arbitrum. Without this
+# key the autopilot tries to build its own auctions from a local
+# orderbook DB which we do not run in this setup.
+shadow = "https://api.cow.fi/arbitrum_one"
+
+[logging]
+filter = "warn,autopilot=info,shared=warn"
+
+[current-block]
+# Arbitrum has ~250ms block time but we don't need that granularity for
+# auction polling. 5s keeps RPC consumption modest on shared infra.
+poll-interval = "5s"
+
+[[gas-estimators]]
+type = "Web3"
+
+[[drivers]]
+# Must match the [[solver]] name in driver.shadow.toml. Used by the
+# driver to route the autopilot request to the right internal solver.
+name = "mhagentic"
+url = "http://cow-driver:11088/mhagentic"
+# Placeholder solver address — gets replaced with the real submission
+# key when CoW provisions one during Barn onboarding. Shadow mode does
+# not actually use this address for anything on-chain.
+address = "0x0000000000000000000000000000000000000001"
+
+# Native-price estimation runs through the driver's baseline endpoint.
+# The driver exposes ``/baseline`` automatically when at least one
+# solver is configured.
+[native-price-estimation]
+estimators = [[
+    { type = "Driver", name = "mhagentic", url = "http://cow-driver:11088/mhagentic" },
+]]
+
+[native-price-estimation.cache]
+max-age = "20m"
+
+# Order quoting: used for token price quotes outside the auction. We
+# point it at our driver/solver so it's consistent with the auction
+# path. Same baseline URL pattern.
+[order-quoting]
+price-estimation-drivers = [{ name = "mhagentic", url = "http://cow-driver:11088/mhagentic" }]

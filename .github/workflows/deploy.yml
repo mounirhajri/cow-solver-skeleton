@@ -53,9 +53,11 @@ jobs:
         with:
           sparse-checkout: |
             config/driver.shadow.toml
+            config/autopilot.shadow.toml
+            docker-compose.yml
           sparse-checkout-cone-mode: false
 
-      - name: Copy driver config to host
+      - name: Copy compose + cow-stack configs to host
         env:
           SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
           HOST: ${{ secrets.HETZNER_HOST }}
@@ -63,14 +65,22 @@ jobs:
         run: |
           echo "$SSH_KEY" > /tmp/deploy_key
           chmod 600 /tmp/deploy_key
-          # Ensure config dir exists; place driver.shadow.toml so the
-          # cow-stack profile finds it at the path the compose volume mount
-          # expects (./config/driver.shadow.toml relative to the stack dir).
+          # Sync the compose definition and both cow-stack configs (driver
+          # + autopilot) so the SSH step always operates on the version
+          # checked into the repo.  Without the compose sync, any service
+          # added in a PR would be invisible on the host until manually
+          # scp'ed, silently breaking the cow-stack profile.
           ssh -i /tmp/deploy_key -o StrictHostKeyChecking=no -o BatchMode=yes \
             "$USER@$HOST" "mkdir -p /opt/mhagentic/stack/cow-solver/config"
           scp -i /tmp/deploy_key -o StrictHostKeyChecking=no \
+            docker-compose.yml \
+            "$USER@$HOST:/opt/mhagentic/stack/cow-solver/docker-compose.yml"
+          scp -i /tmp/deploy_key -o StrictHostKeyChecking=no \
             config/driver.shadow.toml \
             "$USER@$HOST:/opt/mhagentic/stack/cow-solver/config/driver.shadow.toml"
+          scp -i /tmp/deploy_key -o StrictHostKeyChecking=no \
+            config/autopilot.shadow.toml \
+            "$USER@$HOST:/opt/mhagentic/stack/cow-solver/config/autopilot.shadow.toml"
 
       - name: Deploy via SSH
         env:
@@ -92,6 +102,16 @@ jobs:
           if ! grep -q '^REWARDS_ADDRESS=' .env 2>/dev/null; then
             echo "REWARDS_ADDRESS=0x0000000000000000000000000000000000000000" >> .env
             echo "::warning::REWARDS_ADDRESS not set; using placeholder zero address. Set a real address before Barn onboarding."
+          fi
+
+          # ── COW_SOLVER_IMAGE pin ────────────────────────────────────────
+          # docker-compose.yml uses ``${COW_SOLVER_IMAGE:-cow-solver:dev}``
+          # so local builds can keep using the legacy tag. On the production
+          # host we pin to the GHCR image so ``docker compose up`` for any
+          # service that depends_on cow-solver (cow-driver, cow-autopilot,
+          # ...) doesn't try to rebuild from a Dockerfile that isn't there.
+          if ! grep -q '^COW_SOLVER_IMAGE=' .env 2>/dev/null; then
+            echo "COW_SOLVER_IMAGE=ghcr.io/mounirhajri/cow-solver:latest" >> .env
           fi
 
           # ── Pull our service image + the CoW reference stack image ─────
