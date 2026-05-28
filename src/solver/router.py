@@ -169,6 +169,11 @@ class RouterSolver:
         self.timeout: float = strategy_timeout
 
     async def solve(self, auction: Auction) -> Solution | NoSolution:
+        # /solve gates quote-only (id=None) requests before invoking any
+        # strategy, so by the time we run here id is guaranteed non-None.
+        # Assert narrows the type for mypy and would fail loudly if the
+        # gate ever regresses.
+        assert auction.id is not None, "router must not run for quote-only auctions"
         # Phase A ghost-order filter — drop UIDs known not to settle
         # before the surplus-headroom sort. Without this gate, persistent
         # loose-limit phantom orders (e.g. a single +22 % oracle TWAP UID
@@ -319,6 +324,10 @@ class RouterSolver:
     async def _solve_v3_batched(
         self, auction: Auction, orders: list[Order]
     ) -> Solution | NoSolution:
+        # solve() asserts non-None auction.id at entry, but mypy's
+        # narrowing does not propagate across the method boundary. Repeat
+        # the assertion here so the Solution constructor below type-checks.
+        assert auction.id is not None
         paths = self._build_v3_candidate_paths(orders, auction.tokens)
         if not paths:
             return NoSolution()
@@ -626,6 +635,10 @@ class RouterSolver:
     async def _solve_legacy(
         self, auction: Auction, orders: list[Order]
     ) -> Solution | NoSolution:
+        # solve() asserts non-None auction.id at entry, but mypy's
+        # narrowing does not propagate across the method boundary. Repeat
+        # the assertion here so the Solution constructor below type-checks.
+        assert auction.id is not None
         # quote_best_path is exact-input only; buys would need exact-output
         # plumbing. v3_only_batched is the supported path for buys.
         # Visibility: when v3_only_batched gets disabled in prod (e.g. during

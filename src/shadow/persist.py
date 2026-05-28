@@ -60,6 +60,13 @@ async def persist_shadow_attempt(
     raw_competition: dict[str, object] | None = None,
 ) -> None:
     """Upsert auction row + insert one row per strategy attempt."""
+    # ``auction.id`` is ``str | None`` per the CoW solver-engine spec
+    # (nullable for quote-only requests). The /solve handler short-circuits
+    # those before reaching this background task, so by the time we get
+    # here the id is guaranteed non-None. The assertion narrows the type
+    # for mypy and would surface as a regression if main.py's gate ever
+    # gets removed.
+    assert auction.id is not None, "persist must not be called for quote-only auctions"
     Session = get_session_factory()
     auction_id = int(auction.id)
 

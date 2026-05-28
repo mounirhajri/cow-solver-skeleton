@@ -45,6 +45,11 @@ class NaiveSolver:
         self.timeout: float = refine_timeout + 1.0
 
     async def solve(self, auction: Auction) -> Solution | NoSolution:
+        # /solve gates quote-only (id=None) requests before invoking any
+        # strategy, so by the time we run here id is guaranteed non-None.
+        # Assert narrows the type for mypy and would fail loudly if the
+        # gate ever regresses.
+        assert auction.id is not None, "naive must not run for quote-only auctions"
         trades: list[Trade] = []
         prices: dict[str, int] = {}
 
