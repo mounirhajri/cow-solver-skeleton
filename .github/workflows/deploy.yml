@@ -53,10 +53,11 @@ jobs:
         with:
           sparse-checkout: |
             config/driver.shadow.toml
+            config/autopilot.shadow.toml
             docker-compose.yml
           sparse-checkout-cone-mode: false
 
-      - name: Copy compose + driver config to host
+      - name: Copy compose + cow-stack configs to host
         env:
           SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
           HOST: ${{ secrets.HETZNER_HOST }}
@@ -64,12 +65,11 @@ jobs:
         run: |
           echo "$SSH_KEY" > /tmp/deploy_key
           chmod 600 /tmp/deploy_key
-          # Ensure config dir exists; sync the compose definition and the
-          # cow-stack driver config so the SSH step always operates on the
-          # version checked into the repo.  Without the compose sync, any
-          # service added in a PR (e.g. cow-driver/cow-autopilot from PR
-          # #44) would be invisible on the host until manually scp'ed,
-          # silently breaking ``docker compose --profile cow-stack up``.
+          # Sync the compose definition and both cow-stack configs (driver
+          # + autopilot) so the SSH step always operates on the version
+          # checked into the repo.  Without the compose sync, any service
+          # added in a PR would be invisible on the host until manually
+          # scp'ed, silently breaking the cow-stack profile.
           ssh -i /tmp/deploy_key -o StrictHostKeyChecking=no -o BatchMode=yes \
             "$USER@$HOST" "mkdir -p /opt/mhagentic/stack/cow-solver/config"
           scp -i /tmp/deploy_key -o StrictHostKeyChecking=no \
@@ -78,6 +78,9 @@ jobs:
           scp -i /tmp/deploy_key -o StrictHostKeyChecking=no \
             config/driver.shadow.toml \
             "$USER@$HOST:/opt/mhagentic/stack/cow-solver/config/driver.shadow.toml"
+          scp -i /tmp/deploy_key -o StrictHostKeyChecking=no \
+            config/autopilot.shadow.toml \
+            "$USER@$HOST:/opt/mhagentic/stack/cow-solver/config/autopilot.shadow.toml"
 
       - name: Deploy via SSH
         env:
