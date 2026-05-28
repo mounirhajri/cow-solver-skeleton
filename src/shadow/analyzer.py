@@ -117,6 +117,18 @@ async def analyze(window: AnalysisWindow) -> Summary:
 
         # Score comparison — use CIP-14 our_score_wei vs winner score.
         # Best solution per auction = highest our_score_wei among solved rows.
+        #
+        # ── FEE DISPARITY WARNING ──────────────────────────────────────────
+        # ``our_score_wei`` is pre-protocol-fee (we do not apply fees in
+        # shadow mode; see src/shadow/scoring.py docstring).  ``ShadowWinner.
+        # score`` from the CoW competition API is post-fee for fee-taking
+        # winners (limit orders with surplus/volume/price-improvement caps).
+        # The delta below therefore *overstates our advantage* for any
+        # auction whose winner settled a fee-bearing order.  Treat the
+        # resulting ``win_rate_hypothetical`` as an upper bound, NOT a
+        # production number.  True win-rate requires either (a) applying
+        # the same fee policy locally before subtraction, or (b) Phase 0a
+        # Barn-onboarding so the driver scores us consistently.
         score_q = await session.execute(
             select(
                 ShadowSolution.auction_id,

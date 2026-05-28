@@ -19,6 +19,12 @@ simulation-node-url = "${RPC_ARBITRUM}"
 # orderbook DB which we do not run in this setup.
 shadow = "https://api.cow.fi/arbitrum_one"
 
+# Protocol fee policies — required top-level field (autopilot panics with
+# "missing field `fee-policies`" otherwise, verified via TOML_TRACE_ERROR).
+# Empty array = no fees applied, correct for shadow mode where we observe
+# competition without participating economically.
+fee-policies = []
+
 [logging]
 filter = "warn,autopilot=info,shared=warn"
 
