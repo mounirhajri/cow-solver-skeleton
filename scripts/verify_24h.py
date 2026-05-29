@@ -25,7 +25,7 @@ from src.persistence.db import get_session_factory
 SEP = "=" * 60
 
 
-async def run(hours: int, sample_n: int) -> None:
+async def run(hours: float, sample_n: int) -> None:
     since = datetime.now(UTC) - timedelta(hours=hours)
     factory = get_session_factory()
 
@@ -42,9 +42,10 @@ async def run(hours: int, sample_n: int) -> None:
 # ── Schicht 1: Datenfluss ─────────────────────────────────────────────────
 
 
-async def _check_datenfluss(sess, since, hours: int) -> None:
+async def _check_datenfluss(sess, since, hours: float) -> None:
     print(f"\n{SEP}")
-    print(f"SCHICHT 1: Datenfluss (letzte {hours}h)")
+    hours_str = f"{hours:g}"  # 24 statt 24.0; 0.5 bleibt 0.5
+    print(f"SCHICHT 1: Datenfluss (letzte {hours_str}h)")
     print(SEP)
 
     # Gesamt
@@ -513,7 +514,7 @@ async def _stichproben(sess, since, n: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="24h Daten-Verifikation")
-    parser.add_argument("--hours", type=int, default=24, help="Zeitfenster in Stunden (default: 24)")
+    parser.add_argument("--hours", type=float, default=24, help="Zeitfenster in Stunden (z. B. 0.5, default: 24)")
     parser.add_argument("--sample", type=int, default=5, help="Anzahl Stichproben-Auktionen (default: 5)")
     args = parser.parse_args()
 
