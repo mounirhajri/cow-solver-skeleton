@@ -30,7 +30,11 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/3"
     redis_key_prefix: str = "solver:"
     pool_cache_max_entries: int = 800
-    pool_cache_ttl_seconds: int = 60
+    # 300 s entspricht der 2026-05-29 Live-Diagnose: bei 60 s rebroadcastet
+    # jede Auktion (~jede Minute) ihren kompletten Pool-Set, was den RPC
+    # unnötig belastet. 300 s deckt ~5 Auktionen pro Cache-Round ab, ohne
+    # nennenswerte Reserve-Drift.  Über env POOL_CACHE_TTL_SECONDS überschreibbar.
+    pool_cache_ttl_seconds: int = 300
 
     # Behaviour
     amm_state_lazy: bool = True
@@ -88,11 +92,13 @@ class Settings(BaseSettings):
     # 0 disables the cooldown (legacy behaviour).
     multi_party_ring_cooldown_seconds: int = 600
 
-    # LongTailRouter (Pool-Indexer). Bursts ~60 RPC calls per auction on top of
-    # RouterSolver's load. On a tight Alchemy free-tier concurrent-connection
-    # quota that pushes RouterSolver into "Authentication required" rejections.
-    # Disable in prod until paid RPC tier is provisioned.
-    long_tail_enabled: bool = True
+    # LongTailRouter (Pool-Indexer). Bursts ~1200 RPC calls per auction on top
+    # of RouterSolver's load. 2026-05-29 Live-Daten: 0 / 711 solved über 24 h
+    # auf Arbitrum, gleichzeitig 90 % des RPC-Budgets aufgefressen, was
+    # router-v2 (39 % solve-rate) bei Rate-Limits ausgehungert hat.  Default
+    # false bis ein bezahlter RPC-Tier provisioniert ist; via LONG_TAIL_ENABLED=true
+    # für Experimente wieder aktivierbar.
+    long_tail_enabled: bool = False
 
     # EBBO (External Best Bid/Offer) pre-submission validator.
     # Checks every emitted sell trade against a fresh V3 quote; rejects the

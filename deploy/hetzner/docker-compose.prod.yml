@@ -13,14 +13,21 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/3
       REDIS_KEY_PREFIX: "solver:"
-      POOL_CACHE_MAX_ENTRIES: 800
-      POOL_CACHE_TTL_SECONDS: 60
-      AMM_STATE_LAZY: "true"
       RPC_ARBITRUM: ${RPC_ARBITRUM}
       SHADOW_LOG_PATH: /data/shadow.jsonl
       LOG_LEVEL: INFO
       PROMETHEUS_PORT: 8001
       DATABASE_URL: postgresql+asyncpg://solver:${SOLVER_DB_PASSWORD}@postgres:5432/solver
+      # Solver-Tuning durchgereicht aus parent .env, mit Defaults die der
+      # 2026-05-29 Live-Diagnose entsprechen (long-tail aus, längerer Cache,
+      # Concurrency-Cap fürs RPC-Budget).
+      LONG_TAIL_ENABLED: ${LONG_TAIL_ENABLED:-false}
+      POOL_CACHE_TTL_SECONDS: ${POOL_CACHE_TTL_SECONDS:-300}
+      POOL_CACHE_MAX_ENTRIES: ${POOL_CACHE_MAX_ENTRIES:-800}
+      AMM_STATE_LAZY: ${AMM_STATE_LAZY:-true}
+      ROUTER_MAX_CONCURRENT: ${ROUTER_MAX_CONCURRENT:-3}
+      EBBO_ENABLED: ${EBBO_ENABLED:-true}
+      EBBO_TOLERANCE_BPS: ${EBBO_TOLERANCE_BPS:-50}
       # GoPlus authenticated tier for scripts/auto_seed_labels.py. Both must
       # be set or the script falls back to anonymous mode (~3 req/s ceiling).
       GOPLUS_APP_KEY: ${GOPLUS_APP_KEY:-}
