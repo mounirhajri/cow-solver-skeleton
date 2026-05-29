@@ -103,6 +103,20 @@ class Settings(BaseSettings):
     # für Experimente wieder aktivierbar.
     long_tail_enabled: bool = False
 
+    # Joint clearing: batch same-pair sell orders at a shared AMM clearing price.
+    # When ≥ joint_clearing_min_group orders share the same (sell_token, buy_token)
+    # pair, a single combined-amount AMM quote is obtained and — if it satisfies
+    # all individual limits — they are settled in one interaction.  This raises
+    # total CIP-14 score vs. single-order RouterSolver submissions.
+    # Default false: shadow-mode soak before flipping on in production.
+    joint_clearing_enabled: bool = False
+    # Minimum number of same-pair orders required to attempt joint clearing.
+    # 2 = any two matching orders; raise to 3 to filter rare noise pairs.
+    joint_clearing_min_group: int = 2
+    # Per-strategy timeout for JointClearingSolver — slightly longer than
+    # RouterSolver because the combined-amount quote adds extra path entries.
+    joint_clearing_timeout: float = 13.0
+
     # EBBO (External Best Bid/Offer) pre-submission validator.
     # Checks every emitted sell trade against a fresh V3 quote; rejects the
     # whole composed solution when our effective clearing-price output falls
