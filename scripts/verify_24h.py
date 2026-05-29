@@ -110,7 +110,7 @@ async def _check_solver_output(sess, since) -> None:
             SELECT
                 strategy,
                 COUNT(*) AS n_attempts,
-                COUNT(*) FILTER (WHERE status = 'solution') AS n_solutions,
+                COUNT(*) FILTER (WHERE status = 'solved') AS n_solutions,
                 COUNT(*) FILTER (WHERE our_score_wei IS NOT NULL AND our_score_wei > 0) AS n_with_score,
                 AVG(our_score_wei::numeric) FILTER (WHERE our_score_wei > 0) AS avg_score,
                 MAX(our_score_wei::numeric) AS max_score,
