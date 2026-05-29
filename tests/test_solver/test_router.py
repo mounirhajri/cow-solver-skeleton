@@ -517,7 +517,9 @@ async def test_semaphore_limits_concurrent_quotes(monkeypatch: pytest.MonkeyPatc
 def test_config_has_router_settings() -> None:
     from src.config import Settings
     s = Settings()
-    assert s.router_max_orders == 9
+    # Reduced 9→4 (2026-05-29): keeps Multicall3 batched eth_call under
+    # PublicNode's gas-simulation cap. See src/config.py for rationale.
+    assert s.router_max_orders == 4
     assert s.router_max_concurrent == 3
     assert s.router_strategy_timeout == 11.0
     # Router uses WETH-only intermediates to stay within Alchemy free-tier rate limit

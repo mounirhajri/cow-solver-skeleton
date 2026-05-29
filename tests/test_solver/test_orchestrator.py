@@ -330,3 +330,101 @@ async def test_ebbo_rejection_falls_through_to_next_candidate(auction: Auction) 
     # A rejection AttemptRecord was logged for the first candidate.
     rejected = [a for a in attempts if a.strategy == "ebbo-rejected"]
     assert len(rejected) == 1
+
+
+async def test_composer_receives_cip14_surplus_estimate(auction: Auction) -> None:
+    """The orchestrator must compute CIP-14 surplus for each composer candidate.
+
+    Regression for the edge composer's decimals-blind _estimate_surplus fallback:
+    sum-of-raw-executed-amounts inflates WETH-emitting wins over higher-value
+    USDC-emitting wins. Pre-computing surplus_estimate at orchestrator level
+    bypasses that fallback.
+
+    Injects a fake edge.matching module so the test runs even without the
+    private submodule. Captures the candidates list compose() receives and
+    asserts surplus_estimate is set per candidate (= compute_solution_score
+    against auction.tokens.reference_price).
+    """
+    import sys
+    import types
+    from dataclasses import dataclass
+
+    # Build two real-looking solutions that both fulfill the fixture's order
+    # (1 WETH → 3450 USDC) at different clearing prices. The second has
+    # bought=3500 USDC (matches reference), the first bought=3460 (small win).
+    # We don't care about the exact scores — only that they're > 0 and ranked.
+    base_uid = auction.orders[0].uid
+    weth = auction.orders[0].sell_token.lower()
+    usdc = auction.orders[0].buy_token.lower()
+    sol_small = Solution(
+        id=1,
+        prices={weth: 3460_000000, usdc: 1_000000000000000000},
+        trades=[Trade(kind="fulfillment", orderUid=base_uid,
+                      executedAmount=10**18)],
+        interactions=[],
+    )
+    sol_big = Solution(
+        id=1,
+        prices={weth: 3500_000000, usdc: 1_000000000000000000},
+        trades=[Trade(kind="fulfillment", orderUid=base_uid,
+                      executedAmount=10**18)],
+        interactions=[],
+    )
+
+    s_a = AsyncMock(name="bipartite")
+    s_a.name = "cow-matching-bipartite"
+    s_a.solve.return_value = sol_small
+    s_b = AsyncMock(name="router-v2")
+    s_b.name = "router-v2"
+    s_b.solve.return_value = sol_big
+
+    # Fake edge.matching with a CandidateSolution dataclass + a compose() that
+    # records what it was called with.
+    @dataclass
+    class FakeCandidateSolution:
+        strategy: str
+        solution: Solution
+        surplus_estimate: int = 0
+
+    captured: list[FakeCandidateSolution] = []
+
+    def fake_compose(candidates, auction_id):  # noqa: ANN001
+        captured.extend(candidates)
+        return None  # falls through to first-winner path; we don't care
+
+    fake_mod = types.ModuleType("edge.matching")
+    fake_mod.CandidateSolution = FakeCandidateSolution  # type: ignore[attr-defined]
+    fake_mod.compose = fake_compose  # type: ignore[attr-defined]
+    fake_edge = types.ModuleType("edge")
+    fake_edge.matching = fake_mod  # type: ignore[attr-defined]
+
+    saved_modules = {k: sys.modules.get(k) for k in ("edge", "edge.matching")}
+    sys.modules["edge"] = fake_edge
+    sys.modules["edge.matching"] = fake_mod
+    try:
+        orch = SolverOrchestrator(
+            strategies=[s_a, s_b],
+            per_strategy_timeout=1.0,
+            run_all_strategies=True,
+            compose=True,
+        )
+        await orch.solve(auction)
+    finally:
+        for k, v in saved_modules.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    # Two candidates passed to compose, both with positive surplus_estimate.
+    assert len(captured) == 2
+    for c in captured:
+        assert c.surplus_estimate > 0, (
+            f"orchestrator must compute CIP-14 surplus for {c.strategy}; "
+            f"composer would otherwise fall back to decimals-blind heuristic"
+        )
+    # The bigger-clearing-price solution must rank higher.
+    by_strategy = {c.strategy: c.surplus_estimate for c in captured}
+    assert by_strategy["router-v2"] > by_strategy["cow-matching-bipartite"], (
+        "router-v2 clears at higher price → must rank above bipartite"
+    )
