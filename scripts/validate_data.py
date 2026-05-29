@@ -437,11 +437,22 @@ async def _check_null_scores(sess, since) -> None:
         {"since": since},
     )
 
-    if not total_null:
-        print(f"  {OK} Keine NULL-Scores bei solved-Lösungen")
+    # naive scores are intentionally NULL (oracle prices → phantom surplus, never submitted)
+    naive_null = await sess.scalar(
+        text(
+            "SELECT COUNT(*) FROM shadow_solutions "
+            "WHERE status = 'solved' AND our_score_wei IS NULL "
+            "AND strategy = 'naive' AND created_at > :since"
+        ),
+        {"since": since},
+    )
+    real_null = total_null - (naive_null or 0)
+
+    if not real_null:
+        print(f"  {OK} Keine NULL-Scores bei solved-Lösungen (naive={naive_null} NULL — korrekt by design)")
         return
 
-    print(f"  {WARN} {total_null} solved-Zeilen ohne our_score_wei")
+    print(f"  {WARN} {real_null} non-naive solved-Zeilen ohne our_score_wei (naive={naive_null} NULL — korrekt)")
 
     rows = await sess.execute(
         text(
@@ -515,7 +526,12 @@ async def _check_before_after_fix(sess, since, fix_cutoff_str: str) -> None:
     data = rows.fetchall()
 
     if not data:
-        print(f"  Keine router_v2-Daten im Fenster.")
+        before_min = max(0, (fix_cutoff - since).total_seconds() / 60)
+        if before_min < 30:
+            print(f"  (kein 'before'-Fenster — --fix-cutoff liegt nur {before_min:.0f} min nach Fensterbeginn)")
+            print(f"  Tipp: größeres --hours wählen oder --fix-cutoff weglassen)")
+        else:
+            print(f"  Keine router_v2-Daten im Fenster.")
         return
 
     by_period: dict[str, dict[str, int]] = {"before": {}, "after": {}}
@@ -564,23 +580,28 @@ async def _check_composer(sess, since) -> None:
                 c.our_score_wei                      AS comp_score,
                 b.our_score_wei                      AS bipartite_score,
                 r.our_score_wei                      AS router_score,
+                mp.our_score_wei                     AS multiparty_score,
                 GREATEST(
                     COALESCE(b.our_score_wei::numeric, 0),
-                    COALESCE(r.our_score_wei::numeric, 0)
+                    COALESCE(r.our_score_wei::numeric, 0),
+                    COALESCE(mp.our_score_wei::numeric, 0)
                 )                                    AS best_single,
                 CASE
                     WHEN c.our_score_wei::numeric >= GREATEST(
                         COALESCE(b.our_score_wei::numeric, 0),
-                        COALESCE(r.our_score_wei::numeric, 0)
+                        COALESCE(r.our_score_wei::numeric, 0),
+                        COALESCE(mp.our_score_wei::numeric, 0)
                     ) THEN 'OK'
                     ELSE 'LOWER_THAN_SINGLE'
                 END                                  AS sanity,
                 c.created_at
             FROM shadow_solutions c
             LEFT JOIN shadow_solutions b
-                ON b.auction_id = c.auction_id AND b.strategy = 'bipartite'
+                ON b.auction_id = c.auction_id AND b.strategy = 'cow-matching-bipartite'
             LEFT JOIN shadow_solutions r
-                ON r.auction_id = c.auction_id AND r.strategy = 'router_v2'
+                ON r.auction_id = c.auction_id AND r.strategy = 'router-v2'
+            LEFT JOIN shadow_solutions mp
+                ON mp.auction_id = c.auction_id AND mp.strategy = 'cow-matching-multi-party'
             WHERE c.strategy = 'composer'
               AND c.status = 'solved'
               AND c.created_at > :since
@@ -601,17 +622,20 @@ async def _check_composer(sess, since) -> None:
         print(f"  {WARN} {n_bad}/{len(data)} Composer-Lösungen UNTER Einzel-Strategie-Score")
 
     print()
-    print(f"  {'Auktion':>12} {'Composer(ETH)':>14} {'Bipartite':>12} "
-          f"{'RouterV2':>12} {'Beste-Einzel':>13} {'Status':>18}")
-    print("  " + "-" * 90)
+    print(f"  {'Auktion':>12} {'Composer':>12} {'Bipartite':>12} "
+          f"{'RouterV2':>12} {'MultiParty':>12} {'BesteSingle':>12} {'Status'}")
+    print("  " + "-" * 100)
     for r in data:
         def fmt(v):
-            return f"{float(v) / 1e18:.8f}" if v is not None else "        -"
+            return f"{float(v) / 1e18:.6f}" if v is not None else "         -"
 
         flag = "" if r.sanity == "OK" else f"  {WARN}"
+        best_zero = float(r.best_single or 0) == 0
+        best_note = " (solo)" if best_zero else ""
         print(
-            f"  {r.auction_id:>12} {fmt(r.comp_score):>14} {fmt(r.bipartite_score):>12} "
-            f"{fmt(r.router_score):>12} {fmt(r.best_single):>13} {r.sanity:>18}{flag}"
+            f"  {r.auction_id:>12} {fmt(r.comp_score):>12} {fmt(r.bipartite_score):>12} "
+            f"{fmt(r.router_score):>12} {fmt(r.multiparty_score):>12} "
+            f"{fmt(r.best_single):>12} {r.sanity}{best_note}{flag}"
         )
 
 
