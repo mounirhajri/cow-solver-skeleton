@@ -36,6 +36,7 @@ async def run(hours: float, sample_n: int) -> None:
         await _check_phantom_score(sess, since)
         await _check_comp_sync(sess, since)
         await _check_ghost_orders(sess)
+        await _check_win_rate_by_bucket(sess, since)
         await _stichproben(sess, since, sample_n)
 
 
@@ -442,6 +443,120 @@ async def _check_ghost_orders(sess) -> None:
             print("  ✓ Ghost-Detektor läuft")
     else:
         print("  ⚠ Noch kein Ghost-Refresh gelaufen")
+
+
+# ── Schicht 3d: Win-Rate per Score-Bucket ────────────────────────────────
+
+
+async def _check_win_rate_by_bucket(sess, since) -> None:
+    """Bucketed Winner-Score Verteilung mit unserer Performance pro Bucket.
+
+    Zeigt wo wir konkurrenzfähig sind (Win-Rate, Coverage) und wo wir blind
+    sind (Coverage 0% bei großen Auktionen = verpasstes Geld).
+
+    Marktanteil-Spalte zeigt absolutes Score-Volumen pro Bucket — wenn 80%
+    des verfügbaren Surplus in den 'großen' Buckets liegt aber wir dort 0%
+    Coverage haben, ist die Story klar.
+
+    Bucket-Grenzen in wei:
+      <1e14   = micro  (<0.0001 ETH ≈ <€0.27)
+      1e14-15 = klein  (0.0001-0.001 ETH ≈ €0.27-2.70)
+      1e15-16 = mittel (0.001-0.01 ETH ≈ €2.70-27)
+      1e16-17 = groß   (0.01-0.1 ETH ≈ €27-270)
+      >1e17   = mega   (>0.1 ETH ≈ >€270)
+    """
+    print(f"\n{SEP}")
+    print("SCHICHT 3d: WIN-RATE PER SCORE-BUCKET")
+    print(SEP)
+
+    rows = await sess.execute(
+        text(
+            """
+            WITH scored AS (
+                SELECT
+                    sw.auction_id,
+                    sw.score::numeric AS winner_score,
+                    (
+                        SELECT MAX(our_score_wei)
+                        FROM shadow_solutions
+                        WHERE auction_id = sw.auction_id
+                          AND our_score_wei > 0
+                    ) AS our_best
+                FROM shadow_winners sw
+                JOIN shadow_auctions sa ON sa.auction_id = sw.auction_id
+                WHERE sa.polled_at > :since
+                  AND sw.score IS NOT NULL
+                  AND sw.score::numeric > 0
+            ),
+            bucketed AS (
+                SELECT
+                    CASE
+                        WHEN winner_score < 1e14 THEN '1-micro  (<0.0001 ETH)'
+                        WHEN winner_score < 1e15 THEN '2-klein  (0.0001-0.001)'
+                        WHEN winner_score < 1e16 THEN '3-mittel (0.001-0.01)'
+                        WHEN winner_score < 1e17 THEN '4-groß   (0.01-0.1)'
+                        ELSE                            '5-mega   (>0.1 ETH)'
+                    END AS bucket,
+                    winner_score,
+                    our_best
+                FROM scored
+            )
+            SELECT
+                bucket,
+                COUNT(*) AS n_auctions,
+                COUNT(our_best) AS n_with_our_score,
+                COUNT(*) FILTER (WHERE our_best > winner_score) AS n_we_win,
+                AVG(winner_score) AS avg_winner,
+                AVG(our_best) FILTER (WHERE our_best IS NOT NULL) AS avg_our,
+                SUM(winner_score) AS sum_winner_score
+            FROM bucketed
+            GROUP BY bucket
+            ORDER BY bucket
+            """
+        ),
+        {"since": since},
+    )
+    data = rows.fetchall()
+
+    if not data:
+        print("  Keine Winner-Daten im Fenster.")
+        return
+
+    total_winner_volume = sum(float(r.sum_winner_score or 0) for r in data) or 1.0
+
+    print(f"  {'Bucket':<24} {'n':>4} {'Cov':>6} {'Win':>6} "
+          f"{'WinR':>6} {'ØWinner':>11} {'ØUns':>11} {'Markt%':>7}")
+    print("  " + "-" * 80)
+    for r in data:
+        n_auc = r.n_auctions
+        n_have = r.n_with_our_score or 0
+        n_win = r.n_we_win or 0
+        cov_pct = f"{100*n_have/n_auc:.0f}%" if n_auc else "n/a"
+        win_pct = f"{100*n_win/n_have:.0f}%" if n_have else "0%"
+        avg_w = float(r.avg_winner or 0) / 1e18
+        avg_o = float(r.avg_our or 0) / 1e18
+        mkt_pct = 100 * float(r.sum_winner_score or 0) / total_winner_volume
+        ours_str = f"{avg_o:.6f}" if n_have else "    -"
+        print(f"  {r.bucket:<24} {n_auc:>4} {cov_pct:>6} {n_win:>6} "
+              f"{win_pct:>6} {avg_w:>10.6f} {ours_str:>11} {mkt_pct:>6.1f}%")
+
+    print()
+    print("  Spalten: n=Auktionen, Cov=wir-haben-Score, Win=we_win, "
+          "WinR=Win/Cov, Markt%=Anteil am Surplus-Volumen")
+
+    # Headline-Insight: in welchen Buckets ist das Geld?
+    money_buckets = sorted(
+        data, key=lambda r: float(r.sum_winner_score or 0), reverse=True
+    )[:2]
+    print()
+    print("  Wo das Geld liegt (Top-2 Buckets nach Surplus-Volumen):")
+    for r in money_buckets:
+        pct = 100 * float(r.sum_winner_score or 0) / total_winner_volume
+        cov = 100 * (r.n_with_our_score or 0) / r.n_auctions if r.n_auctions else 0
+        win = 100 * (r.n_we_win or 0) / (r.n_with_our_score or 1)
+        flag = " ⚠ wenig Coverage" if cov < 50 else ""
+        print(f"    {r.bucket}: {pct:.0f}% des Volumens, "
+              f"unsere Coverage {cov:.0f}%, Win-Rate {win:.0f}%{flag}")
 
 
 # ── Schicht 4: Stichproben ────────────────────────────────────────────────
