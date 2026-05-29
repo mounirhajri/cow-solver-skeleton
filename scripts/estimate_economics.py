@@ -12,9 +12,14 @@ Assumptions baked in (override via flags):
 
 Usage:
     python -m scripts.estimate_economics [--days 7]
+        [--hours 6]
         [--eth-price-eur 3000] [--cow-price-eur 0.15]
         [--server-cost-eur 60] [--bonding-fee-pct 15]
         [--win-rate-confidence 0.2]
+
+    --hours überschreibt --days wenn gesetzt (z. B. --hours 6 = 0.25 Tage).
+    Wichtig für frische Daten nach Config-Switches: erst 6-8 h nach einem
+    Tuning-Change ergibt --days 1 eine homogene Datenbasis.
 """
 
 from __future__ import annotations
@@ -81,7 +86,7 @@ _ROUTER_PRICE_BUG_CUTOFF = datetime(2026, 5, 24, 20, 40, tzinfo=UTC)
 
 @dataclass(frozen=True)
 class Projection:
-    window_days: int
+    window_days: float
     wins_total: int
     wins_per_strategy: dict[str, int]
     wins_per_month_point: float
@@ -167,7 +172,7 @@ def _cap_outliers(values: list[int], percentile: float) -> list[int]:
 
 def project_monthly(
     wins_by_strategy: dict[str, list[int]],
-    window_days: int,
+    window_days: float,
     eth_price_eur: float,
     server_cost_eur: float,
     bonding_fee_pct: float,
@@ -232,7 +237,7 @@ def project_monthly(
 
 
 async def collect_wins_per_strategy(
-    days: int,
+    days: float,
     *,
     dedup_rings: bool = True,
     outlier_cap_percentile: float = 99.0,
@@ -321,7 +326,13 @@ async def collect_wins_per_strategy(
 def print_report(p: Projection, eth_price_eur: float, bonding_fee_pct: float) -> None:
     bar = "=" * 60
     print(f"\n{bar}")
-    print(f"Economics Projection — last {p.window_days} day(s)")
+    # "1 day(s)" für ganze Tage, "6h" für Sub-Tag-Fenster — sonst "0.25 day(s)"
+    # was niemand lesen will.
+    if p.window_days < 1:
+        window_str = f"{p.window_days * 24:g}h"
+    else:
+        window_str = f"{p.window_days:g} day(s)"
+    print(f"Economics Projection — last {window_str}")
     print(bar)
     print(f"Hypothetical wins observed: {p.wins_total} (after dedup + outlier-cap)")
     for strat, n in sorted(p.wins_per_strategy.items()):
@@ -368,7 +379,10 @@ def print_report(p: Projection, eth_price_eur: float, bonding_fee_pct: float) ->
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--days", type=float, default=7.0,
+                        help="Zeitfenster in Tagen (default: 7). Float zulässig.")
+    parser.add_argument("--hours", type=float, default=None,
+                        help="Zeitfenster in Stunden — überschreibt --days wenn gesetzt.")
     parser.add_argument("--eth-price-eur", type=float, default=3000.0)
     parser.add_argument("--cow-price-eur", type=float, default=0.15)
     parser.add_argument("--server-cost-eur", type=float, default=60.0)
@@ -385,14 +399,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    window_days = args.hours / 24 if args.hours is not None else args.days
+
     wins = asyncio.run(collect_wins_per_strategy(
-        days=args.days,
+        days=window_days,
         dedup_rings=not args.no_dedup_rings,
         outlier_cap_percentile=args.outlier_cap_percentile,
     ))
     projection = project_monthly(
         wins_by_strategy=wins,
-        window_days=args.days,
+        window_days=window_days,
         eth_price_eur=args.eth_price_eur,
         server_cost_eur=args.server_cost_eur,
         bonding_fee_pct=args.bonding_fee_pct,
