@@ -169,10 +169,53 @@ class SolverOrchestrator:
         if self._compose and len(composable_solutions) > 1:
             try:
                 from edge.matching import CandidateSolution, compose
-                candidates = [
-                    CandidateSolution(strategy=name, solution=sol)
-                    for name, sol in composable_solutions
-                ]
+
+                # Bug-bypass 2026-05-29: edge/matching/composer._estimate_surplus
+                # ranks candidates by Σ raw executed_amount across heterogeneous
+                # tokens — decimals-blind. A 0.001 WETH win (10^15 base units)
+                # beats a 100 USDC win (10^8) even when the USDC win has higher
+                # ETH-equivalent surplus. compose()'s sort uses
+                # `c.surplus_estimate or _estimate_surplus(...)` — passing a
+                # positive surplus_estimate here skips the broken fallback.
+                # Bipartite/router-v2 do not carry their own surplus estimate
+                # back from edge; computing it here covers all strategies
+                # uniformly with a single source of truth.
+                from src.shadow.scoring import (
+                    compute_solution_score,
+                    orders_by_uid_from_auction,
+                )
+
+                uid_map = orders_by_uid_from_auction(auction)
+                native_prices: dict[str, int] = {
+                    addr.lower(): int(tok.reference_price)
+                    for addr, tok in auction.tokens.items()
+                    if tok.reference_price
+                }
+
+                candidates = []
+                for name, sol in composable_solutions:
+                    surplus = 0
+                    if uid_map and native_prices:
+                        try:
+                            sol_dict = sol.model_dump(mode="json", by_alias=True)
+                            surplus = compute_solution_score(
+                                sol_dict, uid_map, native_prices,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            # Ranking input only — never block composer on a
+                            # score-calc error. surplus stays 0; compose()
+                            # falls back to _estimate_surplus for this one
+                            # candidate (same as legacy behaviour).
+                            log.warning(
+                                "composer_surplus_estimate_failed",
+                                strategy=name,
+                                auction_id=auction.id,
+                                error=str(exc),
+                            )
+                    candidates.append(CandidateSolution(
+                        strategy=name, solution=sol, surplus_estimate=surplus,
+                    ))
+
                 composed = compose(candidates, auction_id=int(auction.id))
                 if composed is not None:
                     log.info("composer_merged",
