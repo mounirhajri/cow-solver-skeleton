@@ -232,7 +232,7 @@ async def _check_join_integrity(sess, since) -> None:
                 COUNT(DISTINCT w.auction_id) FILTER (WHERE a.auction_id IS NULL) AS orphaned
             FROM shadow_winners w
             LEFT JOIN shadow_auctions a USING (auction_id)
-            WHERE w.polled_at > :since
+            WHERE (a.polled_at > :since OR a.auction_id IS NULL)
             """
         ),
         {"since": since},
