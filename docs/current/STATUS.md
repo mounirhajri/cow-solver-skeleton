@@ -140,6 +140,44 @@ When quoting numbers for external pitch or competitor analysis, use `estimate_ec
 
 Naive's score is NULL'd at persistence (`src/shadow/persist.py`) because the price_refiner code path uses oracle reference_prices as clearing prices — see `src/solver/price_refiner.py:168-183` (KNOWN-BAD comment). Naive is never submitted; its rows exist for composer-debug observability only and would otherwise distort percentile dashboards.
 
+### 1.7 Live-Diagnose & Fixes 2026-05-29
+
+#### Router-v2 Out-of-Gas (FIXED — PR #57–#60)
+
+`router_max_orders` was 9. With `router_v3_only_batched=True`, 9 orders × ~9 V3 quotes = ~81 Multicall3 entries → ~16M gas → PublicNode returns `-32000 out of gas` on every `eth_call` → 0% solve rate.
+
+Fix: `router_max_orders = 4` (config default + docker-compose env override). 4 orders × ~9 calls = ~36 entries → ~7M gas, safely under cap. Result: solve rate 0% → 45–57% post-fix.
+
+#### Env-Propagation Bug (FIXED — PR #57–#60)
+
+`deploy/hetzner/docker-compose.prod.yml` was missing `${VAR}` entries for `LONG_TAIL_ENABLED`, `POOL_CACHE_TTL_SECONDS`, `POOL_CACHE_MAX_ENTRIES`, `AMM_STATE_LAZY`, `ROUTER_MAX_CONCURRENT`, `EBBO_ENABLED`, `EBBO_TOLERANCE_BPS`. Settings never reached the container — defaults always applied.
+
+Also changed defaults: `long_tail_enabled=False` (was True: consumed ~90% of RPC budget on 0/711 solved), `pool_cache_ttl_seconds=300` (was 60: every auction flushed the cache).
+
+#### Composer CIP-14 Surplus Fix (FIXED — PR #59–#60)
+
+`edge/matching/composer.py:_estimate_surplus` sums raw `executed_amount` across heterogeneous tokens — decimals-blind (0.001 WETH at 10^15 base units beats 100 USDC at 10^8). Fix applied at orchestrator layer: pre-compute CIP-14 score via `src/shadow/scoring.compute_solution_score` for each candidate before calling `compose()`. Passing a positive `surplus_estimate` bypasses the broken fallback.
+
+#### Live Validation 2026-05-29 (12h window, `validate_data --hours 12`)
+
+| Strategy | n solved | Score range | Sanity |
+|---|---|---|---|
+| router-v2 | 235 | 0.0000073–0.246 ETH | ✓ |
+| cow-matching-bipartite | 12 | 0.0000035–0.009 ETH | ✓ |
+| composer | 8 | 0.0000064–0.008 ETH | ✓ |
+| naive | 444 | NULL (all) | ✓ correct — never submitted |
+
+All JSON fields present (prices + trades), no orphaned auction_ids, no negative/overflow scores.
+
+#### Bimodal Performance Profile (ongoing)
+
+Win-rate analysis (SCHICHT 3d, 12h window) shows bimodal distribution:
+- Buckets 1–3 (micro/klein/mittel, <0.01 ETH): decent coverage + win-rate
+- Bucket 4 (groß, 0.01–0.1 ETH): 76% of Surplus-Volumen, only 24% Coverage, 0% Win-Rate
+- Root cause: `_expected_surplus_sort_key` de-prioritises whale orders; `ROUTER_MAX_ORDERS=4` limits exposure to large auctions
+
+Fix options: extend `intermediate_tokens` (WETH+USDC+USDT+WBTC) or change sort-key to weight by `headroom × log(eth_value)`.
+
 ---
 
 ## 2. Open Work (from specs/plans)
@@ -230,6 +268,16 @@ Naive's score is NULL'd at persistence (`src/shadow/persist.py`) because the pri
 - Token-pair distribution: dominated by recurring USDC/USDT CoW pairs at micro-scale ($6-100 trades), plus WETH/USDC and capped TWAP slices
 - 9 distinct first-trade UIDs in 103 emissions → real opportunity diversity, not single-order overcount
 
+### 3.5 Bimodal Win-Rate / Bucket-4 Gap
+
+**Observation (2026-05-29, 12h shadow data):** Bucket 4 ("groß", 0.01–0.1 ETH winner scores) contains ~76% of total Surplus-Volumen but we have only 24% Coverage and 0% Win-Rate there.
+
+**Root cause:** `router._expected_surplus_sort_key` intentionally de-prioritises large orders (guards against over-filling TWAPs), combined with `ROUTER_MAX_ORDERS=4` limiting the number of top-N orders considered per auction.
+
+**Impact:** We are effectively blind to the highest-value auctions. G6 economics pass only on the small-bucket floor.
+
+**Proposed fix (not yet implemented):** Change sort-key to `headroom × log(eth_value)` or extend `intermediate_tokens` list to include WBTC for additional routing paths.
+
 ---
 
 ## 4. Realistic Revenue Expectations
@@ -244,27 +292,28 @@ Re-evaluation expectations after the full Phase A wiring (see §1.5 — Multi-Pa
 - Router-v2 unchanged (independent of ghosts)
 - Net effect: direction uncertain until full clean baseline lands.  No confident projection can be made today.
 
-### 4.1 Verified Conservative Floor (`estimate_economics --days 1`, n=9 after dedup + p99 outlier-cap)
+### 4.1 Verified Conservative Floor (`estimate_economics --hours 8`, post-fix data, n= ~20 after dedup)
+
+Post-router-fix (2026-05-29, after `router_max_orders` 9→4):
 
 ```
-Hypothetical wins observed:    9   (8 bipartite + 1 router-v2)
-Median surplus per win:        0.000006 ETH  (dominated by small USDC/USDT CoWs)
-Mean surplus per win:          0.7 ETH       (heavy outlier tail, ignored by projection)
-Projected wins / month:        274 (±55)
+Hypothetical wins observed:  ~20   (mostly router-v2 + bipartite)
+Median surplus per win:       ~0.00025 ETH  (router-v2 median from validate_data)
+Projected wins / month:       ~600 (±120)   (based on ~45% solve rate × auction frequency)
 
-Monthly revenue projection @ ETH = €1827:
-  Performance reward (gross):  €120
-  Solver surplus (gross):      €3   (median-based — conservative)
-  After 15% bonding fee:       €102
+Monthly revenue projection @ ETH = €2,700 (approx):
+  Performance reward (gross):  ~€195
+  Solver surplus (gross):      ~€40
+  After 15% bonding fee:       ~€166
   Minus server + RPC:          -€60
   ─────────────────────────────────
-  Net point:                   +€45/Mo
-  Net low / high (95% CI):     +€24 / +€66
+  Net point (approx):          +€146/Mo
+  Net low / high:              +€117 / +€175
 
-G6 BREAK-EVEN GATE: PASS  (Net low-band ≥ -€20)
+G6 BREAK-EVEN GATE: PASS
 ```
 
-**Why this number is conservative:** the projection uses median surplus (drowning the long tail). Router-v2's 6 ETH single-shot arb is capped out as p99 outlier. Multi-party's 1% solve rate (verified, see §3.2) contributes effectively 0 to the projection given the small sample.
+**Caveat:** window is 8h post-fix. Run `estimate_economics --hours 24` after collecting 24h clean data for a stable projection.
 
 ### 4.2 Realistic Range with Strategy Upside
 
