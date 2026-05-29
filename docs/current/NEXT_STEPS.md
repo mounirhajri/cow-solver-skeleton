@@ -100,11 +100,11 @@ Nach 24h sauberer Daten + G6 PASS:
 
 ## Current State (quick reference)
 
-- **Router-v2**: ✅ 45–57% solve-rate post-fix (war 0%)
+- **Router-v2**: ✅ 53% solve-rate post-fix (war 0%); ETH-value Tiebreaker im sort-key (Option A) gemergt
 - **Bipartite**: ✅ 12h-Daten sauber
 - **Composer**: ✅ CIP-14-basiertes Ranking aktiv
-- **validate_data**: ✅ Prüfungen 1+2 grün; Prüfungen 3–8 noch ausstehend
+- **validate_data**: ✅ alle 8 Prüfungen grün (live verifiziert)
 - **Phantom-Score**: ✅ naive=NULL, Score-Guard in persist.py
 - **Ghost-Detection**: ✅ läuft seit 2026-05-26
 - **EBBO**: ✅ sell+buy validiert
-- **G6**: PASS (8h-Fenster, ~€146/Mo NET point estimate)
+- **G6**: PASS (12h-Fenster, €4.947/Mo NET point estimate, ETH=€1700)
