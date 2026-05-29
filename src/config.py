@@ -52,7 +52,10 @@ class Settings(BaseSettings):
     # safely under the rate limit.  With WETH-only intermediates each order needs
     # ~9 sequential calls (~2.7 s on Alchemy); 9 orders / 3 concurrent = 3 waves
     # × 2.7 s = 8.1 s, comfortably inside the 11 s per-strategy budget.
-    router_max_orders: int = 9         # top-N sell orders by sell_amount
+    # Reduced from 9 → 4 (2026-05-29): 9 orders × ~9 V3 calls = ~81 Multicall3
+    # entries → ~16M gas → exceeds PublicNode eth_call cap → -32000 out of gas.
+    # 4 orders × 9 calls = ~36 entries → ~7M gas, comfortably under the cap.
+    router_max_orders: int = 4         # top-N sell orders by sell_amount
     router_max_concurrent: int = 3     # parallel RPC quote slots (semaphore)
     router_strategy_timeout: float = 11.0  # per-strategy timeout for router-v2 (s)
     # Intermediates for router-v2.  Restricted to WETH only (vs the full list used

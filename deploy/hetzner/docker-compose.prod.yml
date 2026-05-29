@@ -26,6 +26,7 @@ services:
       POOL_CACHE_MAX_ENTRIES: ${POOL_CACHE_MAX_ENTRIES:-800}
       AMM_STATE_LAZY: ${AMM_STATE_LAZY:-true}
       ROUTER_MAX_CONCURRENT: ${ROUTER_MAX_CONCURRENT:-3}
+      ROUTER_MAX_ORDERS: ${ROUTER_MAX_ORDERS:-4}
       EBBO_ENABLED: ${EBBO_ENABLED:-true}
       EBBO_TOLERANCE_BPS: ${EBBO_TOLERANCE_BPS:-50}
       # GoPlus authenticated tier for scripts/auto_seed_labels.py. Both must
