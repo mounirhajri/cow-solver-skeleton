@@ -1,6 +1,6 @@
 # Project Status — cow-solver-skeleton
 
-**Last verified:** 2026-05-25 via live DB query + code audit
+**Last verified:** 2026-05-29 via validate_data.py + live shadow DB
 **Deployment:** Hetzner CX22, Arbitrum One, shadow-only (no production submission yet)
 
 This doc is the single source of truth for "what's running, what's broken, what's next." It supersedes any claims in archived specs/plans under `docs/archive/`.
@@ -16,7 +16,7 @@ This doc is the single source of truth for "what's running, what's broken, what'
 | `naive` | `src/solver/naive.py` | Always solved (1306/1307 historical) | Shadow-only; **never submitted** — its oracle-derived clearing prices over-state real settlement (see Known Issues §3.1) |
 | `cow-matching-bipartite` | `edge/matching/bipartite.py` | Greedy 2-party CoW matcher | USDC/USDT specialist — 130/132 historical wins on that pair @ 1:1 clearing |
 | `cow-matching-multi-party` | `edge/matching/multi_party.py` | Johnson cycle enum + LP surplus-maximization | Honest fail rate ≈100% post-fix (most rings non-partial-fillable) |
-| `router-v2` | `src/solver/router.py` | V3 QuoterV2 top-N batched via Multicall3 | Chunk size 25 (gas cap), `router_v3_only_batched=True` default |
+| `router-v2` | `src/solver/router.py` | V3 QuoterV2 top-N batched via Multicall3 | `ROUTER_MAX_ORDERS=4` (PublicNode gas-simulation cap), env-override via docker-compose |
 | `composer` | `edge/matching/composer.py` | CIP-67 token-disjoint merge | Token overlap → candidate rejected, no price averaging |
 
 `long-tail` router exists in code (`edge/pool_indexer/long_tail_router.py`) but is **disabled** in production via `LONG_TAIL_ENABLED=false` due to Alchemy concurrent connection limits.
