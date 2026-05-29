@@ -34,6 +34,7 @@ async def run(hours: int, sample_n: int) -> None:
         await _check_datenfluss(sess, since, hours)
         await _check_solver_output(sess, since)
         await _check_winner_data(sess, since)
+        await _check_phantom_score(sess, since)
         await _check_comp_sync(sess, since)
         await _check_ghost_orders(sess)
         await _stichproben(sess, since, sample_n)
@@ -242,6 +243,139 @@ async def _check_winner_data(sess, since) -> None:
             print("    ⚠ Unser Score ist < 1% des Winners — Phantom-Score-Problem?")
     else:
         print("\n  Kein Score-Vergleich möglich (keine überlappenden Daten)")
+
+
+# ── Schicht 3a: Phantom-Score-Realitätscheck ──────────────────────────────
+
+
+async def _check_phantom_score(sess, since) -> None:
+    """Vergleicht unser_score_wei (an UNSEREN prices) vs.
+    score_vs_winner_prices_wei (gleiche trades, aber an WINNER's prices).
+
+    Das isoliert "Phantom-Score-Bug": wenn ratio our/winner_prices >> 1,
+    waren unsere clearing prices oracle-inflated, nicht ausführbar.
+
+    Echter hypothetischer Win: score_vs_winner_prices_wei > winner_score
+    (apples-to-apples, beide an winner-prices bewertet).
+    """
+    print(f"\n{SEP}")
+    print("SCHICHT 3a: PHANTOM-SCORE-REALITÄTSCHECK")
+    print(SEP)
+
+    # Coverage: wie viele Rows haben den re-evaluierten Score gefüllt?
+    row = await sess.execute(
+        text(
+            """
+            SELECT
+                COUNT(*) AS total_scored,
+                COUNT(*) FILTER (WHERE score_vs_winner_prices_wei IS NOT NULL)
+                    AS with_reeval,
+                COUNT(*) FILTER (WHERE score_vs_winner_prices_wei = 0)
+                    AS zeroed_at_winner_prices
+            FROM shadow_solutions ss
+            JOIN shadow_auctions sa ON sa.auction_id = ss.auction_id
+            WHERE sa.polled_at > :since
+              AND ss.our_score_wei > 0
+            """
+        ),
+        {"since": since},
+    )
+    total_scored, with_reeval, zeroed = row.one()
+    print(f"  Rows mit our_score > 0:       {total_scored or 0:>6}")
+    print(f"  Davon mit re-eval Score:      {with_reeval or 0:>6}  "
+          f"({100*(with_reeval or 0)/(total_scored or 1):.1f}%)")
+
+    if not total_scored:
+        print("  Keine Scores im Fenster.")
+        return
+
+    if not with_reeval:
+        print("  ⚠ KEINE score_vs_winner_prices_wei gefüllt!")
+        print("    Backfill nötig: docker exec cow-solver python -m scripts.backfill_winner_price_scores")
+        return
+
+    print(f"  Zero an Winner-Prices:        {zeroed or 0:>6}  "
+          f"(unsere trades nicht ausführbar gewesen)")
+
+    # Pro Strategie: Inflation-Faktor our/winner_prices
+    rows = await sess.execute(
+        text(
+            """
+            SELECT
+                ss.strategy,
+                COUNT(*) AS n,
+                COUNT(*) FILTER (WHERE ss.score_vs_winner_prices_wei = 0) AS n_zeroed,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (
+                    ORDER BY ss.our_score_wei::numeric / NULLIF(ss.score_vs_winner_prices_wei::numeric, 0)
+                ) AS median_inflation,
+                PERCENTILE_CONT(0.95) WITHIN GROUP (
+                    ORDER BY ss.our_score_wei::numeric / NULLIF(ss.score_vs_winner_prices_wei::numeric, 0)
+                ) AS p95_inflation
+            FROM shadow_solutions ss
+            JOIN shadow_auctions sa ON sa.auction_id = ss.auction_id
+            WHERE sa.polled_at > :since
+              AND ss.our_score_wei > 0
+              AND ss.score_vs_winner_prices_wei IS NOT NULL
+              AND ss.score_vs_winner_prices_wei > 0
+            GROUP BY ss.strategy
+            ORDER BY n DESC
+            """
+        ),
+        {"since": since},
+    )
+    print()
+    print(f"  {'Strategie':<30} {'n':>5} {'zeroed':>7} {'medInflation':>13} {'p95Inflation':>13}")
+    print("  " + "-" * 75)
+    for strategy, n, n_zeroed, median_i, p95_i in rows:
+        med = f"{float(median_i or 0):.2f}×"
+        p95 = f"{float(p95_i or 0):.2f}×"
+        zfrac = f"{100*(n_zeroed or 0)/n:.0f}%" if n else "n/a"
+        flag = ""
+        if median_i and float(median_i) > 1.5:
+            flag = "  ⚠ inflated"
+        elif median_i and float(median_i) > 1.1:
+            flag = "  ~ leicht über"
+        print(f"  {strategy:<30} {n:>5} {zfrac:>7} {med:>13} {p95:>13}{flag}")
+
+    # Ehrliche Wins: re-evaluiert vs winner_score
+    row = await sess.execute(
+        text(
+            """
+            SELECT
+                ss.strategy,
+                COUNT(*) FILTER (WHERE ss.our_score_wei > sw.score) AS naive_wins,
+                COUNT(*) FILTER (WHERE ss.score_vs_winner_prices_wei > sw.score)
+                    AS honest_wins,
+                COUNT(*) AS n_compared
+            FROM shadow_solutions ss
+            JOIN shadow_auctions sa ON sa.auction_id = ss.auction_id
+            JOIN shadow_winners sw ON sw.auction_id = ss.auction_id
+            WHERE sa.polled_at > :since
+              AND ss.our_score_wei > 0
+              AND ss.score_vs_winner_prices_wei IS NOT NULL
+              AND sw.score IS NOT NULL
+              AND sw.score > 0
+            GROUP BY ss.strategy
+            ORDER BY n_compared DESC
+            """
+        ),
+        {"since": since},
+    )
+    print()
+    print("  Ehrliche hypothetische Wins (score_vs_winner_prices > winner_score):")
+    print(f"  {'Strategie':<30} {'verglichen':>11} {'naive_wins':>11} {'ehrlich':>9} {'Verlust':>9}")
+    print("  " + "-" * 75)
+    for strategy, naive_wins, honest_wins, n_compared in rows:
+        nw = naive_wins or 0
+        hw = honest_wins or 0
+        nc = n_compared or 0
+        verlust_pct = f"{100*(nw-hw)/nw:.0f}%" if nw else "n/a"
+        flag = ""
+        if nw and (nw - hw) / nw > 0.5:
+            flag = "  ⚠ Phantom!"
+        elif nw and (nw - hw) / nw > 0.2:
+            flag = "  ~ etwas Phantom"
+        print(f"  {strategy:<30} {nc:>11} {nw:>11} {hw:>9} {verlust_pct:>9}{flag}")
 
 
 # ── Schicht 3b: Comp-Sync ─────────────────────────────────────────────────
