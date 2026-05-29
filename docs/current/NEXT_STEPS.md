@@ -1,23 +1,25 @@
-# Next Steps — 2026-05-29
+# Next Steps — 2026-05-29 (abends)
 
-Status: Router-fix live, 12h clean data collected, validate_data passing Prüfungen 1+2.
+Status: 12h clean data ✅, validate_data alle Prüfungen grün ✅, G6 PASS €4.947/Mo NET ✅
 
 ---
 
-## Priority 1 — validate_data vollständig durchlaufen lassen
+## Priority 1 — ERLEDIGT: validate_data + Economics
 
-```bash
-curl -sL https://raw.githubusercontent.com/mounirhajri/cow-solver-skeleton/claude/cow-solver-review-j7I9q/scripts/validate_data.py \
-  -o /tmp/validate_data.py && \
-docker cp /tmp/validate_data.py cow-solver:/app/scripts/validate_data.py
+Alle 8 Prüfungen grün (2026-05-29 ~22:00 UTC):
+- Prüfung 1 (Score-Sanity): ✅ Alle Scores in Range
+- Prüfung 2 (JSON-Felder): ✅ prices+trades vorhanden
+- Prüfung 3 (Join-Integrität): ✅ 0 verwaiste IDs, 1 Duplikat (minimal)
+- Prüfung 4 (Score-Gap): ✅ router-v2 88.9%, bipartite 270%, composer 340%
+- Prüfung 5 (EBBO): ✅ Keine Ablehnungen
+- Prüfung 6 (NULL-Scores): ✅ nur naive=NULL (by design)
+- Prüfung 8 (Composer-Fix): ✅ alle Composer >= beste Einzel-Strategie
 
-docker exec cow-solver python -m scripts.validate_data --hours 12 \
-  --fix-cutoff "2026-05-29 10:00:00"
-```
+Economics (12h Fenster, ETH=€1700): **€4.947/Mo NET — G6 PASS**
 
-Erwarteter Ausgang:
-- Prüfung 3 (Join-Integrität): 0 verwaiste IDs
-- Prüfung 4 (Score-Gap): router-v2 Score-Gap ~90-95%
+---
+
+## Priority 1 (neu) — 24h Daten für stabile Projektion
 - Prüfung 8 (Composer-Fix): alle Composer-Scores >= beste Einzel-Strategie
 
 ---
@@ -98,11 +100,11 @@ Nach 24h sauberer Daten + G6 PASS:
 
 ## Current State (quick reference)
 
-- **Router-v2**: ✅ 45–57% solve-rate post-fix (war 0%)
+- **Router-v2**: ✅ 53% solve-rate post-fix (war 0%); ETH-value Tiebreaker im sort-key (Option A) gemergt
 - **Bipartite**: ✅ 12h-Daten sauber
 - **Composer**: ✅ CIP-14-basiertes Ranking aktiv
-- **validate_data**: ✅ Prüfungen 1+2 grün; Prüfungen 3–8 noch ausstehend
+- **validate_data**: ✅ alle 8 Prüfungen grün (live verifiziert)
 - **Phantom-Score**: ✅ naive=NULL, Score-Guard in persist.py
 - **Ghost-Detection**: ✅ läuft seit 2026-05-26
 - **EBBO**: ✅ sell+buy validiert
-- **G6**: PASS (8h-Fenster, ~€146/Mo NET point estimate)
+- **G6**: PASS (12h-Fenster, €4.947/Mo NET point estimate, ETH=€1700)

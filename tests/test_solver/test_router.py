@@ -398,6 +398,55 @@ async def test_sort_ranks_otm_orders_last(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_sort_tiebreaks_zero_headroom_by_eth_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two market-priced orders (limit == market → headroom 0) must be
+    ranked by ETH value, not left in arbitrary input order.
+
+    Before the ETH-value tiebreaker both collapsed to surplus key 0, so the
+    top-N pick among the zero-headroom mass was arbitrary — the root cause of
+    0 % win-rate in the high-value buckets (Bucket 4/5, 2026-05-29 data).
+    Orders are passed [small, big] so a stable sort without the tiebreaker
+    would keep `small` first; the assertion proves the tiebreaker reorders
+    to quote the bigger ETH-value order instead.
+    """
+    quoted_amounts: list[int] = []
+
+    async def mock_quote(
+        _mc: object, _si: object, _bi: object, amount_in: int, _ints: object
+    ) -> None:
+        quoted_amounts.append(amount_in)
+        return None
+
+    monkeypatch.setattr("src.solver.router.quote_best_path", mock_quote)
+
+    weth = "0x" + "1" * 40
+    weth2 = "0x" + "3" * 40
+    tokens = {
+        weth:  Token(decimals=18, referencePrice=10**18),
+        weth2: Token(decimals=18, referencePrice=10**18),
+    }
+    # Both exactly at market: sell_value == buy_value → headroom 0 for both.
+    big_market = _make_order(
+        uid="big", sellToken=weth, buyToken=weth2,
+        sellAmount=100 * 10**18, buyAmount=100 * 10**18,
+    )
+    small_market = _make_order(
+        uid="small", sellToken=weth, buyToken=weth2,
+        sellAmount=10**18, buyAmount=10**18,
+    )
+    multicall = AsyncMock()
+    router = RouterSolver(
+        multicall=multicall, intermediates=[], max_orders=1, v3_only_batched=False
+    )
+    await router.solve(_make_auction([small_market, big_market], tokens=tokens))
+    assert quoted_amounts == [100 * 10**18], (
+        f"zero-headroom tie should pick the bigger ETH-value order, got {quoted_amounts}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_order_cap_falls_back_to_sell_amount_when_no_reference_price(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
