@@ -63,11 +63,11 @@ async def _check_score_sanity(sess, since) -> None:
                 COUNT(*) FILTER (WHERE our_score_wei = 0)                   AS zero_score,
                 COUNT(*) FILTER (WHERE our_score_wei < 0)                   AS negative,
                 COUNT(*) FILTER (WHERE our_score_wei > 5000000000000000000) AS over_5eth,
-                ROUND(MIN(our_score_wei::numeric) / 1e18, 8)                AS min_eth,
-                ROUND(MAX(our_score_wei::numeric) / 1e18, 8)                AS max_eth,
+                ROUND(MIN(our_score_wei::numeric) / 1e18::numeric, 8)          AS min_eth,
+                ROUND(MAX(our_score_wei::numeric) / 1e18::numeric, 8)          AS max_eth,
                 ROUND(
-                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY our_score_wei::numeric)
-                    / 1e18, 8
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY our_score_wei::numeric)::numeric
+                    / 1e18::numeric, 8
                 )                                                           AS median_eth
             FROM shadow_solutions
             WHERE status = 'solved'
@@ -278,10 +278,10 @@ async def _check_score_gap(sess, since) -> None:
             SELECT
                 s.strategy,
                 COUNT(DISTINCT s.auction_id)                                          AS n,
-                ROUND(AVG(s.our_score_wei::numeric) / 1e18, 6)                       AS avg_our_eth,
-                ROUND(AVG(w.score::numeric) / 1e18, 6)                               AS avg_winner_eth,
+                ROUND(AVG(s.our_score_wei::numeric) / 1e18::numeric, 6)              AS avg_our_eth,
+                ROUND(AVG(w.score::numeric) / 1e18::numeric, 6)                    AS avg_winner_eth,
                 ROUND(
-                    100.0 * AVG(s.our_score_wei::numeric)
+                    100 * AVG(s.our_score_wei::numeric)
                     / NULLIF(AVG(w.score::numeric), 0), 1
                 )                                                                     AS gap_pct,
                 COUNT(*) FILTER (WHERE s.our_score_wei::numeric >= w.score::numeric)  AS we_win
@@ -327,10 +327,10 @@ async def _check_score_gap(sess, since) -> None:
             SELECT
                 strategy,
                 COUNT(*) AS n,
-                ROUND(AVG(our_score_wei::numeric) / 1e18, 6)                  AS avg_own,
-                ROUND(AVG(score_vs_winner_prices_wei::numeric) / 1e18, 6)     AS avg_at_winner,
+                ROUND(AVG(our_score_wei::numeric) / 1e18::numeric, 6)        AS avg_own,
+                ROUND(AVG(score_vs_winner_prices_wei::numeric) / 1e18::numeric, 6) AS avg_at_winner,
                 ROUND(
-                    100.0 * AVG(score_vs_winner_prices_wei::numeric)
+                    100 * AVG(score_vs_winner_prices_wei::numeric)
                     / NULLIF(AVG(our_score_wei::numeric), 0), 1
                 )                                                              AS price_eff_pct
             FROM shadow_solutions
@@ -380,7 +380,7 @@ async def _check_ebbo(sess, since) -> None:
             SELECT
                 strategy,
                 COUNT(*)                AS n,
-                ROUND(AVG(latency_ms))  AS avg_lat_ms,
+                ROUND(AVG(latency_ms)::numeric)  AS avg_lat_ms,
                 MIN(created_at)         AS first,
                 MAX(created_at)         AS last
             FROM shadow_solutions
