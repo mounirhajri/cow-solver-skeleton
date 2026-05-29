@@ -69,28 +69,45 @@ def _eth_value_sort_key(order: Order, auction: Auction) -> int:
     return order.sell_amount * token_info.reference_price // 10**18
 
 
-def _expected_surplus_sort_key(order: Order, auction: Auction) -> int:
-    """Expected surplus headroom at reference prices.
+def _expected_surplus_sort_key(order: Order, auction: Auction) -> tuple[int, int]:
+    """Expected surplus headroom (primary) with ETH-value tiebreaker (secondary).
 
-    Computes ``sell_value - buy_value`` in ETH-equivalent units.  Positive
-    when the user has given us margin to capture (sell side worth more at
-    market than buy side requires); zero / negative when the order is
-    already OTM at reference (any router quote would lose).
+    Returns ``(headroom, eth_value)`` so the sort is two-level:
+
+    1.  **Primary — surplus headroom** ``max(0, sell_value - buy_value)`` in
+        ETH-equivalent units.  Positive when the user left us margin to
+        capture (sell side worth more at market than buy side requires);
+        clamped to 0 for OTM orders so they sort to the back.
+    2.  **Secondary — ETH value** ``sell_value`` of the order.  Breaks ties
+        between orders that share the same (often zero) headroom.
 
     Symmetric for sell and buy orders: both expose the same signed
     (sell_amount, buy_amount) pair, and the absolute headroom is the same
     |sell_value - buy_value| regardless of which side the protocol fixes
     as "exact". One key sorts both kinds consistently.
 
-    Why this beats sorting by ETH-value: whale orders (high ETH-value) tend
-    to be pre-optimised — their limit prices sit on the live market price
-    so the surplus headroom is ~0 and we cannot beat the winner solver.
-    Mid-size orders with sloppy limits leave 10–100 bps of headroom; those
-    are where router-v2 can win.
+    Why the headroom primary beats sorting by ETH-value alone: whale orders
+    (high ETH-value) tend to be pre-optimised — their limit prices sit on the
+    live market price so the surplus headroom is ~0 and we cannot beat the
+    winner solver on limit slack alone. Mid-size orders with sloppy limits
+    leave 10–100 bps of headroom; those are where router-v2 reliably wins
+    (Buckets 1/2, 70–77 % win-rate observed 2026-05-29).
 
-    Falls back to ``_eth_value_sort_key`` when either token lacks a
-    reference price — without prices we can't compute headroom, and ETH
-    value is at least a directional proxy for "interesting order".
+    Why the ETH-value tiebreaker was added (2026-05-29): market-priced whales
+    all collapse to headroom 0, so the top-N pick among that zero-headroom
+    mass used to be arbitrary — leaving us blind to the highest-value auctions
+    (Buckets 4/5, ~87 % of surplus volume but 0 % win-rate and only ~46–50 %
+    coverage). Ranking ties by ETH value spends any quote slots left over
+    after the genuinely-ITM orders on the biggest opportunities instead of
+    random ones; execution surplus (a better V3 rate than the user's limit)
+    can still exist even at zero limit-headroom. This raises Bucket 4/5
+    coverage without disturbing the Bucket 1/2 ordering (headroom stays
+    primary, so any ITM order still outranks every zero-headroom one).
+
+    Falls back to ``_eth_value_sort_key`` (wrapped as a degenerate tuple so
+    the sort key type stays consistent) when either token lacks a reference
+    price — without prices we can't compute headroom, and ETH value is at
+    least a directional proxy for "interesting order".
     """
     sell_tok = auction.tokens.get(order.sell_token)
     buy_tok = auction.tokens.get(order.buy_token)
@@ -100,13 +117,16 @@ def _expected_surplus_sort_key(order: Order, auction: Auction) -> int:
         or buy_tok is None
         or buy_tok.reference_price is None
     ):
-        return _eth_value_sort_key(order, auction)
+        fallback = _eth_value_sort_key(order, auction)
+        return (fallback, fallback)
     sell_value = order.sell_amount * sell_tok.reference_price
     buy_value = order.buy_amount * buy_tok.reference_price
     # OTM orders (negative headroom) collapse to 0 so they sort to the back
     # rather than dominating with large negative numbers.  We still process
     # them if max_orders > #ITM_orders, but never preferentially.
-    return max(0, (sell_value - buy_value) // 10**18)
+    headroom = max(0, (sell_value - buy_value) // 10**18)
+    eth_value = sell_value // 10**18
+    return (headroom, eth_value)
 
 
 class RouterSolver:
