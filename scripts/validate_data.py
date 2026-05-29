@@ -92,7 +92,7 @@ async def _check_score_sanity(sess, since) -> None:
     all_ok = True
     for r in data:
         flag = ""
-        if r.null_score:
+        if r.null_score and r.strategy != "naive":
             flag += f"  {WARN} {r.null_score} NULL-Scores"
         if r.zero_score:
             flag += f"  {WARN} {r.zero_score} Null-Werte"
@@ -126,15 +126,15 @@ async def _check_json_fields(sess, since) -> None:
             SELECT
                 strategy,
                 COUNT(*)                                              AS n,
-                COUNT(*) FILTER (WHERE solution ? 'prices')           AS has_prices,
-                COUNT(*) FILTER (WHERE solution ? 'trades')           AS has_trades,
-                COUNT(*) FILTER (WHERE solution ? 'interactions')     AS has_interactions,
+                COUNT(*) FILTER (WHERE (solution -> 'prices') IS NOT NULL)   AS has_prices,
+                COUNT(*) FILTER (WHERE (solution -> 'trades') IS NOT NULL)   AS has_trades,
+                COUNT(*) FILTER (WHERE (solution -> 'interactions') IS NOT NULL) AS has_interactions,
                 COUNT(*) FILTER (WHERE
-                    NOT (solution ? 'prices') OR NOT (solution ? 'trades')
+                    (solution -> 'prices') IS NULL OR (solution -> 'trades') IS NULL
                 )                                                     AS missing_fields,
                 COUNT(*) FILTER (WHERE
-                    solution ? 'trades'
-                    AND jsonb_array_length(solution -> 'trades') = 0
+                    (solution -> 'trades') IS NOT NULL
+                    AND json_array_length(solution -> 'trades') = 0
                 )                                                     AS empty_trades
             FROM shadow_solutions
             WHERE status = 'solved'
@@ -177,12 +177,12 @@ async def _check_json_fields(sess, since) -> None:
         text(
             """
             SELECT id, auction_id, strategy,
-                   jsonb_array_length(solution -> 'trades') AS n_trades,
+                   json_array_length(solution -> 'trades') AS n_trades,
                    solution -> 'trades' -> 0                AS first_trade
             FROM shadow_solutions
             WHERE status = 'solved'
               AND created_at > :since
-              AND (NOT (solution ? 'prices') OR NOT (solution ? 'trades'))
+              AND ((solution -> 'prices') IS NULL OR (solution -> 'trades') IS NULL)
             LIMIT 3
             """
         ),
@@ -448,11 +448,11 @@ async def _check_null_scores(sess, since) -> None:
             """
             SELECT
                 id, auction_id, strategy, created_at, error,
-                solution ? 'prices' AS has_prices,
-                solution ? 'trades' AS has_trades,
+                (solution -> 'prices') IS NOT NULL AS has_prices,
+                (solution -> 'trades') IS NOT NULL AS has_trades,
                 CASE
-                    WHEN solution ? 'trades'
-                    THEN jsonb_array_length(solution -> 'trades')
+                    WHEN (solution -> 'trades') IS NOT NULL
+                    THEN json_array_length(solution -> 'trades')
                     ELSE NULL
                 END AS n_trades
             FROM shadow_solutions
