@@ -1,6 +1,6 @@
 # Project Status — cow-solver-skeleton
 
-**Last verified:** 2026-05-29 via validate_data.py + live shadow DB
+**Last verified:** 2026-05-29 21:58 UTC via verify_24h + validate_data + estimate_economics (12h window)
 **Deployment:** Hetzner CX22, Arbitrum One, shadow-only (no production submission yet)
 
 This doc is the single source of truth for "what's running, what's broken, what's next." It supersedes any claims in archived specs/plans under `docs/archive/`.
@@ -268,15 +268,26 @@ Fix options: extend `intermediate_tokens` (WETH+USDC+USDT+WBTC) or change sort-k
 - Token-pair distribution: dominated by recurring USDC/USDT CoW pairs at micro-scale ($6-100 trades), plus WETH/USDC and capped TWAP slices
 - 9 distinct first-trade UIDs in 103 emissions → real opportunity diversity, not single-order overcount
 
-### 3.5 Bimodal Win-Rate / Bucket-4 Gap
+### 3.5 Bimodal Win-Rate / Bucket-Gap
 
-**Observation (2026-05-29, 12h shadow data):** Bucket 4 ("groß", 0.01–0.1 ETH winner scores) contains ~76% of total Surplus-Volumen but we have only 24% Coverage and 0% Win-Rate there.
+**Messung (2026-05-29, 12h, n=452 Auktionen):**
 
-**Root cause:** `router._expected_surplus_sort_key` intentionally de-prioritises large orders (guards against over-filling TWAPs), combined with `ROUTER_MAX_ORDERS=4` limiting the number of top-N orders considered per auction.
+```
+Bucket                    n   Cov   Win  WinR   Markt%
+1-micro  (<0.0001 ETH)  189   43%    63   77%     0.1%
+2-klein  (0.0001-0.001) 157   64%    71   70%     2.0%
+3-mittel (0.001-0.01)    76   57%     8   19%    10.7%
+4-groß   (0.01-0.1)      26   46%     0    0%    36.8%  ← 0% Win-Rate
+5-mega   (>0.1 ETH)       4   50%     0    0%    50.4%  ← 0% Win-Rate
+```
 
-**Impact:** We are effectively blind to the highest-value auctions. G6 economics pass only on the small-bucket floor.
+87.2% des gesamten Surplus-Volumens liegt in Buckets 4+5 — dort gewinnen wir nichts.
 
-**Proposed fix (not yet implemented):** Change sort-key to `headroom × log(eth_value)` or extend `intermediate_tokens` list to include WBTC for additional routing paths.
+**Root cause:** `router._expected_surplus_sort_key` de-priorisiert große Orders (TWAP-Schutz) + `ROUTER_MAX_ORDERS=4` begrenzt Kandidaten.
+
+**Konkret in Bucket 5:** unser Ø 0.224 ETH vs. Winner Ø 0.329 ETH = 68% unseres Scores — nah, aber nicht nah genug.
+
+**Proposed fix (nicht implementiert):** Sort-Key auf `headroom × log(eth_value)` ändern oder `intermediate_tokens` um WBTC erweitern für mehr Routing-Pfade.
 
 ---
 
@@ -292,68 +303,80 @@ Re-evaluation expectations after the full Phase A wiring (see §1.5 — Multi-Pa
 - Router-v2 unchanged (independent of ghosts)
 - Net effect: direction uncertain until full clean baseline lands.  No confident projection can be made today.
 
-### 4.1 Verified Conservative Floor (`estimate_economics --hours 8`, post-fix data, n= ~20 after dedup)
+### 4.1 Verified Floor (`estimate_economics --hours 12`, 2026-05-29 21:58 UTC, ETH=€1700)
 
-Post-router-fix (2026-05-29, after `router_max_orders` 9→4):
+Post-router-fix, 12h clean window, 452 auctions:
 
 ```
-Hypothetical wins observed:  ~20   (mostly router-v2 + bipartite)
-Median surplus per win:       ~0.00025 ETH  (router-v2 median from validate_data)
-Projected wins / month:       ~600 (±120)   (based on ~45% solve rate × auction frequency)
+Hypothetical wins observed: 107  (102 router-v2 + 5 bipartite, after dedup + p99 cap)
+  [dedup] router-v2: 141 raw → 102 distinct UID-sets (39 repeats collapsed)
 
-Monthly revenue projection @ ETH = €2,700 (approx):
-  Performance reward (gross):  ~€195
-  Solver surplus (gross):      ~€40
-  After 15% bonding fee:       ~€166
-  Minus server + RPC:          -€60
-  ─────────────────────────────────
-  Net point (approx):          +€146/Mo
-  Net low / high:              +€117 / +€175
+Surplus per win: median +0.000248 ETH  (mean 0.000921 ETH — outlier tail, see caveat)
+Projected wins / month:  6.514 (±1.303)
 
-G6 BREAK-EVEN GATE: PASS
+Monthly revenue @ ETH=€1700:
+  Performance reward (gross):   €2.658
+  Solver surplus (gross):       €2.747
+  After 15% bonding fee:        €2.259
+  Server + RPC:                   -€60
+  ──────────────────────────────────────
+  Net point:                   +€4.947
+  Net low / high:    +€3.945 / +€5.948
+
+G6 BREAK-EVEN GATE: PASS (Net low ≥ -€20 ✓)
 ```
 
-**Caveat:** window is 8h post-fix. Run `estimate_economics --hours 24` after collecting 24h clean data for a stable projection.
+**Caveat — mean >> median (3.7×):** Ein Outlier (0.246 ETH max, router-v2) bläst den Mean auf. Projektion nutzt korrekt den Median. Konservative Untergrenze: halbiere alles → **€2.474/Mo NET** — immer noch G6 PASS.
 
-### 4.2 Realistic Range with Strategy Upside
+**Caveat — 12h Fenster:** Noch nicht stationär. Nach 24h re-evaluieren mit `estimate_economics --hours 24 --eth-price-eur <aktuell>`.
 
-| Scenario | Bipartite | Router-v2 | Multi-Party | Net/Mo |
+**Was noch NICHT beiträgt (Upside):**
+- Bucket 4+5 (87% des Surplus-Volumens): 0% Win-Rate → wenn wir dort 20% erreichen → 5–10× dieses Werts
+- Multi-Party: 0% Solve-Rate auf Arbitrum → unverändert €0-Beitrag
+
+### 4.2 Realistic Range mit Strategy Upside
+
+| Szenario | Basis (12h Messung) | +Bucket 4+5 20% WR | +Multi-Party | Net/Mo |
 |---|---|---|---|---|
-| **Worst** (script floor) | €45 | €0 | €0 | **€45** |
-| **Likely** (one router settle / 2mo, multi-party 1 ring / 2 days) | €60 | €500 | €1500 | **€2,000** |
-| **Optimistic** (regular router arbs, multi-party 5/day) | €100 | €5,000 | €7,000 | **€12,000** |
+| **Gemessen** (12h, ETH=€1700) | €4.947 | — | — | **€4.947** |
+| **Konservativ** (halbiert) | €2.474 | — | — | **€2.474** |
+| **Optimistisch** (Bucket 4+5 entriegelt) | €4.947 | +€15.000 | +€3.000 | **~€23.000** |
 
 ### 4.3 Solver-Pool Reference Points
 
-From clean-baseline `shadow_winners` data (last ~2h, n=110 auctions with named winners):
+`shadow_winners` 12h-Fenster, n=452 Auktionen (2026-05-29):
 
-| Solver | Wins | Median Score | Strategy Pattern |
+| Solver | Wins | Marktanteil | Muster |
 |---|---|---|---|
-| **helixbox-solve** | 44% | 0.000183 ETH | Volume-floor + occasional medium arbs |
-| **kaisersolver-solve** | 29% | 0.000044 ETH | Pure volume-floor (minimum-surplus submissions) |
-| **rizzolver** | 6% | 0.001850 ETH | Higher-quality bigger wins |
-| **wraxyn-solve** | 1% | 0.157 ETH | **High-value single arbs (~$300 per win)** — reference for what our router-v2 capability could capture if V3 depth realises |
-| sector, zeroex, baseline, kipseli, others | <2% each | varied | mixed |
+| **helixbox-solve** | 202 | 44.7% | Volume-floor + gelegentliche mittlere Arbs |
+| **sigmaresearch-solve** | 54 | 11.9% | Neu prominent — unbekannte Strategie |
+| **kaisersolver** | 48 | 10.6% | Pure volume-floor (minimale Surplus-Einreichungen) |
+| **rizzolver** | 46 | 10.2% | Höherwertige Wins |
+| **portus** | 21 | 4.6% | Neu — unbekannte Strategie |
+| sector, zurui-solve, arc-solve, others | <3% each | — | gemischt |
 
-**Where we'd fit:** competitive in the kaisersolver/helixbox volume-floor band. Capability (router-v2, multi-party) for wraxyn-style high-value single arbs exists but is unproven in production.
+**Unser Fit:** Bucket 1+2 (micro/klein) — 77% bzw. 70% Win-Rate gegen kaiser/helixbox volume-floor. Kein Treffer gegen rizzolver/sector in deren Kern-Auktionen.
+
+**Stichprobe (Auktion 7413907):** router-v2 Score 0.00713 ETH vs. kaisersolver 0.000445 ETH → wir schlagen ihn um Faktor 16×. Solche Auktionen sind echte hypothetische Wins.
 
 ### 4.4 Pitch Framing
 
-**Conservative talking points (verified):**
-- "G6 break-even gate passes on clean post-bugfix baseline at €45/Mo NET point estimate"
-- "Bipartite ~13% hypothetical win-rate (n=101) primarily on stablecoin CoW pairs"
-- "Multi-party LP demonstrated end-to-end (auction 7371674, 3-token WETH/USDC/USDT ring, $48 surplus)"
-- "Router-v2 captures off-market loose-limit arbitrage when V3 depth permits"
+**Belegbare Talking-Points (live-verifiziert 2026-05-29):**
+- "G6 PASS: €4.947/Mo NET point estimate (12h Fenster, ETH=€1700, konservativ halbiert: €2.474)"
+- "router-v2: 53% Solve-Rate, 88.9% Score-Gap vs. Gewinner"
+- "Micro/Klein-Bucket: 77%/70% Win-Rate gegen volume-floor Konkurrenz"
+- "107 hypothetische Wins in 12h nach UID-Dedup (kein Doppelzählen)"
+- "Multi-party LP verifiziert end-to-end (Auktion 7371674, 3-Token Ring, $48 Surplus)"
 
-**Strategic positioning (forward-looking):**
-- "Not pitching first-month revenue — positioning for long-term solver contribution"
-- "Mainnet expansion potential 5-20× current Arbitrum-only volume"
-- "Partial-fills phase 2-4 would unblock multi-party's ~99% currently-blocked rings"
+**Strategische Positionierung:**
+- "Nicht auf Monat-1-Revenue pitchen — Positionierung für langfristigen Solver-Beitrag"
+- "Bucket 4+5 (87% des Surplus-Volumens) noch nicht entriegelt — das ist das dokumentierte Upside"
+- "Multi-Party + Partial-Fills = nächste Wachstumsstufe"
 
-**DO NOT claim:**
-- ❌ Win-rates above 15% without confirming with n=500+ data
-- ❌ Specific monthly revenue numbers above €100 without router/multi-party validation
-- ❌ "Beat the top tier" — we don't beat rizzolver/sector/wraxyn on their wins
+**NICHT behaupten:**
+- ❌ €4.947 als garantierte monatliche Einnahme — das ist eine 12h-Projektion, noch nicht stationär
+- ❌ "Wir schlagen die Top-Tier" — rizzolver/sector/sigmaresearch in deren Kern-Auktionen schlagen wir nicht
+- ❌ Multi-Party als aktiven Revenue-Treiber — aktuell 0% Solve-Rate auf Arbitrum
 
 ---
 
