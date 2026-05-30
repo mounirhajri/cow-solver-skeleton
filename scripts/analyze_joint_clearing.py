@@ -74,7 +74,7 @@ async def _run(hours: int, min_eth_value: float) -> None:
                 ss.solution,
                 ss.our_score_wei,
                 sw.score AS winner_score,
-                sw.solver AS winner_solver
+                sw.winner_solver AS winner_solver
             FROM shadow_solutions ss
             LEFT JOIN shadow_winners sw USING (auction_id)
             JOIN shadow_auctions sa ON sa.auction_id = ss.auction_id
@@ -159,16 +159,16 @@ async def _run(hours: int, min_eth_value: float) -> None:
                 })
 
         # ── Fetch same-pair opportunity from orders ────────────────────────
-        # Query: for each auction, count orders with the same (sellToken, buyToken)
-        # pair that appeared in the auction.  Join with router-v2 solutions to
-        # identify those we actually attempted.
+        # For each auction, count non-partial SELL orders sharing the same
+        # (sellToken, buyToken) pair.  ≥2 = a joint-clearing candidate group.
+        # No join to shadow_solutions: that would multiply the per-order rows
+        # and inflate COUNT(*).  We only need the raw order grouping here.
         q2 = text("""
             SELECT
                 sa.auction_id,
                 o_sell_token,
                 o_buy_token,
-                COUNT(*) AS n_orders,
-                SUM(CASE WHEN ss.auction_id IS NOT NULL THEN 1 ELSE 0 END) AS n_solved
+                COUNT(*) AS n_orders
             FROM shadow_auctions sa
             CROSS JOIN LATERAL (
                 SELECT
@@ -179,9 +179,6 @@ async def _run(hours: int, min_eth_value: float) -> None:
                 WHERE (elem->>'kind') = 'sell'
                   AND (elem->>'partiallyFillable') = 'false'
             ) orders_expanded
-            LEFT JOIN shadow_solutions ss
-                ON ss.auction_id = sa.auction_id
-                AND ss.strategy = 'router-v2'
             WHERE sa.polled_at > :since
             GROUP BY sa.auction_id, o_sell_token, o_buy_token
             HAVING COUNT(*) >= 2
