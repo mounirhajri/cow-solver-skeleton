@@ -13,6 +13,7 @@ from src.shadow.scoring import (
     compute_solution_score,
     extract_native_prices,
     orders_by_uid_from_auction,
+    reconstruct_clearing_prices_from_executed,
     score_at_external_prices,
 )
 
@@ -324,3 +325,102 @@ def test_orders_by_uid_from_pydantic() -> None:
     assert "0xdeadbeef" in result
     assert result["0xdeadbeef"]["sellToken"] == "0xS"
     assert result["0xdeadbeef"]["sellAmount"] == 1000
+
+
+# ── reconstruct_clearing_prices_from_executed (Arbitrum empty-clearingPrices) ─
+
+
+def test_reconstruct_single_order_builds_pair_prices() -> None:
+    # Winner filled one order: sold 1e18 sell-token, received 3000 buy-token.
+    # price[sell] = executed_buy, price[buy] = executed_sell.
+    winner_sol = {
+        "orders": [
+            {"id": "0xABC", "sellAmount": "1000000000000000000", "buyAmount": "3000"}
+        ]
+    }
+    uid_map = {"0xabc": {"sellToken": "0xSell", "buyToken": "0xBuy"}}
+    cp = reconstruct_clearing_prices_from_executed(winner_sol, uid_map)
+    assert cp == {"0xsell": 3000, "0xbuy": 1000000000000000000}
+
+
+def test_reconstruct_uses_camelcase_and_snakecase_token_keys() -> None:
+    winner_sol = {"orders": [{"id": "0xAbC", "sellAmount": "10", "buyAmount": "20"}]}
+    uid_map = {"0xabc": {"sell_token": "0xSELL", "buy_token": "0xBUY"}}
+    cp = reconstruct_clearing_prices_from_executed(winner_sol, uid_map)
+    assert cp == {"0xsell": 20, "0xbuy": 10}
+
+
+def test_reconstruct_returns_empty_when_uid_not_in_map() -> None:
+    winner_sol = {"orders": [{"id": "0xABC", "sellAmount": "10", "buyAmount": "20"}]}
+    assert reconstruct_clearing_prices_from_executed(winner_sol, {}) == {}
+
+
+def test_reconstruct_returns_empty_for_multi_pair_winner() -> None:
+    # Two different pairs → 4 distinct tokens → no consistent 2-token vector.
+    winner_sol = {
+        "orders": [
+            {"id": "0x1", "sellAmount": "10", "buyAmount": "20"},
+            {"id": "0x2", "sellAmount": "30", "buyAmount": "40"},
+        ]
+    }
+    uid_map = {
+        "0x1": {"sellToken": "0xA", "buyToken": "0xB"},
+        "0x2": {"sellToken": "0xC", "buyToken": "0xD"},
+    }
+    assert reconstruct_clearing_prices_from_executed(winner_sol, uid_map) == {}
+
+
+def test_reconstruct_skips_zero_and_nonnumeric_amounts() -> None:
+    uid_map = {"0x1": {"sellToken": "0xA", "buyToken": "0xB"}}
+    assert reconstruct_clearing_prices_from_executed(
+        {"orders": [{"id": "0x1", "sellAmount": "0", "buyAmount": "20"}]}, uid_map
+    ) == {}
+    assert reconstruct_clearing_prices_from_executed(
+        {"orders": [{"id": "0x1", "sellAmount": "x", "buyAmount": "20"}]}, uid_map
+    ) == {}
+
+
+def test_reconstruct_empty_inputs() -> None:
+    assert reconstruct_clearing_prices_from_executed(None, {}) == {}
+    assert reconstruct_clearing_prices_from_executed({}, {}) == {}
+    assert reconstruct_clearing_prices_from_executed({"orders": []}, {}) == {}
+
+
+def test_reconstruct_feeds_score_at_external_prices() -> None:
+    # End-to-end: reconstructed winner prices used to re-score our trade.
+    # Our solution sold 1e18 sell-token and (claims) 2900 buy-token; the winner
+    # achieved 3000 for the same input → our score at winner prices is higher.
+    uid = "0xabc"
+    uid_map = {
+        uid: {
+            "sellToken": "0xsell",
+            "buyToken": "0xbuy",
+            "sellAmount": 1000000000000000000,
+            "buyAmount": 2000,  # limit
+            "kind": "sell",
+        }
+    }
+    winner_sol = {
+        "orders": [
+            {"id": uid, "sellAmount": "1000000000000000000", "buyAmount": "3000"}
+        ]
+    }
+    cp = reconstruct_clearing_prices_from_executed(winner_sol, uid_map)
+    assert cp  # non-empty
+    our_solution = {
+        "prices": {"0xsell": 2900, "0xbuy": 1000000000000000000},
+        "trades": [
+            {
+                "kind": "fulfillment",
+                "orderUid": uid,
+                "executedAmount": "1000000000000000000",
+            }
+        ],
+    }
+    native = {"0xbuy": 10**18}  # 1:1 native price for the buy token
+    winner_priced = score_at_external_prices(our_solution, uid_map, native, cp)
+    own_priced = score_at_external_prices(
+        our_solution, uid_map, native, our_solution["prices"]
+    )
+    # At the winner's better price our trade yields more surplus.
+    assert winner_priced > own_priced

@@ -261,3 +261,64 @@ def orders_by_uid_from_auction(auction: Any) -> dict[str, dict[str, Any]]:
             if uid:
                 result[uid] = o
     return result
+
+
+def reconstruct_clearing_prices_from_executed(
+    winner_sol: dict[str, Any] | None,
+    orders_by_uid: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Rebuild a winner's clearing prices from its executed order amounts.
+
+    The CoW competition API returns ``clearingPrices`` as an empty object on
+    Arbitrum (verified 2026-05-30 across the full shadow_winners table), so the
+    winner-price comparison column can never be filled from that field.  Each
+    winner *solution* does, however, list the orders it filled with their
+    executed ``sellAmount`` / ``buyAmount``.
+
+    Under a uniform clearing price the executed amounts define the price ratio
+    of the traded pair:
+
+        price[sell_token] * executed_sell == price[buy_token] * executed_buy
+        =>  price[sell_token] = executed_buy ,  price[buy_token] = executed_sell
+
+    The token *addresses* are not in the solution's order entries (only the uid,
+    ``sellAmount`` and ``buyAmount``), so they are looked up in ``orders_by_uid``
+    built from the auction order book.
+
+    Only a single-pair winner (the overwhelming majority on Arbitrum — winners
+    almost always fill one order) yields an internally consistent two-token
+    vector here.  A multi-pair winner would require a normalised cross-token
+    price vector; those are skipped (returns ``{}``) rather than emitting an
+    inconsistent vector that would corrupt the score.  Returns lower-cased
+    token keys, matching :func:`score_at_external_prices`.
+    """
+    if not isinstance(winner_sol, dict):
+        return {}
+    orders = winner_sol.get("orders") or []
+    legs: list[tuple[str, str, int, int]] = []
+    tokens: set[str] = set()
+    for o in orders:
+        if not isinstance(o, dict):
+            continue
+        uid = (o.get("id") or o.get("orderUid") or o.get("uid") or "").lower()
+        order = orders_by_uid.get(uid)
+        if not order:
+            continue
+        sell_token = str(order.get("sellToken") or order.get("sell_token") or "").lower()
+        buy_token = str(order.get("buyToken") or order.get("buy_token") or "").lower()
+        if not sell_token or not buy_token:
+            continue
+        try:
+            exec_sell = int(o.get("sellAmount"))
+            exec_buy = int(o.get("buyAmount"))
+        except (TypeError, ValueError):
+            continue
+        if exec_sell <= 0 or exec_buy <= 0:
+            continue
+        legs.append((sell_token, buy_token, exec_sell, exec_buy))
+        tokens.update((sell_token, buy_token))
+
+    if not legs or len(tokens) != 2:
+        return {}
+    sell_token, buy_token, exec_sell, exec_buy = legs[0]
+    return {sell_token: exec_buy, buy_token: exec_sell}

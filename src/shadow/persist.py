@@ -20,6 +20,7 @@ from src.shadow.scoring import (
     compute_solution_score,
     extract_native_prices,
     orders_by_uid_from_auction,
+    reconstruct_clearing_prices_from_executed,
     score_at_external_prices,
 )
 from src.solver.orchestrator import AttemptRecord
@@ -323,11 +324,6 @@ async def _backfill_winner_price_scores_for_auction(
     if winner_sol is None:
         return
 
-    # CoW API uses camelCase clearingPrices; our own solver dict uses "prices".
-    clearing_prices = winner_sol.get("clearingPrices") or winner_sol.get("prices") or {}
-    if not clearing_prices:
-        return
-
     # Native prices: prefer raw_competition.auction.prices, fall back to
     # raw_auction.tokens[*].referencePrice (mirrors persist_shadow_attempt).
     native_prices = extract_native_prices(raw_competition or {})
@@ -349,6 +345,16 @@ async def _backfill_winner_price_scores_for_auction(
     # dedicated backfill script handles those rows via the CoW API.
     uid_map = orders_by_uid_from_auction(auction_payload or {})
     if not uid_map:
+        return
+
+    # CoW API uses camelCase clearingPrices; our own solver dict uses "prices".
+    # On Arbitrum both are empty in the competition response, so fall back to
+    # reconstructing the clearing-price ratio from the winner's executed order
+    # amounts (needs uid_map for the token addresses — hence built above).
+    clearing_prices = winner_sol.get("clearingPrices") or winner_sol.get("prices") or {}
+    if not clearing_prices:
+        clearing_prices = reconstruct_clearing_prices_from_executed(winner_sol, uid_map)
+    if not clearing_prices:
         return
 
     q = await session.execute(

@@ -10,6 +10,11 @@ For "backfilled" solutions whose raw_auction is a placeholder dict, we fetch
 order details from the CoW Protocol API by UID (same fallback path as
 backfill_scores.py).
 
+Winner clearing prices are sourced in three tiers (see the per-row loop):
+shadow_winners.raw_solution, then shadow_competitors.clearing_prices, then —
+because the CoW Arbitrum API returns clearingPrices as {} in both — a
+reconstruction from the winner's executed order amounts.
+
 Usage:
     python -m scripts.backfill_winner_price_scores [--days 30] [--dry-run] [--batch 500]
 """
@@ -35,6 +40,7 @@ from src.persistence.models import (
 from src.shadow.scoring import (
     extract_native_prices,
     orders_by_uid_from_auction,
+    reconstruct_clearing_prices_from_executed,
     score_at_external_prices,
 )
 
@@ -101,21 +107,13 @@ async def backfill(days: int = 30, dry_run: bool = False, batch_size: int = 500)
     error_count = 0
     api_fetch_count = 0
     skipped_no_prices = 0
+    reconstructed_count = 0
 
     for sol_id, auction_id, solution, raw_auction, raw_competition, winner_raw in rows:
         try:
             if not isinstance(solution, dict):
                 zero_count += 1
                 updates.append({"id": sol_id, "score_vs_winner_prices_wei": None})
-                continue
-
-            # Prefer the poller snapshot; fall back to the competition-API
-            # clearing prices stored in shadow_competitors (see pre-fetch above).
-            clearing_prices = _winner_clearing_prices(winner_raw)
-            if not clearing_prices:
-                clearing_prices = winner_cp_by_auction.get(auction_id, {})
-            if not clearing_prices:
-                skipped_no_prices += 1
                 continue
 
             native_prices = extract_native_prices(raw_competition or {})
@@ -140,6 +138,28 @@ async def backfill(days: int = 30, dry_run: bool = False, batch_size: int = 500)
                             f"  WARN aid={auction_id} sid={sol_id}: API returned no orders"
                         )
 
+            # Winner clearing prices come from up to THREE sources, in order of
+            # fidelity:
+            #   1. shadow_winners.raw_solution.clearingPrices / .prices
+            #   2. shadow_competitors.clearing_prices (sync_competitions snapshot)
+            #   3. reconstruct from the winner's executed order amounts
+            # On Arbitrum the CoW API returns clearingPrices as {} in BOTH #1
+            # and #2 (verified 2026-05-30), so #3 is what actually unblocks the
+            # backfill: each winner order carries executed sellAmount/buyAmount,
+            # which define the clearing-price ratio of the filled pair.
+            clearing_prices = _winner_clearing_prices(winner_raw)
+            if not clearing_prices:
+                clearing_prices = winner_cp_by_auction.get(auction_id, {})
+            if not clearing_prices:
+                clearing_prices = reconstruct_clearing_prices_from_executed(
+                    winner_raw, uid_map
+                )
+                if clearing_prices:
+                    reconstructed_count += 1
+            if not clearing_prices:
+                skipped_no_prices += 1
+                continue
+
             score = score_at_external_prices(
                 solution, uid_map, native_prices, clearing_prices
             )
@@ -161,6 +181,7 @@ async def backfill(days: int = 30, dry_run: bool = False, batch_size: int = 500)
     print(
         f"  Scored: {len(updates)} | zero/null: {zero_count} | errors: {error_count}"
         f" | skipped (no winner prices): {skipped_no_prices}"
+        f" | reconstructed prices: {reconstructed_count}"
         f" | API fetches: {api_fetch_count}"
     )
 
