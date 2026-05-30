@@ -74,7 +74,7 @@ async def _run(hours: int, min_eth_value: float) -> None:
                 ss.solution,
                 ss.our_score_wei,
                 sw.score AS winner_score,
-                sw.solver AS winner_solver
+                sw.winner_solver AS winner_solver
             FROM shadow_solutions ss
             LEFT JOIN shadow_winners sw USING (auction_id)
             JOIN shadow_auctions sa ON sa.auction_id = ss.auction_id
@@ -167,21 +167,16 @@ async def _run(hours: int, min_eth_value: float) -> None:
                 sa.auction_id,
                 o_sell_token,
                 o_buy_token,
-                COUNT(*) AS n_orders,
-                SUM(CASE WHEN ss.auction_id IS NOT NULL THEN 1 ELSE 0 END) AS n_solved
+                COUNT(*) AS n_orders
             FROM shadow_auctions sa
             CROSS JOIN LATERAL (
                 SELECT
                     (elem->>'sellToken')  AS o_sell_token,
-                    (elem->>'buyToken')   AS o_buy_token,
-                    (elem->>'uid')        AS o_uid
+                    (elem->>'buyToken')   AS o_buy_token
                 FROM json_array_elements(sa.raw_auction->'orders') AS elem
                 WHERE (elem->>'kind') = 'sell'
                   AND (elem->>'partiallyFillable') = 'false'
             ) orders_expanded
-            LEFT JOIN shadow_solutions ss
-                ON ss.auction_id = sa.auction_id
-                AND ss.strategy = 'router-v2'
             WHERE sa.polled_at > :since
             GROUP BY sa.auction_id, o_sell_token, o_buy_token
             HAVING COUNT(*) >= 2
