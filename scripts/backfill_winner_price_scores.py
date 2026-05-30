@@ -26,7 +26,12 @@ from sqlalchemy import select, update
 
 from scripts.backfill_scores import _extract_order_uids, fetch_orders_by_uid
 from src.persistence.db import get_session_factory
-from src.persistence.models import ShadowAuction, ShadowSolution, ShadowWinner
+from src.persistence.models import (
+    ShadowAuction,
+    ShadowCompetitor,
+    ShadowSolution,
+    ShadowWinner,
+)
 from src.shadow.scoring import (
     extract_native_prices,
     orders_by_uid_from_auction,
@@ -65,6 +70,30 @@ async def backfill(days: int = 30, dry_run: bool = False, batch_size: int = 500)
         )
         rows = q.all()
 
+        # Winner clearing prices live in TWO places and only one is reliable:
+        #   1. shadow_winners.raw_solution — the poller's competition snapshot.
+        #      Observed 2026-05-30: this frequently lacks clearingPrices, so
+        #      _winner_clearing_prices() returns {} and every row gets skipped.
+        #   2. shadow_competitors.clearing_prices — populated by
+        #      sync_competitions.py from the CoW competition API, which DOES
+        #      carry the winner's full clearingPrices.
+        # Pre-fetch source #2 (one query) as a fallback keyed by auction_id so
+        # the per-row loop below can fill the gap without N extra round-trips.
+        auction_ids = {r[1] for r in rows}
+        winner_cp_by_auction: dict[int, dict[str, Any]] = {}
+        if auction_ids:
+            comp_q = await session.execute(
+                select(
+                    ShadowCompetitor.auction_id,
+                    ShadowCompetitor.clearing_prices,
+                )
+                .where(ShadowCompetitor.is_winner.is_(True))
+                .where(ShadowCompetitor.auction_id.in_(auction_ids))
+            )
+            for aid, cp in comp_q.all():
+                if cp:
+                    winner_cp_by_auction[aid] = cp
+
     print(f"Found {len(rows)} unscored solved solutions (batch cap {batch_size})")
 
     updates: list[dict[str, object]] = []
@@ -80,7 +109,11 @@ async def backfill(days: int = 30, dry_run: bool = False, batch_size: int = 500)
                 updates.append({"id": sol_id, "score_vs_winner_prices_wei": None})
                 continue
 
+            # Prefer the poller snapshot; fall back to the competition-API
+            # clearing prices stored in shadow_competitors (see pre-fetch above).
             clearing_prices = _winner_clearing_prices(winner_raw)
+            if not clearing_prices:
+                clearing_prices = winner_cp_by_auction.get(auction_id, {})
             if not clearing_prices:
                 skipped_no_prices += 1
                 continue
