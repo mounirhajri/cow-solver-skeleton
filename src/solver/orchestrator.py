@@ -416,6 +416,22 @@ def load_default_strategies() -> list[SolverStrategy]:
         ghost_detector=ghost_detector,
     ))
 
+    # Joint clearing: batch same-pair sell orders into one AMM interaction.
+    # Gated on settings.joint_clearing_enabled (default False) — shadow-soak
+    # first to measure CIP-14 uplift before enabling in production.
+    if settings.joint_clearing_enabled:
+        from src.solver.joint_clearing import JointClearingSolver
+
+        strategies.append(JointClearingSolver(
+            multicall=multicall,
+            intermediates=settings.router_intermediate_tokens,
+            max_orders=settings.router_max_orders,
+            max_concurrent=settings.router_max_concurrent,
+            strategy_timeout=settings.joint_clearing_timeout,
+            min_group_size=settings.joint_clearing_min_group,
+            ghost_detector=ghost_detector,
+        ))
+
     return strategies
 
 
@@ -521,4 +537,18 @@ def _load_default_strategies_with_multicall(multicall: Any) -> list[SolverStrate
         strategy_timeout=settings.router_strategy_timeout,
         ghost_detector=ghost_detector,
     ))
+
+    if settings.joint_clearing_enabled:
+        from src.solver.joint_clearing import JointClearingSolver
+
+        strategies.append(JointClearingSolver(
+            multicall=multicall,
+            intermediates=settings.router_intermediate_tokens,
+            max_orders=settings.router_max_orders,
+            max_concurrent=settings.router_max_concurrent,
+            strategy_timeout=settings.joint_clearing_timeout,
+            min_group_size=settings.joint_clearing_min_group,
+            ghost_detector=ghost_detector,
+        ))
+
     return strategies
