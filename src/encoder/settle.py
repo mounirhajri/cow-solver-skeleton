@@ -80,7 +80,10 @@ def encode_settle(
 
     ``intra_interactions`` is a list of (target, value, callData) tuples placed
     in the intra slot of the [pre, intra, post] interactions array; pre and post
-    are always empty for our AMM-only settlement shape.
+    are always empty for our AMM-only settlement shape. Each tuple is converted
+    to a list before encoding because ``eth_abi`` treats the interaction struct
+    positionally and accepts either, but lists keep the nested-array shape
+    explicit.
     """
     interactions = [[], [list(i) for i in intra_interactions], []]
     args = encode(
