@@ -6,8 +6,6 @@ stub the async Redis client with a tiny dict-backed object exposing get/setex.
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from src.shadow.order_cache import OrderCache

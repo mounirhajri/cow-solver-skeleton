@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.shadow.feasibility import Verdict, validate_solution
+from src.shadow.feasibility import validate_solution
 
 _SELL = "0x1111111111111111111111111111111111111111"
 _BUY = "0x2222222222222222222222222222222222222222"
