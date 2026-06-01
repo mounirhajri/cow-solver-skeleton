@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from eth_abi import encode
+from eth_abi import decode, encode
 from eth_utils import keccak
 
 _SETTLE_SIG = (
@@ -87,7 +87,7 @@ def encode_settle(
     """
     interactions = [[], [list(i) for i in intra_interactions], []]
     args = encode(
-        ["address[]", "uint256[]", f"{_TRADE_TYPE}[]", f"{_INTERACTION_TYPE}[][3]"],
+        _SETTLE_ARG_TYPES,
         [
             tokens,
             clearing_prices,
@@ -96,6 +96,75 @@ def encode_settle(
         ],
     )
     return SETTLE_SELECTOR + args
+
+
+_SETTLE_ARG_TYPES = [
+    "address[]",
+    "uint256[]",
+    f"{_TRADE_TYPE}[]",
+    f"{_INTERACTION_TYPE}[][3]",
+]
+
+
+@dataclass(frozen=True)
+class DecodedSettle:
+    """A settle() call recovered from raw calldata via canonical ABI decoding.
+
+    ``intra_interactions`` mirrors ``encode_settle``'s input shape; ``pre`` and
+    ``post`` are surfaced separately so a fidelity check can refuse to compare
+    against real settlements that use hooks our AMM-only encoder doesn't model.
+    """
+
+    tokens: list[str]
+    clearing_prices: list[int]
+    trades: list[SettleTrade]
+    pre_interactions: list[tuple[str, int, bytes]]
+    intra_interactions: list[tuple[str, int, bytes]]
+    post_interactions: list[tuple[str, int, bytes]]
+
+
+def decode_settle(calldata: bytes) -> DecodedSettle:
+    """Inverse of ``encode_settle``: parse settle() calldata back into fields.
+
+    Uses canonical ``eth_abi.decode`` (independent of our hand-rolled encoder),
+    so feeding our encoder's output through here and re-encoding is a genuine
+    ABI-fidelity gate: any offset/padding/ordering bug breaks byte-equality.
+
+    Raises ``ValueError`` if the 4-byte selector isn't settle()'s.
+    """
+    if calldata[:4] != SETTLE_SELECTOR:
+        raise ValueError(
+            f"selector mismatch: {calldata[:4].hex()} != {SETTLE_SELECTOR.hex()}"
+        )
+    tokens, prices, trades_raw, interactions = decode(_SETTLE_ARG_TYPES, calldata[4:])
+
+    trades = [
+        SettleTrade(
+            sell_token_index=t[0],
+            buy_token_index=t[1],
+            receiver=t[2],
+            sell_amount=t[3],
+            buy_amount=t[4],
+            valid_to=t[5],
+            app_data=t[6],
+            fee_amount=t[7],
+            flags=t[8],
+            executed_amount=t[9],
+            signature=t[10],
+        )
+        for t in trades_raw
+    ]
+    pre, intra, post = (
+        [(i[0], i[1], i[2]) for i in slot] for slot in interactions
+    )
+    return DecodedSettle(
+        tokens=list(tokens),
+        clearing_prices=list(prices),
+        trades=trades,
+        pre_interactions=pre,
+        intra_interactions=intra,
+        post_interactions=post,
+    )
 
 
 # Signing scheme index -> bits 5-6 of the trade flags bitfield.
