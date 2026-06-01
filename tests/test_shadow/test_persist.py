@@ -56,6 +56,8 @@ async def session_factory(monkeypatch):
                 error TEXT,
                 our_score_wei NUMERIC,
                 score_vs_winner_prices_wei NUMERIC,
+                feasible INTEGER,
+                revert_reason TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """))
@@ -781,3 +783,55 @@ async def test_persist_logs_phantom_above_cap_count(session_factory, monkeypatch
     for _, kw in per_row_logs:
         assert "strategy" in kw
         assert "raw_score_wei" in kw
+
+
+@pytest.mark.asyncio
+async def test_persist_stores_feasibility_verdict(session_factory, monkeypatch) -> None:
+    from src.shadow import persist as persist_mod
+    from src.shadow.feasibility import Verdict
+
+    async def _fake_validate(solution, **kwargs):
+        return Verdict(False, "execution reverted: TransferFailed")
+
+    # Isolate the persist-hook wiring: force a positive score (so the hook's
+    # `score is not None` guard passes) and a deterministic verdict. The hook
+    # builds real RpcClient/Redis objects (constructors don't connect), so
+    # `feas_rpc` is truthy and the patched validator runs without network.
+    monkeypatch.setattr(persist_mod, "validate_solution", _fake_validate)
+    monkeypatch.setattr(persist_mod, "compute_solution_score", lambda *a, **k: 5 * 10**14)
+    monkeypatch.setattr(persist_mod, "orders_by_uid_from_auction", lambda *a, **k: {"0xabc": object()})
+    monkeypatch.setattr(persist_mod.settings, "feasibility_enabled", True)
+
+    sell = "0x1111111111111111111111111111111111111111"
+    buy = "0x2222222222222222222222222222222222222222"
+
+    auction = _auction("4242")
+    attempts = [
+        AttemptRecord(
+            strategy="router-v2",
+            status="solved",
+            latency_ms=10,
+            solution={
+                "id": 4242,
+                "prices": {sell: "1000000", buy: "1000000"},
+                "trades": [
+                    {"kind": "fulfillment", "orderUid": "0xabc", "executedAmount": "1000"}
+                ],
+                "interactions": [],
+            },
+            error=None,
+        ),
+    ]
+    # native prices present so the hook's `native_prices` guard is satisfied.
+    raw_competition = {"auction": {"prices": {sell: "1000000000000000000",
+                                              buy: "1000000000000000000"}}}
+
+    await persist_shadow_attempt(auction, attempts, raw_competition=raw_competition)
+
+    async with session_factory() as session:
+        row = (await session.execute(
+            select(ShadowSolution).where(ShadowSolution.strategy == "router-v2")
+        )).scalars().first()
+        assert row is not None
+        assert row.feasible is False
+        assert "TransferFailed" in row.revert_reason
