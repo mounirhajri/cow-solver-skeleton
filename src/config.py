@@ -149,8 +149,11 @@ class Settings(BaseSettings):
     # settlement contract has allowlisted. This is a PUBLIC, already-registered
     # CoW solver address — we never need its key (eth_call is read-only). Swap
     # to our own address once Barn onboarding (Phase 0a) lands.
-    # barter (active Arbitrum solver), checksummed:
-    feasibility_solver_address: str = "0x0Ddcb0769a3591230cAa80F85469240b71442089"
+    # NOTE: the previous default (barter, 0x0Ddcb…2089) is NOT allowlisted on
+    # Arbitrum — it reverted "GPv2: not a solver" on every call. This address was
+    # empirically verified allowlisted via scripts/smoke_settle_decode (it
+    # submitted a real AMM-only settlement that our encoder byte-matched).
+    feasibility_solver_address: str = "0x4CdbA844CEB949567eA18b9EF185515fA626c69D"
     v3_swap_router: str = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
     v2_routers: list[str] = Field(
         default_factory=lambda: [
