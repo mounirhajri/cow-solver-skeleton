@@ -190,13 +190,22 @@ async def run_analysis(
     days: int,
     strategy: str | None = None,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
+    hours: int | None = None,
 ) -> None:
     factory = session_factory or get_session_factory()
-    since = datetime.now(UTC) - timedelta(days=days)
+    # --hours overrides --days for tight post-deploy windows (e.g. confirming a
+    # config change took effect without a day of stale rows drowning it out).
+    if hours is not None:
+        window = timedelta(hours=hours)
+        label = f"last {hours} hours"
+    else:
+        window = timedelta(days=days)
+        label = f"last {days} days"
+    since = datetime.now(UTC) - window
     scope = f" [strategy={strategy}]" if strategy else ""
     print(
         f"\nFeasibility Verdict Analysis  "
-        f"(last {days} days, since {since:%Y-%m-%d %H:%M} UTC){scope}"
+        f"({label}, since {since:%Y-%m-%d %H:%M} UTC){scope}"
     )
 
     async with factory() as session:
@@ -208,9 +217,11 @@ async def run_analysis(
     print()
 
 
-async def main_async(days: int, strategy: str | None = None) -> None:
+async def main_async(
+    days: int, strategy: str | None = None, hours: int | None = None
+) -> None:
     try:
-        await run_analysis(days=days, strategy=strategy)
+        await run_analysis(days=days, strategy=strategy, hours=hours)
     except Exception as exc:
         log.error(
             "analyze_feasibility_unhandled",
@@ -230,6 +241,12 @@ def main() -> None:
         help="Analysis window in days (default: 7).",
     )
     parser.add_argument(
+        "--hours",
+        type=int,
+        default=None,
+        help="Analysis window in hours; overrides --days when set.",
+    )
+    parser.add_argument(
         "--strategy",
         type=str,
         default=None,
@@ -239,7 +256,7 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
-    asyncio.run(main_async(days=args.days, strategy=args.strategy))
+    asyncio.run(main_async(days=args.days, strategy=args.strategy, hours=args.hours))
 
 
 if __name__ == "__main__":
