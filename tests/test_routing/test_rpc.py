@@ -197,3 +197,20 @@ async def test_eth_call_capture_sends_from_address() -> None:
         await client.eth_call_capture("0xto", "0xdata", from_addr="0xSOLVER")
     assert captured["params"][0]["from"] == "0xSOLVER"
     assert captured["params"][0]["to"] == "0xto"
+
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_returns_reason_after_retries_exhausted() -> None:
+    """All 4 attempts rate-limited → returns (False, reason) instead of raising."""
+    fake_web3 = MagicMock()
+    responses = [_resp({}, status=429)] * 4
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.asyncio.sleep"), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mc = _mock_client(responses)
+        mock_cls.return_value = mc
+        client = RpcClient("https://rpc.example")
+        ok, payload = await client.eth_call_capture("0xto", "0xdata")
+    assert ok is False
+    assert "429" in payload
+    assert mc.post.call_count == 4  # initial + 3 retries
