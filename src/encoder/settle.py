@@ -52,6 +52,8 @@ def encode_trade_flags(
     flags = 0
     flags |= 0 if kind.lower() == "sell" else 0x01
     flags |= 0x02 if partially_fillable else 0
+    # Unrecognised balance source falls back to erc20 (0x00) by design:
+    # callers pass validated values and our orders are almost always erc20.
     flags |= _SELL_BALANCE.get(sell_token_balance.lower(), 0x00)
     flags |= _BUY_BALANCE.get(buy_token_balance.lower(), 0x00)
     flags |= _SCHEME_INDEX[scheme] << 5

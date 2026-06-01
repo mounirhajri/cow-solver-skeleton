@@ -39,3 +39,15 @@ def test_combined_buy_partial_eip1271() -> None:
 def test_unknown_scheme_raises() -> None:
     with pytest.raises(ValueError, match="signing scheme"):
         encode_trade_flags("sell", False, "magic")
+
+
+def test_sell_token_balance_external() -> None:
+    assert encode_trade_flags("sell", False, "eip712", sell_token_balance="external") == 0x08
+
+
+def test_sell_token_balance_internal() -> None:
+    assert encode_trade_flags("sell", False, "eip712", sell_token_balance="internal") == 0x0C
+
+
+def test_buy_token_balance_internal() -> None:
+    assert encode_trade_flags("sell", False, "eip712", buy_token_balance="internal") == 0x10
