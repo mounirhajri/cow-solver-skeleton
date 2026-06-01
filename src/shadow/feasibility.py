@@ -49,10 +49,10 @@ def _sig_bytes(order: dict[str, Any]) -> bytes:
 
 
 async def _resolve_order(uid: str, cache: Any, api: Any) -> dict[str, Any] | None:
-    cached = await cache.get(uid)
+    cached: dict[str, Any] | None = await cache.get(uid)
     if cached is not None:
         return cached
-    fetched = await api.fetch_order(uid)
+    fetched: dict[str, Any] | None = await api.fetch_order(uid)
     if fetched is not None:
         await cache.set(uid, fetched)
     return fetched

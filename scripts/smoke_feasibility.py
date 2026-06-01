@@ -13,7 +13,6 @@ allowlist is wrong — fix before trusting any phantom verdict.
 import asyncio
 
 import redis.asyncio as aioredis
-
 from sqlalchemy import select
 
 from src.config import settings
@@ -47,7 +46,9 @@ async def main() -> None:
         solver_addr=settings.feasibility_solver_address,
     )
     print(f"auction {row.auction_id}: feasible={verdict.feasible} reason={verdict.reason}")
-    assert verdict.feasible is True, "known-good winner came back NOT feasible — encoder/allowlist bug"
+    assert verdict.feasible is True, (
+        "known-good winner came back NOT feasible — encoder/allowlist bug"
+    )
 
 
 if __name__ == "__main__":

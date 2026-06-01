@@ -13,11 +13,11 @@ from typing import Any
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
+from src.config import settings
 from src.log import get_logger
 from src.models.auction import Auction
 from src.persistence.db import get_session_factory
 from src.persistence.models import ShadowAuction, ShadowSolution
-from src.config import settings
 from src.shadow.feasibility import Verdict, validate_solution
 from src.shadow.scoring import (
     compute_solution_score,
