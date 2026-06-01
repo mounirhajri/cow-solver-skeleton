@@ -15,3 +15,13 @@ def test_settings_loads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.redis_key_prefix == "solver:"  # default
     assert s.pool_cache_max_entries == 800  # default for shadow phase
     assert str(s.shadow_log_path) == "/tmp/shadow.jsonl"
+
+
+def test_feasibility_defaults() -> None:
+    from src.config import Settings
+
+    s = Settings()
+    assert s.feasibility_enabled is True
+    # A public, allowlisted CoW solver address (checksummed, 42 chars).
+    assert s.feasibility_solver_address.startswith("0x")
+    assert len(s.feasibility_solver_address) == 42

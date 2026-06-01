@@ -60,5 +60,14 @@ class CowApiClient:
             winner_score=int(winner["score"]),
         )
 
+    async def fetch_order(self, uid: str) -> dict[str, Any] | None:
+        """Fetch a single order (signature + signingScheme included).
+
+        Hits the public, ungated ``GET /orders/{uid}`` endpoint — unlike
+        ``/auction`` this is open to anyone. Returns the raw order dict, or
+        ``None`` on 404 (order purged after settlement).
+        """
+        return await asyncio.to_thread(self._get, f"/orders/{uid}")
+
     async def close(self) -> None:
         pass  # no persistent connection to close

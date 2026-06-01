@@ -143,3 +143,107 @@ def test_block_number() -> None:
     with patch("src.routing.rpc.Web3", return_value=fake_web3):
         client = RpcClient("https://rpc.example")
         assert client.block_number() == 12345
+
+
+# ── eth_call_capture ──────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_success() -> None:
+    fake_web3 = MagicMock()
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = _mock_client([
+            _resp({"jsonrpc": "2.0", "id": 1, "result": "0x01"})
+        ])
+        client = RpcClient("https://rpc.example")
+        ok, payload = await client.eth_call_capture(
+            "0xsettlement", "0xdata", from_addr="0xsolver"
+        )
+    assert ok is True
+    assert payload == "0x01"
+
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_revert_returns_reason() -> None:
+    fake_web3 = MagicMock()
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = _mock_client([
+            _resp({"jsonrpc": "2.0", "id": 1,
+                   "error": {"code": 3, "message": "execution reverted: GPv2: invalid signature"}})
+        ])
+        client = RpcClient("https://rpc.example")
+        ok, payload = await client.eth_call_capture(
+            "0xsettlement", "0xdata", from_addr="0xsolver"
+        )
+    assert ok is False
+    assert "invalid signature" in payload
+
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_raises_on_non_revert_rpc_error() -> None:
+    """A non-revert JSON-RPC error (infra) RAISES rather than reporting phantom."""
+    fake_web3 = MagicMock()
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = _mock_client([
+            _resp({"jsonrpc": "2.0", "id": 1,
+                   "error": {"code": -32602, "message": "invalid argument 0"}})
+        ])
+        client = RpcClient("https://rpc.example")
+        with pytest.raises(RuntimeError, match="-32602"):
+            await client.eth_call_capture("0xto", "0xdata")
+
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_raises_on_missing_result() -> None:
+    """Missing 'result' (malformed/infra) RAISES rather than reporting phantom."""
+    fake_web3 = MagicMock()
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = _mock_client([
+            _resp({"jsonrpc": "2.0", "id": 1})
+        ])
+        client = RpcClient("https://rpc.example")
+        with pytest.raises(RuntimeError, match="missing 'result'"):
+            await client.eth_call_capture("0xto", "0xdata")
+
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_sends_from_address() -> None:
+    fake_web3 = MagicMock()
+    captured: dict = {}
+
+    async def _post(url, json, timeout):  # noqa: A002
+        captured["params"] = json["params"]
+        return _resp({"jsonrpc": "2.0", "id": 1, "result": "0x"})
+
+    mock_client = MagicMock()
+    mock_client.post = _post
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient", return_value=mock_client):
+        client = RpcClient("https://rpc.example")
+        await client.eth_call_capture("0xto", "0xdata", from_addr="0xSOLVER")
+    assert captured["params"][0]["from"] == "0xSOLVER"
+    assert captured["params"][0]["to"] == "0xto"
+
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_raises_after_retries_exhausted() -> None:
+    """All 4 attempts rate-limited → RAISES (infra failure, not a revert).
+
+    Rate-limit exhaustion must NOT be reported as (False, reason): that would
+    record the solution as phantom. It is an infra-class failure, so it raises
+    and validate_solution maps it to an UNKNOWN (None) verdict.
+    """
+    fake_web3 = MagicMock()
+    responses = [_resp({}, status=429)] * 4
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.asyncio.sleep"), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mc = _mock_client(responses)
+        mock_cls.return_value = mc
+        client = RpcClient("https://rpc.example")
+        with pytest.raises(RuntimeError, match="429"):
+            await client.eth_call_capture("0xto", "0xdata")
+    assert mc.post.call_count == 4  # initial + 3 retries

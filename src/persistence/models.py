@@ -66,6 +66,12 @@ class ShadowSolution(Base):
     # our_score_wei, both low vs winner) from "our prices are off" (≪
     # our_score_wei).  NULL until backfill / winner-persistence has run.
     score_vs_winner_prices_wei: Mapped[int | None] = mapped_column(Numeric(40, 0))
+    # On-chain feasibility verdict (Phase 4a, going-forward only).
+    # None  = not yet validated / validation infra failure (UNKNOWN).
+    # True  = settle() eth_call succeeded → solution is commit-feasible.
+    # False = settle() reverted → phantom; see revert_reason.
+    feasible: Mapped[bool | None] = mapped_column(Boolean)
+    revert_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 

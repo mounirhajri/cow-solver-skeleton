@@ -44,6 +44,8 @@ async def session_factory():
                 error TEXT,
                 our_score_wei NUMERIC,
                 score_vs_winner_prices_wei NUMERIC,
+                feasible INTEGER,
+                revert_reason TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """))

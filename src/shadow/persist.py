@@ -5,6 +5,7 @@ Called from /solve via BackgroundTasks — must never raise; logs and swallows.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from datetime import UTC, datetime
 from typing import Any
@@ -12,10 +13,12 @@ from typing import Any
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
+from src.config import settings
 from src.log import get_logger
 from src.models.auction import Auction
 from src.persistence.db import get_session_factory
 from src.persistence.models import ShadowAuction, ShadowSolution
+from src.shadow.feasibility import Verdict, validate_solution
 from src.shadow.scoring import (
     compute_solution_score,
     extract_native_prices,
@@ -110,6 +113,25 @@ async def persist_shadow_attempt(
                 if tok.reference_price
             }
 
+        # Feasibility validation deps (built once per call, reused per attempt).
+        feas_cache = feas_api = feas_rpc = feas_redis = None
+        if settings.feasibility_enabled and native_prices:
+            with contextlib.suppress(Exception):  # noqa: BLE001
+                import redis.asyncio as aioredis
+
+                from src.routing.rpc import RpcClient
+                from src.shadow.cow_api import CowApiClient
+                from src.shadow.order_cache import OrderCache
+
+                feas_redis = aioredis.Redis.from_url(
+                    settings.redis_url, decode_responses=False
+                )
+                feas_cache = OrderCache(
+                    redis=feas_redis, key_prefix=settings.redis_key_prefix
+                )
+                feas_api = CowApiClient(network="arbitrum_one")
+                feas_rpc = RpcClient(settings.rpc_arbitrum)
+
         n_sub_dust_skipped = 0
         n_phantom_above_cap = 0
         for a in attempts:
@@ -160,6 +182,27 @@ async def persist_shadow_attempt(
                 n_sub_dust_skipped += 1
                 continue
 
+            feasible: bool | None = None
+            revert_reason: str | None = None
+            if (
+                feas_rpc is not None
+                and a.strategy != "naive"
+                and a.solution
+                and score is not None  # only validate solutions worth submitting
+            ):
+                with contextlib.suppress(Exception):  # noqa: BLE001
+                    async with asyncio.timeout(10):
+                        verdict: Verdict = await validate_solution(
+                            a.solution,
+                            cache=feas_cache,
+                            api=feas_api,
+                            rpc=feas_rpc,
+                            settlement_addr=settings.gpv2_settlement,
+                            solver_addr=settings.feasibility_solver_address,
+                        )
+                        feasible = verdict.feasible
+                        revert_reason = verdict.reason
+
             session.add(
                 ShadowSolution(
                     auction_id=auction_id,
@@ -169,6 +212,8 @@ async def persist_shadow_attempt(
                     solution=a.solution,
                     error=a.error,
                     our_score_wei=score,
+                    feasible=feasible,
+                    revert_reason=revert_reason,
                 )
             )
 
@@ -184,6 +229,16 @@ async def persist_shadow_attempt(
                 auction_id=auction_id,
                 n_phantom_above_cap=n_phantom_above_cap,
             )
+
+        if feas_rpc is not None:
+            with contextlib.suppress(Exception):  # noqa: BLE001
+                await feas_rpc._client.aclose()
+        if feas_api is not None:
+            with contextlib.suppress(Exception):  # noqa: BLE001
+                await feas_api.close()
+        if feas_redis is not None:
+            with contextlib.suppress(Exception):  # noqa: BLE001
+                await feas_redis.aclose()
 
         await session.commit()
 
