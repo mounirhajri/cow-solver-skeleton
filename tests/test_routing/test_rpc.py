@@ -143,3 +143,57 @@ def test_block_number() -> None:
     with patch("src.routing.rpc.Web3", return_value=fake_web3):
         client = RpcClient("https://rpc.example")
         assert client.block_number() == 12345
+
+
+# ── eth_call_capture ──────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_success() -> None:
+    fake_web3 = MagicMock()
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = _mock_client([
+            _resp({"jsonrpc": "2.0", "id": 1, "result": "0x01"})
+        ])
+        client = RpcClient("https://rpc.example")
+        ok, payload = await client.eth_call_capture(
+            "0xsettlement", "0xdata", from_addr="0xsolver"
+        )
+    assert ok is True
+    assert payload == "0x01"
+
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_revert_returns_reason() -> None:
+    fake_web3 = MagicMock()
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = _mock_client([
+            _resp({"jsonrpc": "2.0", "id": 1,
+                   "error": {"code": 3, "message": "execution reverted: GPv2: invalid signature"}})
+        ])
+        client = RpcClient("https://rpc.example")
+        ok, payload = await client.eth_call_capture(
+            "0xsettlement", "0xdata", from_addr="0xsolver"
+        )
+    assert ok is False
+    assert "invalid signature" in payload
+
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_sends_from_address() -> None:
+    fake_web3 = MagicMock()
+    captured: dict = {}
+
+    async def _post(url, json, timeout):  # noqa: A002
+        captured["params"] = json["params"]
+        return _resp({"jsonrpc": "2.0", "id": 1, "result": "0x"})
+
+    mock_client = MagicMock()
+    mock_client.post = _post
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient", return_value=mock_client):
+        client = RpcClient("https://rpc.example")
+        await client.eth_call_capture("0xto", "0xdata", from_addr="0xSOLVER")
+    assert captured["params"][0]["from"] == "0xSOLVER"
+    assert captured["params"][0]["to"] == "0xto"
