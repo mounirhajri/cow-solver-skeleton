@@ -37,6 +37,8 @@ def _app_data_bytes(order: dict[str, Any]) -> bytes:
     raw = order.get("appData") or order.get("appDataHash") or ("0x" + "00" * 32)
     h = raw[2:] if isinstance(raw, str) and raw.startswith("0x") else str(raw)
     b = bytes.fromhex(h)
+    # appData is a bytes32: left-pad short values with zeros, and take the
+    # right-most 32 bytes of any oversized value (CoW should never send oversized).
     return b.rjust(32, b"\x00")[:32]
 
 
@@ -77,6 +79,8 @@ async def validate_solution(
         # Build the token index map from clearing prices (deterministic order).
         prices = solution.get("prices") or {}
         tokens = sorted({k.lower() for k in prices})
+        if len(tokens) != len(prices):
+            return Verdict(None, "duplicate token keys (case-insensitive)")
         index = {tok: i for i, tok in enumerate(tokens)}
         clearing_prices = [_to_int(prices[next(
             k for k in prices if k.lower() == tok
