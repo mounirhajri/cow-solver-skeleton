@@ -6,14 +6,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.models.auction import Auction, Token
+from src.models.auction import Auction
 from src.models.order import Order
 from src.models.solution import Solution
 from src.routing.v3_batched import V3BatchedQuote, V3Path
 from src.solver.base import NoSolution
 from src.solver.joint_clearing import (
-    JointClearingSolver,
     _GROUP_UID_PREFIX,
+    JointClearingSolver,
     _all_limits_satisfied,
     _ceil_div,
 )
