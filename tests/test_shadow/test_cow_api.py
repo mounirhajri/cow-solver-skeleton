@@ -43,3 +43,43 @@ async def test_fetch_competition_returns_none_on_404() -> None:
 
     assert result is None
     await client.close()
+
+
+async def test_fetch_order_returns_order_with_signature() -> None:
+    payload = json.dumps({
+        "uid": "0xabc",
+        "sellToken": "0x1111111111111111111111111111111111111111",
+        "buyToken": "0x2222222222222222222222222222222222222222",
+        "sellAmount": "1000",
+        "buyAmount": "900",
+        "validTo": 1900000000,
+        "appData": "0x" + "00" * 32,
+        "feeAmount": "0",
+        "kind": "sell",
+        "partiallyFillable": False,
+        "receiver": "0x3333333333333333333333333333333333333333",
+        "signingScheme": "eip712",
+        "signature": "0x" + "ab" * 65,
+    }).encode()
+
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen(payload)):
+        client = CowApiClient(network="arbitrum_one")
+        order = await client.fetch_order("0xabc")
+
+    assert order is not None
+    assert order["signature"] == "0x" + "ab" * 65
+    assert order["signingScheme"] == "eip712"
+    await client.close()
+
+
+async def test_fetch_order_returns_none_on_404() -> None:
+    import urllib.error
+
+    http_err = urllib.error.HTTPError(url="", code=404, msg="Not Found", hdrs=MagicMock(), fp=None)  # type: ignore[arg-type]
+
+    with patch("urllib.request.urlopen", side_effect=http_err):
+        client = CowApiClient(network="arbitrum_one")
+        order = await client.fetch_order("0xdead")
+
+    assert order is None
+    await client.close()
