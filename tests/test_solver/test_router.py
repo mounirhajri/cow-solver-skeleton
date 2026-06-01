@@ -2,6 +2,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
+from eth_abi import decode
 
 from src.models.auction import Auction, Token
 from src.models.order import Order
@@ -855,9 +856,10 @@ async def test_register_prices_drops_trade_on_clearing_price_conflict(
     # First-emitted wins (it registers prices first); second is rejected.
     assert len(result.trades) == 1
     assert result.trades[0].order_uid == "s1"
-    # Exactly one Interaction, matching the surviving trade — never ship
-    # an interaction for a dropped trade.
-    assert len(result.interactions) == 1
+    # Exactly two Interactions for the single surviving trade — the
+    # Settlement→Router approve followed by the V3 swap. The dropped trade
+    # contributes neither (never ship interactions for a dropped trade).
+    assert len(result.interactions) == 2
 
 
 @pytest.mark.asyncio
@@ -1362,3 +1364,114 @@ async def test_partial_quote_search_emits_at_75pct_when_50pct_misses(
     assert trade.executed_amount == 750, (
         f"expected executed_amount=750 (0.75x), got {trade.executed_amount}"
     )
+
+
+# ── Settlement→Router approval interaction ────────────────────────────────────
+#
+# A V3 swap makes the SwapRouter do ``tokenIn.transferFrom(settlement → pool)``,
+# which needs the Settlement to have approved the router. The Settlement holds
+# no standing allowance (verified on-chain == 0), so each settle() must emit its
+# own ``approve(router, cap)`` interaction immediately BEFORE the swap. Without
+# it every V3 swap reverts STF / "exceeds allowance" and feas% stays 0.
+
+
+def _v3_router() -> RouterSolver:
+    from unittest.mock import AsyncMock
+
+    return RouterSolver(
+        multicall=AsyncMock(), intermediates=[], v3_only_batched=True
+    )
+
+
+def _single_hop_path(*, exact_output: bool = False) -> "object":
+    from src.routing.v3_batched import V3Path
+
+    return V3Path(
+        order_uid="o1",
+        token_in="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        token_out="0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        amount_in=1000,
+        fee_tier_in=500,
+        exact_output=exact_output,
+    )
+
+
+def test_encode_path_interaction_prepends_approve_for_sell() -> None:
+    """Sell (exact-input): [approve(router, executed_sell), swap]. The approve
+    must target token_in, grant the router exactly the input it will pull, and
+    precede the swap so the allowance exists when transferFrom runs."""
+    from src.encoder.erc20 import APPROVE_SELECTOR
+
+    router = _v3_router()
+    path = _single_hop_path()
+    interactions = router._encode_path_interaction(
+        path, executed_sell=1000, executed_buy=1100, deadline=99
+    )
+    assert isinstance(interactions, list)
+    assert len(interactions) == 2
+    approve, swap = interactions
+
+    # approve goes to the sell token, not the router
+    assert approve.target.lower() == path.token_in.lower()
+    assert approve.value == 0
+    assert approve.call_data[:4] == APPROVE_SELECTOR
+    spender, amount = decode(["address", "uint256"], approve.call_data[4:])
+    assert spender.lower() == router._v3_router_address.lower()
+    assert amount == 1000  # exact input pulled
+
+    # swap goes to the router and comes AFTER the approve
+    assert swap.target.lower() == router._v3_router_address.lower()
+
+
+def test_encode_path_interaction_approves_amount_in_max_for_buy() -> None:
+    """Buy (exact-output): the router may pull up to amountInMaximum =
+    apply_slippage_up(executed_sell, slippage_bps), so the approval must cover
+    that cap, not the nominal executed_sell."""
+    from src.encoder.v3 import apply_slippage_up
+
+    router = _v3_router()
+    path = _single_hop_path(exact_output=True)
+    interactions = router._encode_path_interaction(
+        path, executed_sell=1000, executed_buy=900, deadline=99
+    )
+    approve, _swap = interactions
+    _spender, amount = decode(["address", "uint256"], approve.call_data[4:])
+    expected = apply_slippage_up(1000, router._slippage_bps)
+    assert amount == expected
+    assert expected > 1000  # slippage_bps default 50 → cap above nominal
+
+
+@pytest.mark.asyncio
+async def test_router_v3_batched_solution_includes_approve_interaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: a batched-mode solution's interactions list contains the
+    approve before the swap, so the re-encoded settle() is feasibility-valid."""
+    from src.encoder.erc20 import APPROVE_SELECTOR
+    from src.routing.v3_batched import V3BatchedQuote, V3Path
+
+    async def mock_batched(
+        _mc: object, paths: list[V3Path], **_: object
+    ) -> list[V3BatchedQuote]:
+        return [
+            V3BatchedQuote(path=p, amount_out=1100 if i == 0 else 0)
+            for i, p in enumerate(paths)
+        ]
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", mock_batched)
+
+    router = _v3_router()
+    result = await router.solve(_make_auction([_make_order()], auction_id="9"))
+    assert isinstance(result, Solution)
+    # Solution.interactions is list[dict] from Interaction.to_gpv2_dict():
+    # {"target", "value", "callData": "0x"+hex}.
+    selectors = [
+        bytes.fromhex(i["callData"][2:10])
+        for i in result.interactions
+        if isinstance(i.get("callData"), str) and len(i["callData"]) >= 10
+    ]
+    assert APPROVE_SELECTOR in selectors, (
+        "solution must include an approve interaction before the V3 swap"
+    )
+    # approve must come before the swap in the intra list
+    assert selectors[0] == APPROVE_SELECTOR

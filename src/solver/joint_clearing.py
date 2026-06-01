@@ -326,13 +326,14 @@ class JointClearingSolver:
             prices[sell_tok] = combined_buy
             prices[buy_tok] = combined_sell
 
-            intra_interactions.append(
-                self._router._encode_path_interaction(
+            intra_interactions.extend(
+                i.to_gpv2_dict()
+                for i in self._router._encode_path_interaction(
                     best.path,
                     executed_sell=combined_sell,
                     executed_buy=combined_buy,
                     deadline=deadline,
-                ).to_gpv2_dict()
+                )
             )
             for order in group:
                 trades.append(Trade(
@@ -376,13 +377,14 @@ class JointClearingSolver:
                     order_uid=order.uid,
                     executed_amount=order.sell_amount,
                 ))
-                intra_interactions.append(
-                    self._router._encode_path_interaction(
+                intra_interactions.extend(
+                    i.to_gpv2_dict()
+                    for i in self._router._encode_path_interaction(
                         best_q.path,
                         executed_sell=order.sell_amount,
                         executed_buy=best_q.amount_out,
                         deadline=deadline,
-                    ).to_gpv2_dict()
+                    )
                 )
                 filled_uids.add(order.uid)
 

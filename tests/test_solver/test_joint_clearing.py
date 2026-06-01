@@ -165,11 +165,12 @@ async def test_joint_clearing_single_order_fallback_to_router(
 
     with patch("src.solver.joint_clearing.RouterSolver._encode_path_interaction") as mock_enc:
         from src.encoder.interactions import Interaction
-        mock_enc.return_value = Interaction(
+        # _encode_path_interaction returns [approve, swap]; mock the list.
+        mock_enc.return_value = [Interaction(
             target="0x" + "0" * 40,
             value=0,
             call_data=b"\x00",
-        )
+        )]
         multicall = AsyncMock()
         solver = JointClearingSolver(multicall=multicall, intermediates=[])
         result = await solver.solve(auction)
@@ -208,11 +209,12 @@ async def test_joint_clearing_two_same_pair_orders_batched(
 
     with patch("src.solver.joint_clearing.RouterSolver._encode_path_interaction") as mock_enc:
         from src.encoder.interactions import Interaction
-        mock_enc.return_value = Interaction(
+        # _encode_path_interaction returns [approve, swap]; mock the list.
+        mock_enc.return_value = [Interaction(
             target="0x" + "0" * 40,
             value=0,
             call_data=b"\x01\x02",
-        )
+        )]
         multicall = AsyncMock()
         solver = JointClearingSolver(multicall=multicall, intermediates=[], min_group_size=2)
         result = await solver.solve(auction)
@@ -237,6 +239,47 @@ async def test_joint_clearing_two_same_pair_orders_batched(
 
     # Only ONE interaction (combined AMM swap)
     assert len(result.interactions) == 1
+
+
+@pytest.mark.asyncio
+async def test_joint_clearing_emits_real_approve_before_swap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: with the REAL ``_encode_path_interaction`` (no mock), a
+    joint-clearing group settlement must emit [approve, swap] so the V3
+    router can ``transferFrom`` the sell token out of the Settlement. The
+    mocked tests above hide the encoder; this one exercises it end-to-end.
+    """
+    from src.encoder.erc20 import APPROVE_SELECTOR
+
+    o1 = _make_order("o1", sell_amount=10**18, buy_amount=2_900 * 10**6)
+    o2 = _make_order("o2", sell_amount=2 * 10**18, buy_amount=5_800 * 10**6)
+    auction = _make_auction([o1, o2])
+
+    combined_sell = 3 * 10**18
+    combined_buy = 8_700 * 10**6
+
+    group_path = _make_v3_path(f"{_GROUP_UID_PREFIX}xxxxx", amount_in=combined_sell)
+    group_quote = V3BatchedQuote(path=group_path, amount_out=combined_buy)
+    ind1 = V3BatchedQuote(path=_make_v3_path("o1", amount_in=10**18), amount_out=2_950 * 10**6)
+    ind2 = V3BatchedQuote(path=_make_v3_path("o2", amount_in=2 * 10**18), amount_out=5_850 * 10**6)
+
+    async def mock_batched(*args, **kwargs):  # noqa: ANN001
+        return [ind1, ind2, group_quote]
+
+    monkeypatch.setattr("src.solver.joint_clearing.batched_v3_quote", mock_batched)
+
+    multicall = AsyncMock()
+    solver = JointClearingSolver(multicall=multicall, intermediates=[], min_group_size=2)
+    result = await solver.solve(auction)
+
+    assert isinstance(result, Solution)
+    # One combined swap → approve + swap = 2 interactions, approve FIRST.
+    assert len(result.interactions) == 2
+    first_selector = bytes.fromhex(result.interactions[0]["callData"][2:10])  # type: ignore[index]
+    assert first_selector == APPROVE_SELECTOR
+    # The approve grants the sell token (WETH) allowance to the router.
+    assert result.interactions[0]["target"].lower() == _WETH.lower()  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
@@ -266,7 +309,7 @@ async def test_joint_clearing_group_limits_missed_fallback_individual(
 
     with patch("src.solver.joint_clearing.RouterSolver._encode_path_interaction") as mock_enc:
         from src.encoder.interactions import Interaction
-        mock_enc.return_value = Interaction(target="0x" + "0" * 40, value=0, call_data=b"")
+        mock_enc.return_value = [Interaction(target="0x" + "0" * 40, value=0, call_data=b"")]
         multicall = AsyncMock()
         solver = JointClearingSolver(multicall=multicall, intermediates=[], min_group_size=2)
         result = await solver.solve(auction)
@@ -305,7 +348,7 @@ async def test_joint_clearing_different_pairs_independent(
 
     with patch("src.solver.joint_clearing.RouterSolver._encode_path_interaction") as mock_enc:
         from src.encoder.interactions import Interaction
-        mock_enc.return_value = Interaction(target="0x" + "0" * 40, value=0, call_data=b"")
+        mock_enc.return_value = [Interaction(target="0x" + "0" * 40, value=0, call_data=b"")]
         multicall = AsyncMock()
         solver = JointClearingSolver(multicall=multicall, intermediates=[], min_group_size=2)
         result = await solver.solve(auction)
