@@ -115,6 +115,29 @@ async def test_unknown_when_rpc_raises() -> None:
 
 
 @pytest.mark.asyncio
+async def test_block_defaults_to_latest() -> None:
+    """Omitting block keeps the historical default of simulating at 'latest'."""
+    cache, api, rpc = _deps(rpc_result=(True, "0x"))
+    await validate_solution(
+        _SOLUTION, cache=cache, api=api, rpc=rpc,
+        settlement_addr="0xset", solver_addr="0xslv",
+    )
+    assert rpc.eth_call_capture.await_args.kwargs["block"] == "latest"
+
+
+@pytest.mark.asyncio
+async def test_block_is_forwarded_to_eth_call() -> None:
+    """A caller-supplied block (the competition sim block) reaches the RPC so
+    feasibility is judged against auction-time state, not 'latest'."""
+    cache, api, rpc = _deps(rpc_result=(True, "0x"))
+    await validate_solution(
+        _SOLUTION, cache=cache, api=api, rpc=rpc,
+        settlement_addr="0xset", solver_addr="0xslv", block="0x123abc",
+    )
+    assert rpc.eth_call_capture.await_args.kwargs["block"] == "0x123abc"
+
+
+@pytest.mark.asyncio
 async def test_multi_trade_resolves_each_order() -> None:
     """Two fulfillment trades → both orders resolved, single settle() eth_call."""
     sell2 = "0x4444444444444444444444444444444444444444"

@@ -16,6 +16,7 @@ from src.persistence.models import ShadowAuction, ShadowSolution
 from src.shadow.persist import (
     EPSILON_HIGH_WEI,
     EPSILON_WEI,
+    _block_param,
     persist_shadow_attempt,
     persist_shadow_attempt_safe,
 )
@@ -837,3 +838,70 @@ async def test_persist_stores_feasibility_verdict(session_factory, monkeypatch) 
         assert row is not None
         assert row.feasible is False
         assert "TransferFailed" in row.revert_reason
+
+
+def test_block_param_returns_hex_for_positive_block() -> None:
+    assert _block_param(351_234_567) == hex(351_234_567)
+
+
+def test_block_param_falls_back_to_latest() -> None:
+    # None (live /solve) and 0 (default sentinel) both mean "no sim block"
+    # → simulate at latest rather than against block 0x0.
+    assert _block_param(None) == "latest"
+    assert _block_param(0) == "latest"
+
+
+@pytest.mark.asyncio
+async def test_persist_validates_at_simulation_block(session_factory, monkeypatch) -> None:
+    """The auction's simulation_block reaches validate_solution as hex(block),
+    so feasibility is judged against auction-time state, not 'latest'."""
+    from src.shadow import persist as persist_mod
+    from src.shadow.feasibility import Verdict
+
+    seen: dict[str, object] = {}
+
+    async def _fake_validate(solution, **kwargs):
+        seen["block"] = kwargs.get("block")
+        return Verdict(True, None)
+
+    monkeypatch.setattr(persist_mod, "validate_solution", _fake_validate)
+    monkeypatch.setattr(persist_mod, "compute_solution_score", lambda *a, **k: 5 * 10**14)
+    monkeypatch.setattr(
+        persist_mod, "orders_by_uid_from_auction", lambda *a, **k: {"0xabc": object()}
+    )
+    monkeypatch.setattr(persist_mod.settings, "feasibility_enabled", True)
+
+    sell = "0x1111111111111111111111111111111111111111"
+    buy = "0x2222222222222222222222222222222222222222"
+
+    auction = Auction(
+        id="4243",
+        tokens={},
+        orders=[],
+        liquidity=[],
+        effectiveGasPrice=0,
+        deadline=None,
+        simulationBlock=351_234_567,
+    )
+    attempts = [
+        AttemptRecord(
+            strategy="router-v2",
+            status="solved",
+            latency_ms=10,
+            solution={
+                "id": 4243,
+                "prices": {sell: "1000000", buy: "1000000"},
+                "trades": [
+                    {"kind": "fulfillment", "orderUid": "0xabc", "executedAmount": "1000"}
+                ],
+                "interactions": [],
+            },
+            error=None,
+        ),
+    ]
+    raw_competition = {"auction": {"prices": {sell: "1000000000000000000",
+                                             buy: "1000000000000000000"}}}
+
+    await persist_shadow_attempt(auction, attempts, raw_competition=raw_competition)
+
+    assert seen["block"] == hex(351_234_567)

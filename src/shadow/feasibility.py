@@ -72,8 +72,19 @@ async def validate_solution(
     rpc: Any,
     settlement_addr: str,
     solver_addr: str,
+    block: str = "latest",
 ) -> Verdict:
-    """Validate one solution's on-chain feasibility. Never raises."""
+    """Validate one solution's on-chain feasibility. Never raises.
+
+    ``block`` selects the state the settle() is simulated against. Default
+    ``"latest"`` measures post-settlement drift (orders already filled, pools
+    moved) — fine for infra checks but NOT auction-time feasibility. Pass the
+    competition simulation block (``hex(n)``) to evaluate the solution against
+    the same state CoW used at auction time. If that block has aged out of the
+    node's history, the RPC returns a ``missing trie node`` error (no "revert"
+    in the message) → eth_call_capture raises → mapped to UNKNOWN, never a
+    false phantom.
+    """
     try:
         trades_in = [
             t for t in (solution.get("trades") or [])
@@ -139,7 +150,7 @@ async def validate_solution(
             to=settlement_addr,
             data="0x" + calldata.hex(),
             from_addr=solver_addr,
-            block="latest",
+            block=block,
         )
         return Verdict(True, None) if ok else Verdict(False, payload[:500])
     except Exception as exc:  # noqa: BLE001
