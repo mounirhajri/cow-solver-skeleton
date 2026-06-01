@@ -20,6 +20,81 @@ Trade tuple:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+from eth_abi import encode
+from eth_utils import keccak
+
+_SETTLE_SIG = (
+    "settle(address[],uint256[],"
+    "(uint256,uint256,address,uint256,uint256,uint32,bytes32,uint256,uint256,uint256,bytes)[],"
+    "(address,uint256,bytes)[][3])"
+)
+SETTLE_SELECTOR = keccak(text=_SETTLE_SIG)[:4]
+
+_TRADE_TYPE = (
+    "(uint256,uint256,address,uint256,uint256,uint32,bytes32,uint256,uint256,uint256,bytes)"
+)
+_INTERACTION_TYPE = "(address,uint256,bytes)"
+
+
+@dataclass(frozen=True)
+class SettleTrade:
+    """One GPv2Trade.Data row for a settle() call."""
+
+    sell_token_index: int
+    buy_token_index: int
+    receiver: str
+    sell_amount: int
+    buy_amount: int
+    valid_to: int
+    app_data: bytes      # exactly 32 bytes
+    fee_amount: int
+    flags: int
+    executed_amount: int
+    signature: bytes
+
+    def as_tuple(self) -> tuple[object, ...]:
+        return (
+            self.sell_token_index,
+            self.buy_token_index,
+            self.receiver,
+            self.sell_amount,
+            self.buy_amount,
+            self.valid_to,
+            self.app_data,
+            self.fee_amount,
+            self.flags,
+            self.executed_amount,
+            self.signature,
+        )
+
+
+def encode_settle(
+    tokens: list[str],
+    clearing_prices: list[int],
+    trades: list[SettleTrade],
+    intra_interactions: list[tuple[str, int, bytes]],
+) -> bytes:
+    """ABI-encode a GPv2Settlement.settle() call.
+
+    ``intra_interactions`` is a list of (target, value, callData) tuples placed
+    in the intra slot of the [pre, intra, post] interactions array; pre and post
+    are always empty for our AMM-only settlement shape.
+    """
+    interactions = [[], [list(i) for i in intra_interactions], []]
+    args = encode(
+        ["address[]", "uint256[]", f"{_TRADE_TYPE}[]", f"{_INTERACTION_TYPE}[][3]"],
+        [
+            tokens,
+            clearing_prices,
+            [t.as_tuple() for t in trades],
+            interactions,
+        ],
+    )
+    return SETTLE_SELECTOR + args
+
+
 # Signing scheme index -> bits 5-6 of the trade flags bitfield.
 # Order matches cowprotocol GPv2Signing.Scheme enum: eip712, ethsign, eip1271, presign.
 _SCHEME_INDEX = {"eip712": 0, "ethsign": 1, "eip1271": 2, "presign": 3}
