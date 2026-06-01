@@ -50,6 +50,22 @@ def test_auction_accepts_cow_driver_extras(sample_auction_dict: dict) -> None:
     assert auction.surplus_capturing_jit_order_owners == ["0x" + "a" * 40]
 
 
+def test_auction_parses_simulation_block(sample_auction_dict: dict) -> None:
+    """The shadow poller backfills ``simulationBlock`` from the competition's
+    ``competitionSimulationBlock`` so the feasibility validator can target
+    auction-time state. The camelCase alias must map to ``simulation_block``."""
+    sample_auction_dict["simulationBlock"] = 351_234_567
+    auction = Auction.model_validate(sample_auction_dict)
+    assert auction.simulation_block == 351_234_567
+
+
+def test_auction_simulation_block_defaults_none(sample_auction_dict: dict) -> None:
+    """The live /solve payload omits it → None → validator falls back to
+    'latest' (never a spurious historical block)."""
+    auction = Auction.model_validate(sample_auction_dict)
+    assert auction.simulation_block is None
+
+
 def test_auction_tokens_indexed_by_address(sample_auction_dict: dict) -> None:
     auction = Auction.model_validate(sample_auction_dict)
     weth = auction.tokens["0x82af49447d8a07e3bd95bd0d56f35241523fbab1"]

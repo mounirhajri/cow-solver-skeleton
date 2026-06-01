@@ -57,6 +57,19 @@ EPSILON_WEI = 10**12  # 1 microETH ≈ $0.002 at €1800/ETH
 EPSILON_HIGH_WEI = 10**18  # 1 ETH
 
 
+def _block_param(simulation_block: int | None) -> str:
+    """RPC block tag for the feasibility settle() simulation.
+
+    Returns ``hex(simulation_block)`` when a positive competition simulation
+    block is known (so the validator evaluates auction-time state), else the
+    ``"latest"`` fallback. Guarding ``> 0`` rejects the 0/None defaults that the
+    live /solve path leaves on the auction.
+    """
+    if simulation_block is not None and simulation_block > 0:
+        return hex(simulation_block)
+    return "latest"
+
+
 async def persist_shadow_attempt(
     auction: Auction,
     attempts: list[AttemptRecord],
@@ -199,6 +212,7 @@ async def persist_shadow_attempt(
                             rpc=feas_rpc,
                             settlement_addr=settings.gpv2_settlement,
                             solver_addr=settings.feasibility_solver_address,
+                            block=_block_param(auction.simulation_block),
                         )
                         feasible = verdict.feasible
                         revert_reason = verdict.reason

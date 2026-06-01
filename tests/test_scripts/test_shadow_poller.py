@@ -45,6 +45,74 @@ async def test_poll_once_batch_fetches_and_solves(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_poll_once_forwards_simulation_block_to_solve(tmp_path):
+    """The competition's competitionSimulationBlock must be forwarded to /solve
+    as simulationBlock, so the feasibility validator can target auction-time
+    state instead of 'latest'."""
+    from pathlib import Path
+
+    mock_comp = {
+        "auctionId": "88888",
+        "competitionSimulationBlock": 351_234_567,
+        "auction": {"orders": ["uid1"], "prices": {}},
+        "solutions": [],
+    }
+    mock_orders = [
+        {"uid": "uid1", "sellToken": "0xa", "buyToken": "0xb",
+         "sellAmount": "1000", "buyAmount": "900", "kind": "sell"}
+    ]
+
+    solver = AsyncMock()
+    solver.post.return_value = MagicMock(status_code=200, json=lambda: {"prices": {}})
+
+    with (
+        patch("scripts.shadow_poller._cow_get", AsyncMock(return_value=mock_comp)),
+        patch("scripts.shadow_poller._fetch_orders_by_uids", AsyncMock(return_value=mock_orders)),
+        patch("scripts.shadow_poller.SHADOW_LOG_PATH", Path(tmp_path / "shadow.jsonl")),
+        patch("scripts.shadow_poller.touch_liveness"),
+        patch("scripts.shadow_poller.persist_winner_and_outcomes_safe", AsyncMock()),
+    ):
+        result = await poll_once(solver, set())
+
+    assert result == "ok"
+    solver.post.assert_called_once()
+    payload = solver.post.call_args.kwargs["json"]
+    assert payload["simulationBlock"] == 351_234_567
+
+
+@pytest.mark.asyncio
+async def test_poll_once_simulation_block_absent_is_none(tmp_path):
+    """Older competitions omit competitionSimulationBlock → simulationBlock None
+    → validator falls back to 'latest'."""
+    from pathlib import Path
+
+    mock_comp = {
+        "auctionId": "88889",
+        "auction": {"orders": ["uid1"], "prices": {}},
+        "solutions": [],
+    }
+    mock_orders = [
+        {"uid": "uid1", "sellToken": "0xa", "buyToken": "0xb",
+         "sellAmount": "1000", "buyAmount": "900", "kind": "sell"}
+    ]
+
+    solver = AsyncMock()
+    solver.post.return_value = MagicMock(status_code=200, json=lambda: {"prices": {}})
+
+    with (
+        patch("scripts.shadow_poller._cow_get", AsyncMock(return_value=mock_comp)),
+        patch("scripts.shadow_poller._fetch_orders_by_uids", AsyncMock(return_value=mock_orders)),
+        patch("scripts.shadow_poller.SHADOW_LOG_PATH", Path(tmp_path / "shadow.jsonl")),
+        patch("scripts.shadow_poller.touch_liveness"),
+        patch("scripts.shadow_poller.persist_winner_and_outcomes_safe", AsyncMock()),
+    ):
+        await poll_once(solver, set())
+
+    payload = solver.post.call_args.kwargs["json"]
+    assert payload["simulationBlock"] is None
+
+
+@pytest.mark.asyncio
 async def test_poll_once_returns_ok_on_already_seen():
     mock_comp = {"auctionId": "12345", "auction": {"orders": [], "prices": {}}, "solutions": []}
     with patch("scripts.shadow_poller._cow_get", AsyncMock(return_value=mock_comp)):

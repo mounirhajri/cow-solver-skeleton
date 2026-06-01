@@ -36,6 +36,14 @@ class Auction(BaseModel):
     liquidity: list[dict[str, object]] = Field(default_factory=list)
     effective_gas_price: int = Field(alias="effectiveGasPrice", default=0)
     deadline: str | None = None
+    # The block CoW used to simulate the competition for this auction. Orders
+    # are still open and pools sit at auction-time state at this block, so the
+    # feasibility validator simulates settle() here (instead of "latest") to
+    # measure auction-time feasibility rather than post-settlement drift. The
+    # shadow poller backfills it from the competition's
+    # ``competitionSimulationBlock``; the live /solve path leaves it None
+    # (CoW's /solve payload doesn't carry it), falling back to "latest".
+    simulation_block: int | None = Field(alias="simulationBlock", default=None)
     # Pass-through field: spec-required, but we don't act on it yet (no JIT
     # orders emitted). Storing it keeps the model spec-compliant for any
     # future logic that wants to respect the surplus-capture allowlist.

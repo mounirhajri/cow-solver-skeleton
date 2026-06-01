@@ -184,6 +184,11 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
         "liquidity": [],
         "effectiveGasPrice": "0",
         "deadline": None,
+        # The block CoW simulated this competition against. Forwarded so the
+        # feasibility validator evaluates settle() at auction-time state (orders
+        # open, pools un-drifted) instead of "latest". May be absent on older
+        # competitions → None → validator falls back to "latest".
+        "simulationBlock": comp.get("competitionSimulationBlock"),
     }
 
     our_solution = None
