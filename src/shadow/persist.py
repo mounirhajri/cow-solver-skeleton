@@ -5,6 +5,7 @@ Called from /solve via BackgroundTasks — must never raise; logs and swallows.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from datetime import UTC, datetime
 from typing import Any
@@ -190,16 +191,17 @@ async def persist_shadow_attempt(
                 and score is not None  # only validate solutions worth submitting
             ):
                 with contextlib.suppress(Exception):  # noqa: BLE001
-                    verdict: Verdict = await validate_solution(
-                        a.solution,
-                        cache=feas_cache,
-                        api=feas_api,
-                        rpc=feas_rpc,
-                        settlement_addr=settings.gpv2_settlement,
-                        solver_addr=settings.feasibility_solver_address,
-                    )
-                    feasible = verdict.feasible
-                    revert_reason = verdict.reason
+                    async with asyncio.timeout(10):
+                        verdict: Verdict = await validate_solution(
+                            a.solution,
+                            cache=feas_cache,
+                            api=feas_api,
+                            rpc=feas_rpc,
+                            settlement_addr=settings.gpv2_settlement,
+                            solver_addr=settings.feasibility_solver_address,
+                        )
+                        feasible = verdict.feasible
+                        revert_reason = verdict.reason
 
             session.add(
                 ShadowSolution(
@@ -231,8 +233,10 @@ async def persist_shadow_attempt(
         if feas_rpc is not None:
             with contextlib.suppress(Exception):  # noqa: BLE001
                 await feas_rpc._client.aclose()
+        if feas_api is not None:
             with contextlib.suppress(Exception):  # noqa: BLE001
                 await feas_api.close()
+        if feas_redis is not None:
             with contextlib.suppress(Exception):  # noqa: BLE001
                 await feas_redis.aclose()
 
