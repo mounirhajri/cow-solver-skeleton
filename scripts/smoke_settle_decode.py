@@ -81,11 +81,27 @@ def _check_one(tx_hash: str, calldata: bytes) -> bool | None:
         trades=decoded.trades,
         intra_interactions=decoded.intra_interactions,
     )
+    summary = (
+        f"{len(decoded.trades)} trades, "
+        f"{len(decoded.intra_interactions)} intra interactions"
+    )
     if reencoded == calldata:
         print(
-            f"  {tx_hash}: FEASIBLE re-encode — bytes match exactly "
-            f"({len(calldata)} bytes, {len(decoded.trades)} trades, "
-            f"{len(decoded.intra_interactions)} intra interactions). ENCODER OK."
+            f"  {tx_hash}: bytes match EXACTLY "
+            f"({len(calldata)} bytes, {summary}). ENCODER OK."
+        )
+        return True
+
+    # CoW solvers append metadata bytes after the ABI-encoded args (the EVM
+    # ignores trailing calldata). Our encoding is the clean, 32-byte-aligned ABI
+    # payload, so a real tx that equals ours plus a short non-ABI suffix is a
+    # PASS: the entire ABI portion matched byte-for-byte.
+    if calldata.startswith(reencoded):
+        suffix = calldata[len(reencoded):]
+        print(
+            f"  {tx_hash}: ABI bytes match exactly ({len(reencoded)} bytes, {summary}); "
+            f"real tx appends {len(suffix)} bytes of solver metadata "
+            f"(0x{suffix.hex()}) beyond the ABI encoding. ENCODER OK."
         )
         return True
 
@@ -116,6 +132,7 @@ def main() -> None:
     # ── single known tx ──────────────────────────────────────────────────────
     if args.tx:
         tx = w3.eth.get_transaction(HexBytes(args.tx))
+        print(f"  from (allowlisted solver) = {tx['from']}")
         verdict = _check_one(args.tx, _to_bytes(tx["input"]))
         sys.exit(0 if verdict is not False else 1)
 
@@ -149,6 +166,7 @@ def main() -> None:
             continue
         seen.add(tx_hash)
         tx = w3.eth.get_transaction(tx_hash_hb)
+        print(f"  from (allowlisted solver) = {tx['from']}")
         verdict = _check_one(tx_hash, _to_bytes(tx["input"]))
         if verdict is True:
             return

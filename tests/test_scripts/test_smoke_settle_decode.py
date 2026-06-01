@@ -42,6 +42,13 @@ def test_check_one_passes_on_amm_only_settlement() -> None:
     assert _check_one("0xfeed", _amm_only_calldata()) is True
 
 
+def test_check_one_passes_with_appended_solver_metadata() -> None:
+    # Real CoW settlements append non-ABI metadata bytes after the encoded args.
+    # Our clean ABI encoding is a prefix of the real calldata → still a PASS.
+    real = _amm_only_calldata() + bytes.fromhex("0000000000719402")
+    assert _check_one("0xtagged", real) is True
+
+
 def test_check_one_skips_non_settle_calldata() -> None:
     assert _check_one("0xbad", bytes.fromhex("deadbeef") + b"\x00" * 32) is None
 

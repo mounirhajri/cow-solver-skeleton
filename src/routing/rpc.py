@@ -14,6 +14,13 @@ _RATE_LIMIT_CODES = {429, -32005}
 # match on the message substring too. Anything else is an infra-class failure.
 _REVERT_CODE = 3
 
+# Some reverts are about OUR caller, not the solution. settle()'s onlySolver gate
+# reverts with "GPv2: not a solver" when the eth_call `from` isn't an allowlisted
+# solver — a config failure on our side. Treat these as infra (raise → UNKNOWN),
+# never as a phantom solution, or every solution gets falsely condemned whenever
+# the configured solver address isn't allowlisted.
+_CALLER_AUTH_MARKERS = ("not a solver",)
+
 
 def _is_revert(code: object, msg: str) -> bool:
     """True iff this JSON-RPC error denotes a genuine on-chain execution revert."""
@@ -21,6 +28,12 @@ def _is_revert(code: object, msg: str) -> bool:
         return True
     low = msg.lower()
     return "revert" in low or "reverted" in low
+
+
+def _is_caller_auth_revert(msg: str) -> bool:
+    """True iff a revert is about our caller's authorization, not the solution."""
+    low = msg.lower()
+    return any(m in low for m in _CALLER_AUTH_MARKERS)
 
 
 class RpcClient:
@@ -138,6 +151,14 @@ class RpcClient:
                 # Distinguish a genuine contract revert (→ phantom, (False, msg))
                 # from any other RPC error (→ infra, raise → UNKNOWN verdict).
                 if _is_revert(code, msg):
+                    # ...unless the revert is the onlySolver gate rejecting OUR
+                    # caller: that's our misconfiguration, not a phantom solution.
+                    if _is_caller_auth_revert(msg):
+                        raise RuntimeError(
+                            f"RPC error {code}: {msg} "
+                            "(eth_call `from` is not an allowlisted solver — "
+                            "config issue, not a phantom solution)"
+                        )
                     return False, msg
                 raise RuntimeError(f"RPC error {code}: {msg}")
 

@@ -196,6 +196,43 @@ async def test_eth_call_capture_raises_on_non_revert_rpc_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_eth_call_capture_raises_on_not_a_solver_revert() -> None:
+    """`GPv2: not a solver` is a caller-auth (config) revert, NOT a phantom.
+
+    The onlySolver gate rejects our eth_call `from` when it isn't allowlisted.
+    This MUST raise (→ UNKNOWN verdict), never report (False, reason): otherwise
+    every solution is falsely condemned as phantom whenever the configured solver
+    address isn't on the allowlist.
+    """
+    fake_web3 = MagicMock()
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = _mock_client([
+            _resp({"jsonrpc": "2.0", "id": 1,
+                   "error": {"code": 3, "message": "execution reverted: GPv2: not a solver"}})
+        ])
+        client = RpcClient("https://rpc.example")
+        with pytest.raises(RuntimeError, match="not a solver"):
+            await client.eth_call_capture("0xto", "0xdata", from_addr="0xunallowlisted")
+
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_invalid_signature_stays_phantom() -> None:
+    """A real solution revert (bad signature) is still reported as phantom."""
+    fake_web3 = MagicMock()
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = _mock_client([
+            _resp({"jsonrpc": "2.0", "id": 1,
+                   "error": {"code": 3, "message": "execution reverted: GPv2: invalid signature"}})
+        ])
+        client = RpcClient("https://rpc.example")
+        ok, payload = await client.eth_call_capture("0xto", "0xdata", from_addr="0xsolver")
+    assert ok is False
+    assert "invalid signature" in payload
+
+
+@pytest.mark.asyncio
 async def test_eth_call_capture_raises_on_missing_result() -> None:
     """Missing 'result' (malformed/infra) RAISES rather than reporting phantom."""
     fake_web3 = MagicMock()
