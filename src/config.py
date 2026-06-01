@@ -115,6 +115,19 @@ class Settings(BaseSettings):
     # Router, which has a different ABI).  V2 routers vary per DEX; the list
     # below is the order LiquidityAggregator queries.
     gpv2_settlement: str = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
+
+    # ── Phantom-score feasibility validation ────────────────────────────────
+    # When true, persist.py re-encodes each submittable positive-score solution
+    # as a real GPv2Settlement.settle() and eth_calls it at latest block to
+    # prove on-chain feasibility (token conservation + signature validity).
+    feasibility_enabled: bool = True
+    # The `from` address for the read-only settle() simulation. settle() has an
+    # onlySolver modifier, so the call must originate from an address the live
+    # settlement contract has allowlisted. This is a PUBLIC, already-registered
+    # CoW solver address — we never need its key (eth_call is read-only). Swap
+    # to our own address once Barn onboarding (Phase 0a) lands.
+    # barter (active Arbitrum solver), checksummed:
+    feasibility_solver_address: str = "0x0Ddcb0769a3591230cAa80F85469240b71442089"
     v3_swap_router: str = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
     v2_routers: list[str] = Field(
         default_factory=lambda: [
