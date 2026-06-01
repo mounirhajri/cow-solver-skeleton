@@ -35,12 +35,10 @@ The combined-amount quote uses a synthetic order_uid (``__jc_group__…``) so
 
 from __future__ import annotations
 
-import asyncio
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
-from src.config import settings
 from src.log import get_logger
 from src.models.auction import Auction
 from src.models.order import Order
@@ -50,8 +48,8 @@ from src.routing.multicall import Multicall3
 from src.routing.v3_batched import V3BatchedQuote, V3Path, batched_v3_quote
 from src.solver.base import NoSolution
 from src.solver.router import (
-    RouterSolver,
     _SWAP_DEADLINE_SECONDS,
+    RouterSolver,
     _expected_surplus_sort_key,
 )
 
@@ -176,7 +174,7 @@ class JointClearingSolver:
         max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
         strategy_timeout: float = _DEFAULT_STRATEGY_TIMEOUT,
         min_group_size: int = _DEFAULT_MIN_GROUP_SIZE,
-        ghost_detector: "GhostDetector | None" = None,
+        ghost_detector: GhostDetector | None = None,
         gpv2_settlement: str | None = None,
         v3_router_address: str | None = None,
         slippage_bps: int | None = None,
@@ -237,9 +235,6 @@ class JointClearingSolver:
                 groups[_group_key(order)].append(order)
 
         joint_pairs = {k: v for k, v in groups.items() if len(v) >= self._min_group_size}
-        grouped_uids: set[str] = {
-            o.uid for group in joint_pairs.values() for o in group
-        }
 
         # ── 4. Build all paths in one batch ──────────────────────────────────
         individual_paths = self._router._build_v3_candidate_paths(orders, auction.tokens)
@@ -326,13 +321,14 @@ class JointClearingSolver:
             prices[sell_tok] = combined_buy
             prices[buy_tok] = combined_sell
 
-            intra_interactions.append(
-                self._router._encode_path_interaction(
+            intra_interactions.extend(
+                i.to_gpv2_dict()
+                for i in self._router._encode_path_interaction(
                     best.path,
                     executed_sell=combined_sell,
                     executed_buy=combined_buy,
                     deadline=deadline,
-                ).to_gpv2_dict()
+                )
             )
             for order in group:
                 trades.append(Trade(
@@ -376,13 +372,14 @@ class JointClearingSolver:
                     order_uid=order.uid,
                     executed_amount=order.sell_amount,
                 ))
-                intra_interactions.append(
-                    self._router._encode_path_interaction(
+                intra_interactions.extend(
+                    i.to_gpv2_dict()
+                    for i in self._router._encode_path_interaction(
                         best_q.path,
                         executed_sell=order.sell_amount,
                         executed_buy=best_q.amount_out,
                         deadline=deadline,
-                    ).to_gpv2_dict()
+                    )
                 )
                 filled_uids.add(order.uid)
 

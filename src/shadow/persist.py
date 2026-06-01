@@ -252,7 +252,7 @@ async def persist_shadow_attempt(
                 await feas_api.close()
         if feas_redis is not None:
             with contextlib.suppress(Exception):  # noqa: BLE001
-                await feas_redis.aclose()
+                await feas_redis.aclose()  # type: ignore[attr-defined]  # redis-py 7.x has aclose; bundled stubs lag
 
         await session.commit()
 

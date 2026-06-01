@@ -37,6 +37,7 @@ from eth_abi import decode, encode
 from eth_utils import keccak
 
 from src.config import settings
+from src.encoder.erc20 import encode_approve
 from src.routing.multicall import Call, Multicall3
 from src.routing.rpc import RpcClient
 
@@ -58,9 +59,9 @@ _DEFAULT_TOKENS = [
 # to run out.
 _ALLOWANCE_THRESHOLD = 2**200
 
-# ERC20 selectors. ``approve`` for the calldata we emit, ``allowance``
-# for the read we batch.
-_SEL_APPROVE = keccak(text="approve(address,uint256)")[:4]
+# ERC20 ``allowance`` selector for the read we batch. The ``approve``
+# selector/encoder lives in src.encoder.erc20 (shared with the solver's
+# inline approve interactions) — see ``_encode_approve_calldata`` below.
 _SEL_ALLOWANCE = keccak(text="allowance(address,address)")[:4]
 
 _MAX_UINT256 = 2**256 - 1
@@ -84,8 +85,9 @@ def _encode_allowance_call(owner: str, spender: str) -> str:
 
 
 def _encode_approve_calldata(spender: str, amount: int) -> bytes:
-    args = encode(["address", "uint256"], [spender, amount])
-    return _SEL_APPROVE + args
+    # Delegate to the shared encoder so this diagnostic and the solver's
+    # inline approve interactions can never drift apart.
+    return encode_approve(spender, amount)
 
 
 async def _check_allowances(
@@ -146,7 +148,7 @@ def _format_pending(check: AllowanceCheck, spender: str) -> str:
     if check.needs_zero_reset:
         zero_cd = _encode_approve_calldata(spender, 0)
         lines.append(
-            f"      zero-reset (USDT-style; broadcast FIRST):"
+            "      zero-reset (USDT-style; broadcast FIRST):"
         )
         lines.append(f"        calldata: 0x{zero_cd.hex()}")
     cd = _encode_approve_calldata(spender, _MAX_UINT256)

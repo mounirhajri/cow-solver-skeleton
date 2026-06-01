@@ -26,8 +26,9 @@ import time
 from typing import TYPE_CHECKING
 
 from src.config import settings
+from src.encoder.erc20 import encode_approve
 from src.encoder.interactions import Interaction
-from src.encoder.v3 import encode_v3_swap
+from src.encoder.v3 import apply_slippage_up, encode_v3_swap
 from src.liquidity.base import LiquiditySource, SwapRequest
 from src.log import get_logger
 from src.models.auction import Auction
@@ -437,13 +438,14 @@ class RouterSolver:
                         executed_amount=order.buy_amount,
                     )
                 )
-                intra_interactions.append(
-                    self._encode_path_interaction(
+                intra_interactions.extend(
+                    i.to_gpv2_dict()
+                    for i in self._encode_path_interaction(
                         best.path,
                         executed_sell=amount_in,
                         executed_buy=order.buy_amount,
                         deadline=deadline,
-                    ).to_gpv2_dict()
+                    )
                 )
                 filled_uids.add(order.uid)
             else:
@@ -473,13 +475,14 @@ class RouterSolver:
                             executed_amount=order.sell_amount,
                         )
                     )
-                    intra_interactions.append(
-                        self._encode_path_interaction(
+                    intra_interactions.extend(
+                        i.to_gpv2_dict()
+                        for i in self._encode_path_interaction(
                             best.path,
                             executed_sell=order.sell_amount,
                             executed_buy=best.amount_out,
                             deadline=deadline,
-                        ).to_gpv2_dict()
+                        )
                     )
                     filled_uids.add(order.uid)
                 elif order.partially_fillable:
@@ -543,13 +546,14 @@ class RouterSolver:
                                     executed_amount=partial_sell,
                                 )
                             )
-                            intra_interactions.append(
-                                self._encode_path_interaction(
+                            intra_interactions.extend(
+                                i.to_gpv2_dict()
+                                for i in self._encode_path_interaction(
                                     frac_best.path,
                                     executed_sell=partial_sell,
                                     executed_buy=frac_best.amount_out,
                                     deadline=deadline,
-                                ).to_gpv2_dict()
+                                )
                             )
                             filled_uids.add(order.uid)
                             log.info(
@@ -874,8 +878,17 @@ class RouterSolver:
         executed_sell: int,
         executed_buy: int,
         deadline: int,
-    ) -> Interaction:
-        """Encode the winning V3 path into a settle-able GPv2 Interaction.
+    ) -> list[Interaction]:
+        """Encode the winning V3 path into settle-able GPv2 Interactions.
+
+        Returns ``[approve, swap]``: the SwapRouter pulls ``token_in`` out of
+        the Settlement via ``transferFrom``, which requires a standing
+        Settlement→Router allowance. The Settlement holds none (verified
+        on-chain == 0), so we grant it inline with an ``approve`` interaction
+        emitted immediately BEFORE the swap. The approval cap matches exactly
+        what the swap can pull: the exact input for sell-kind, and
+        ``amountInMaximum`` (slippage-padded) for buy-kind — so the grant is
+        never larger than the swap requires.
 
         Lives here (not in V3Source) so the v3_only_batched path can encode
         directly from its V3BatchedQuote pick without going through the
@@ -883,7 +896,20 @@ class RouterSolver:
         ``src.encoder.v3.encode_v3_swap`` dispatch — slippage math and the
         single/multi/sell/buy table are defined once.
         """
-        return encode_v3_swap(
+        # Cap the router can pull: exact input for sell, amountInMaximum (the
+        # same slippage-up the swap encoder applies to amount_in_maximum) for
+        # buy. Keeping the two in lockstep avoids an under-approval revert.
+        approve_amount = (
+            apply_slippage_up(executed_sell, self._slippage_bps)
+            if path.exact_output
+            else executed_sell
+        )
+        approve = Interaction(
+            target=path.token_in,
+            value=0,
+            call_data=encode_approve(self._v3_router_address, approve_amount),
+        )
+        swap = encode_v3_swap(
             token_in=path.token_in,
             token_out=path.token_out,
             fee_in=path.fee_tier_in,
@@ -897,6 +923,7 @@ class RouterSolver:
             slippage_bps=self._slippage_bps,
             router_address=self._v3_router_address,
         )
+        return [approve, swap]
 
     # ── Shared clearing-price logic ───────────────────────────────────────────
 
