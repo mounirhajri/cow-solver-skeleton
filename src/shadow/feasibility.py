@@ -19,6 +19,12 @@ from src.log import get_logger
 
 log = get_logger(__name__)
 
+# GPv2 sentinel: a null/zero receiver in the SIGNED order means "pay the owner".
+# The EIP-712 digest is signed over address(0), so we MUST re-encode address(0)
+# (not the owner) or ecrecover yields the wrong signer and settle() reverts on a
+# bad signature — which we'd misread as a phantom solution.
+_ZERO_ADDRESS = "0x" + "00" * 20
+
 
 @dataclass(frozen=True)
 class Verdict:
@@ -104,7 +110,7 @@ async def validate_solution(
             settle_trades.append(SettleTrade(
                 sell_token_index=index[sell_tok],
                 buy_token_index=index[buy_tok],
-                receiver=order.get("receiver") or order.get("owner") or solver_addr,
+                receiver=order.get("receiver") or _ZERO_ADDRESS,
                 sell_amount=_to_int(order.get("sellAmount")),
                 buy_amount=_to_int(order.get("buyAmount")),
                 valid_to=_to_int(order.get("validTo")),

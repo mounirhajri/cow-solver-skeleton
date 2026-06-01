@@ -9,6 +9,19 @@ from web3.providers.rpc import HTTPProvider
 _RETRY_DELAYS = (0.2, 0.6, 1.8)
 _RATE_LIMIT_CODES = {429, -32005}
 
+# JSON-RPC error code 3 is the EVM "execution reverted" code (EIP-1474).
+# Geth/Erigon also surface reverts under -32000 with a "revert" message, so we
+# match on the message substring too. Anything else is an infra-class failure.
+_REVERT_CODE = 3
+
+
+def _is_revert(code: object, msg: str) -> bool:
+    """True iff this JSON-RPC error denotes a genuine on-chain execution revert."""
+    if code == _REVERT_CODE:
+        return True
+    low = msg.lower()
+    return "revert" in low or "reverted" in low
+
 
 class RpcClient:
     """Minimal async RPC client for L2 reads.
@@ -77,14 +90,22 @@ class RpcClient:
         from_addr: str | None = None,
         block: str = "latest",
     ) -> tuple[bool, str]:
-        """Like ``eth_call`` but returns the revert instead of raising.
+        """Like ``eth_call`` but returns a contract revert instead of raising.
 
-        Returns ``(True, result_hex)`` on success, ``(False, reason)`` on a
-        contract revert. ``from_addr`` is injected into the call object — needed
-        for ``onlySolver`` functions like settle() that gate on msg.sender.
+        Returns ``(True, result_hex)`` on success and ``(False, reason)`` ONLY
+        for a genuine on-chain execution revert (the solution is phantom).
+        ``from_addr`` is injected into the call object — needed for
+        ``onlySolver`` functions like settle() that gate on msg.sender.
+
+        Infrastructure-class failures (non-revert JSON-RPC errors, a missing
+        ``result`` field, or rate-limit exhaustion after all retries) RAISE
+        ``RuntimeError``. This keeps the tri-state honest: the caller must map
+        a raise to an UNKNOWN verdict, never to "phantom". Conflating our own
+        fetch/RPC failure with an on-chain revert would falsely condemn a
+        solution as infeasible.
 
         Rate-limit errors (429 / -32005) are retried with the same back-off as
-        ``eth_call``; a persistent rate-limit surfaces as ``(False, reason)``.
+        ``eth_call``.
         """
         call_obj: dict[str, str] = {"to": to, "data": data}
         if from_addr is not None:
@@ -95,12 +116,12 @@ class RpcClient:
             "method": "eth_call",
             "params": [call_obj, block],
         }
-        last_reason = "eth_call: no attempts made"
+        last_exc: Exception = RuntimeError("eth_call: no attempts made")
         for _attempt, delay in enumerate((*_RETRY_DELAYS, None), start=1):
             resp = await self._client.post(self.url, json=payload, timeout=5.0)
 
             if resp.status_code == 429:
-                last_reason = "RPC error 429: Too Many Requests"
+                last_exc = RuntimeError("RPC error 429: Too Many Requests")
                 if delay is not None:
                     await asyncio.sleep(delay)
                 continue
@@ -111,14 +132,17 @@ class RpcClient:
                 code = err.get("code", "?") if isinstance(err, dict) else "?"
                 msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
                 if code in _RATE_LIMIT_CODES and delay is not None:
-                    last_reason = f"RPC error {code}: {msg}"
+                    last_exc = RuntimeError(f"RPC error {code}: {msg}")
                     await asyncio.sleep(delay)
                     continue
-                # Contract revert / non-retryable error → report as infeasible.
-                return False, msg
+                # Distinguish a genuine contract revert (→ phantom, (False, msg))
+                # from any other RPC error (→ infra, raise → UNKNOWN verdict).
+                if _is_revert(code, msg):
+                    return False, msg
+                raise RuntimeError(f"RPC error {code}: {msg}")
 
             if "result" not in body:
-                return False, f"RPC response missing 'result': {body}"
+                raise RuntimeError(f"RPC response missing 'result': {body}")
             return True, str(body["result"])
 
-        return False, last_reason
+        raise last_exc

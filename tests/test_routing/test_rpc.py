@@ -181,6 +181,35 @@ async def test_eth_call_capture_revert_returns_reason() -> None:
 
 
 @pytest.mark.asyncio
+async def test_eth_call_capture_raises_on_non_revert_rpc_error() -> None:
+    """A non-revert JSON-RPC error (infra) RAISES rather than reporting phantom."""
+    fake_web3 = MagicMock()
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = _mock_client([
+            _resp({"jsonrpc": "2.0", "id": 1,
+                   "error": {"code": -32602, "message": "invalid argument 0"}})
+        ])
+        client = RpcClient("https://rpc.example")
+        with pytest.raises(RuntimeError, match="-32602"):
+            await client.eth_call_capture("0xto", "0xdata")
+
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_raises_on_missing_result() -> None:
+    """Missing 'result' (malformed/infra) RAISES rather than reporting phantom."""
+    fake_web3 = MagicMock()
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = _mock_client([
+            _resp({"jsonrpc": "2.0", "id": 1})
+        ])
+        client = RpcClient("https://rpc.example")
+        with pytest.raises(RuntimeError, match="missing 'result'"):
+            await client.eth_call_capture("0xto", "0xdata")
+
+
+@pytest.mark.asyncio
 async def test_eth_call_capture_sends_from_address() -> None:
     fake_web3 = MagicMock()
     captured: dict = {}
@@ -200,8 +229,13 @@ async def test_eth_call_capture_sends_from_address() -> None:
 
 
 @pytest.mark.asyncio
-async def test_eth_call_capture_returns_reason_after_retries_exhausted() -> None:
-    """All 4 attempts rate-limited → returns (False, reason) instead of raising."""
+async def test_eth_call_capture_raises_after_retries_exhausted() -> None:
+    """All 4 attempts rate-limited → RAISES (infra failure, not a revert).
+
+    Rate-limit exhaustion must NOT be reported as (False, reason): that would
+    record the solution as phantom. It is an infra-class failure, so it raises
+    and validate_solution maps it to an UNKNOWN (None) verdict.
+    """
     fake_web3 = MagicMock()
     responses = [_resp({}, status=429)] * 4
     with patch("src.routing.rpc.Web3", return_value=fake_web3), \
@@ -210,7 +244,6 @@ async def test_eth_call_capture_returns_reason_after_retries_exhausted() -> None
         mc = _mock_client(responses)
         mock_cls.return_value = mc
         client = RpcClient("https://rpc.example")
-        ok, payload = await client.eth_call_capture("0xto", "0xdata")
-    assert ok is False
-    assert "429" in payload
+        with pytest.raises(RuntimeError, match="429"):
+            await client.eth_call_capture("0xto", "0xdata")
     assert mc.post.call_count == 4  # initial + 3 retries
