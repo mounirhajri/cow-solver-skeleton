@@ -799,7 +799,9 @@ async def test_persist_stores_feasibility_verdict(session_factory, monkeypatch) 
     # `feas_rpc` is truthy and the patched validator runs without network.
     monkeypatch.setattr(persist_mod, "validate_solution", _fake_validate)
     monkeypatch.setattr(persist_mod, "compute_solution_score", lambda *a, **k: 5 * 10**14)
-    monkeypatch.setattr(persist_mod, "orders_by_uid_from_auction", lambda *a, **k: {"0xabc": object()})
+    monkeypatch.setattr(
+        persist_mod, "orders_by_uid_from_auction", lambda *a, **k: {"0xabc": object()}
+    )
     monkeypatch.setattr(persist_mod.settings, "feasibility_enabled", True)
 
     sell = "0x1111111111111111111111111111111111111111"

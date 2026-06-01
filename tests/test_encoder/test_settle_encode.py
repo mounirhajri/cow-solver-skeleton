@@ -16,7 +16,7 @@ def test_selector_matches_signature() -> None:
         "(uint256,uint256,address,uint256,uint256,uint32,bytes32,uint256,uint256,uint256,bytes)[],"
         "(address,uint256,bytes)[][3])"
     )
-    assert SETTLE_SELECTOR == keccak(text=sig)[:4]
+    assert keccak(text=sig)[:4] == SETTLE_SELECTOR
 
 
 def test_encode_settle_roundtrips_via_abi_decode() -> None:
