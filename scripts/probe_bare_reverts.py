@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -57,6 +58,7 @@ from src.encoder.v3_calldata import (
 )
 from src.encoder.v3_path import EXACT_INPUT_SELECTOR, EXACT_OUTPUT_SELECTOR
 from src.log import get_logger
+from src.models.auction import Auction
 from src.persistence.db import get_session_factory
 from src.persistence.models import ShadowAuction, ShadowSolution
 from src.routing.amm_v3 import QUOTER_V2_ADDRESS
@@ -92,6 +94,34 @@ _NO_SIM_BLOCK = "no_sim_block"
 _NO_SWAP = "no_swap_found"
 _NO_PRICE = "no_clearing_price"
 _DECODE_FAIL = "decode_fail"
+
+# Offline-mode flags, ranked worst → best. The reconstruction picks the
+# highest-ranked flag observed across a solution's trades.
+_LIMIT_FLOOR_VIOLATION = "limit_floor_violation"  # sell order: floor(buy) < buyAmount
+_LIMIT_VIOLATION = "limit_violation"  # buy order: ceil(sell) > sellAmount
+_CONSERVATION_SHORT = "conservation_short"  # swap delivers < sum owed (approx)
+_OFFLINE_NO_PRICE = "no_price"  # missing a clearing price → couldn't fully check
+_ORDER_MISSING = "order_missing"  # trade uid absent from raw_auction → can't check
+_EXPLAINED_NONE = "explained_none"  # stored math consistent → revert is on-chain
+_PARSE_ERROR = "parse_error"  # raw_auction failed to validate
+
+# Higher rank = more conclusive root-cause signal.
+_FLAG_RANK = {
+    _LIMIT_FLOOR_VIOLATION: 5,
+    _LIMIT_VIOLATION: 4,
+    _CONSERVATION_SHORT: 3,
+    _ORDER_MISSING: 2,
+    _OFFLINE_NO_PRICE: 1,
+    _EXPLAINED_NONE: 0,
+    _PARSE_ERROR: -1,
+}
+
+
+def _ceil_div(a: int, b: int) -> int:
+    """Ceiling division, mirroring joint_clearing._ceil_div (GPv2 buy-side rounding)."""
+    if b <= 0:
+        return 0
+    return (a + b - 1) // b
 
 
 @dataclass(frozen=True)
@@ -315,7 +345,219 @@ def _percentile(values: list[float], pct: float) -> float:
     return ordered[k]
 
 
-async def run_probe(
+# ---------------------------------------------------------------------------
+# Offline mode: reconstruct GPv2 limit + conservation math from stored rows
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OfflineRow:
+    uid: str
+    strategy: str
+    n_trades: int
+    worst_flag: str
+    deficit_wei: int = 0
+    deficit_bps: float = float("nan")
+
+
+def _analyse_offline(
+    solution: dict[str, Any],
+    raw_auction: dict[str, Any],
+    strategy: str,
+) -> OfflineRow:
+    """Reconstruct each trade's GPv2-side amounts from the stored solution + auction.
+
+    No RPC: uses only the persisted clearing prices, trade executed amounts, and the
+    order limits in ``raw_auction``. Reproduces GPv2's rounding (floor on sell-order
+    buy amounts, ceil on buy-order sell amounts) to catch the ceil-vs-floor limit
+    edge that ``joint_clearing._all_limits_satisfied`` can pass but settle() reverts on.
+    """
+    trades = solution.get("trades", []) or []
+    n_trades = len(trades)
+    uid = _first_uid(solution)
+
+    try:
+        auction = Auction.model_validate(raw_auction)
+    except Exception as exc:  # noqa: BLE001 — diagnostic: never crash on one row
+        log.debug("offline_parse_error", uid=uid, error=str(exc))
+        return OfflineRow(uid, strategy, n_trades, _PARSE_ERROR)
+
+    order_map = {o.uid: o for o in auction.orders}
+    prices = _price_map(solution)
+
+    worst_flag = _EXPLAINED_NONE
+    deficit_wei = 0
+    deficit_bps = float("nan")
+
+    def _consider(flag: str, dwei: int, dbps: float) -> None:
+        nonlocal worst_flag, deficit_wei, deficit_bps
+        better_rank = _FLAG_RANK[flag] > _FLAG_RANK[worst_flag]
+        same_rank_bigger = _FLAG_RANK[flag] == _FLAG_RANK[worst_flag] and dwei > deficit_wei
+        if better_rank or same_rank_bigger:
+            worst_flag, deficit_wei, deficit_bps = flag, dwei, dbps
+
+    # Sum floored sell-order buy amounts per buy-token (for the conservation slack).
+    buy_owed: dict[str, int] = defaultdict(int)
+
+    for tr in trades:
+        order = order_map.get(str(tr.get("orderUid", "")))
+        if order is None:
+            _consider(_ORDER_MISSING, 0, float("nan"))
+            continue
+        try:
+            executed = int(tr.get("executedAmount"))
+        except (TypeError, ValueError):
+            _consider(_ORDER_MISSING, 0, float("nan"))
+            continue
+
+        p_sell = prices.get(order.sell_token.lower())
+        p_buy = prices.get(order.buy_token.lower())
+        if p_sell is None or p_buy is None or p_buy == 0:
+            _consider(_OFFLINE_NO_PRICE, 0, float("nan"))
+            continue
+
+        if order.kind == "sell":
+            executed_buy = (executed * p_sell) // p_buy  # GPv2 floor
+            buy_owed[order.buy_token.lower()] += executed_buy
+            if executed_buy < order.buy_amount:
+                d = order.buy_amount - executed_buy
+                bps = 10_000 * d / order.buy_amount if order.buy_amount else float("nan")
+                _consider(_LIMIT_FLOOR_VIOLATION, d, bps)
+        else:  # buy order
+            if p_sell == 0:
+                _consider(_OFFLINE_NO_PRICE, 0, float("nan"))
+                continue
+            executed_sell = _ceil_div(executed * p_buy, p_sell)  # GPv2 ceil
+            if executed_sell > order.sell_amount:
+                d = executed_sell - order.sell_amount
+                bps = 10_000 * d / order.sell_amount if order.sell_amount else float("nan")
+                _consider(_LIMIT_VIOLATION, d, bps)
+
+    # Secondary, approximate: does each buy-token's swap delivery cover what users
+    # are owed?  Swap delivery for a sell→buy group == prices[sell_token] (combined
+    # buy).  With GPv2 floor on the per-order owed amounts this is normally >= 0;
+    # a negative slack would indicate a genuine multi-order distribution shortfall.
+    delivered: dict[str, int] = defaultdict(int)
+    for cd in _find_swap_interactions(solution):
+        try:
+            sw = _decode_swap(cd)
+        except Exception:  # noqa: BLE001
+            continue
+        if sw is None or sw.kind == "buy":
+            continue
+        p_in = prices.get(sw.token_in.lower())
+        if p_in is not None:
+            delivered[sw.token_out.lower()] += p_in
+    for token, owed in buy_owed.items():
+        if token not in delivered:
+            # No decodable swap delivers this token → we can't reconstruct the
+            # delivery side offline. Absence of a swap is NOT a shortfall; skip
+            # rather than emit a spurious conservation_short.
+            continue
+        slack = delivered[token] - owed
+        if slack < 0:
+            bps = 10_000 * (-slack) / owed if owed else float("nan")
+            _consider(_CONSERVATION_SHORT, -slack, bps)
+
+    return OfflineRow(uid, strategy, n_trades, worst_flag, deficit_wei, deficit_bps)
+
+
+async def run_offline(days: int, limit: int, strategy: str) -> None:
+    since = datetime.now(UTC) - timedelta(days=days)
+    print(
+        f"\nBare-revert OFFLINE conservation/limit probe  "
+        f"(last {days} day(s), since {since:%Y-%m-%d %H:%M} UTC) [strategy={strategy}]"
+    )
+
+    Session = get_session_factory()
+    async with Session() as session:
+        q = (
+            select(
+                ShadowSolution.solution,
+                ShadowSolution.strategy,
+                ShadowAuction.raw_auction,
+            )
+            .join(ShadowAuction, ShadowSolution.auction_id == ShadowAuction.auction_id)
+            .where(ShadowSolution.strategy == strategy)
+            .where(ShadowSolution.feasible.is_(False))
+            .where(ShadowSolution.revert_reason == BARE_REVERT)
+            .where(ShadowSolution.created_at >= since)
+            .order_by(ShadowSolution.created_at.desc())
+            .limit(limit)
+        )
+        rows = (await session.execute(q)).all()
+
+    print(f"  matched {len(rows)} bare-revert {strategy} solution(s)\n")
+    if not rows:
+        print("  Nothing to probe in window. Widen --days or check the strategy.\n")
+        return
+
+    header = (
+        f"  {'uid':<14} {'strat':<14} {'n_tr':>4} {'deficit_wei':>22} "
+        f"{'deficit_bps':>12}  worst_flag"
+    )
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    tally: dict[str, int] = {}
+    floor_deficits_wei: list[float] = []
+    floor_deficits_bps: list[float] = []
+
+    for solution, strat, raw_auction in rows:
+        if not isinstance(solution, dict) or not isinstance(raw_auction, dict):
+            tally[_PARSE_ERROR] = tally.get(_PARSE_ERROR, 0) + 1
+            continue
+        res = _analyse_offline(solution, raw_auction, str(strat))
+        tally[res.worst_flag] = tally.get(res.worst_flag, 0) + 1
+        if res.worst_flag == _LIMIT_FLOOR_VIOLATION:
+            floor_deficits_wei.append(float(res.deficit_wei))
+            if res.deficit_bps == res.deficit_bps:  # not NaN  # noqa: PLR0124
+                floor_deficits_bps.append(res.deficit_bps)
+
+        bps_s = f"{res.deficit_bps:11.4f}" if res.deficit_bps == res.deficit_bps else "          -"  # noqa: PLR0124, E501
+        print(
+            f"  {res.uid:<14} {res.strategy:<14} {res.n_trades:>4} "
+            f"{res.deficit_wei:>22} {bps_s:>12}  {res.worst_flag}"
+        )
+
+    print("\n" + "=" * 72)
+    print("Summary")
+    print("=" * 72)
+    total = sum(tally.values())
+    for flag in sorted(tally, key=lambda k: (-_FLAG_RANK.get(k, 0), -tally[k])):
+        n = tally[flag]
+        pct = 100 * n / total if total else 0.0
+        print(f"  {n:>4}  ({pct:5.1f}%)  {flag}")
+
+    if floor_deficits_wei:
+        print(
+            "\n  limit_floor_violation deficit (wei): "
+            f"min={int(min(floor_deficits_wei))}  "
+            f"median={int(_percentile(floor_deficits_wei, 50))}  "
+            f"p90={int(_percentile(floor_deficits_wei, 90))}  "
+            f"max={int(max(floor_deficits_wei))}"
+        )
+        if floor_deficits_bps:
+            print(
+                "  limit_floor_violation deficit (bps): "
+                f"min={min(floor_deficits_bps):.4f}  "
+                f"median={_percentile(floor_deficits_bps, 50):.4f}  "
+                f"p90={_percentile(floor_deficits_bps, 90):.4f}  "
+                f"max={max(floor_deficits_bps):.4f}"
+            )
+
+    print(
+        "\n  Decision gate:\n"
+        f"    • {_LIMIT_FLOOR_VIOLATION} dominates → root cause confirmed: ceil→floor\n"
+        "      limit check in joint_clearing._all_limits_satisfied (deficit ≈ 1-wei class).\n"
+        f"    • {_CONSERVATION_SHORT} dominates  → multi-order distribution under-delivers.\n"
+        f"    • {_EXPLAINED_NONE} dominates    → stored math is fine; revert is on-chain\n"
+        "      (signature / ERC20 / router-vs-quoter), not the clearing math.\n"
+        "    • Either way: do NOT pitch feas% to CoW — this only identifies the lever.\n"
+    )
+
+
+async def run_requote(
     minutes: int,
     limit: int,
     strategy: str,
@@ -412,13 +654,30 @@ async def run_probe(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Probe bare-revert phantoms for clearing-price over-promise."
+        description="Probe bare-revert phantoms: offline limit/conservation "
+        "reconstruction (default) or RPC re-quote at the sim-block."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("offline", "requote"),
+        default="offline",
+        help=(
+            "offline (default): reconstruct GPv2 limit/conservation math from stored "
+            "rows, no RPC, full-window. requote: re-quote each swap at the sim-block "
+            "(bounded by the ~100-min non-archive RPC window)."
+        ),
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=2,
+        help="Offline-mode look-back window in days (default: 2).",
     )
     parser.add_argument(
         "--minutes",
         type=int,
         default=90,
-        help="Look-back window in minutes (default: 90; bounded by non-archive RPC).",
+        help="Requote-mode window in minutes (default: 90; bounded by non-archive RPC).",
     )
     parser.add_argument(
         "--limit",
@@ -433,9 +692,14 @@ def main() -> None:
         help="Strategy to probe (default: router-v2).",
     )
     args = parser.parse_args()
-    asyncio.run(
-        run_probe(minutes=args.minutes, limit=args.limit, strategy=args.strategy)
-    )
+    if args.mode == "offline":
+        asyncio.run(
+            run_offline(days=args.days, limit=args.limit, strategy=args.strategy)
+        )
+    else:
+        asyncio.run(
+            run_requote(minutes=args.minutes, limit=args.limit, strategy=args.strategy)
+        )
 
 
 if __name__ == "__main__":
