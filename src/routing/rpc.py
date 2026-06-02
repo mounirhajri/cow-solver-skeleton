@@ -1,5 +1,6 @@
 import asyncio
 
+import eth_abi
 import httpx
 from web3 import Web3
 from web3.providers.rpc import HTTPProvider
@@ -20,6 +21,45 @@ _REVERT_CODE = 3
 # never as a phantom solution, or every solution gets falsely condemned whenever
 # the configured solver address isn't allowlisted.
 _CALLER_AUTH_MARKERS = ("not a solver",)
+
+# Selector of the canonical Solidity `Error(string)` revert (keccak("Error(string)")[:4]).
+# Many providers (notably PublicNode) return a generic "execution reverted" message
+# and put the real revert payload in error.data, ABI-encoded under this selector.
+_ERROR_STRING_SELECTOR = "08c379a0"
+
+
+def _decode_revert_data(data: object) -> str | None:
+    """Best-effort decode of a JSON-RPC error ``data`` field into a human reason.
+
+    Providers like PublicNode mask the message as a bare "execution reverted" and
+    carry the real reason in ``error.data``. For the canonical Solidity
+    ``Error(string)`` revert this is ABI-encoded; decode it back to the string
+    (e.g. "STF", "Too little received", "GPv2: not a solver"). For a custom-error
+    selector we cannot recover a string, so surface the raw hex so the selector is
+    at least visible. Returns ``None`` when there is no usable data.
+
+    Pure/offline and never raises — a decode failure degrades to ``None`` (revert
+    detection itself stays driven by the JSON-RPC code/message, never by this).
+    """
+    # Some providers nest the payload under data.data / data.message.
+    if isinstance(data, dict):
+        inner = data.get("data") if data.get("data") is not None else data.get("message")
+        return _decode_revert_data(inner) if inner is not None else None
+    if not isinstance(data, str):
+        return None
+    hexs = (data[2:] if data.startswith("0x") else data).lower()
+    if not hexs:
+        return None
+    # Canonical Error(string): selector + abi.encode(string).
+    if hexs.startswith(_ERROR_STRING_SELECTOR) and len(hexs) >= len(_ERROR_STRING_SELECTOR) + 64:
+        try:
+            decoded = eth_abi.decode(["string"], bytes.fromhex(hexs[len(_ERROR_STRING_SELECTOR):]))
+            text = str(decoded[0]).strip()
+            return text or None
+        except Exception:
+            return None
+    # Custom error or raw bytes — surface the selector/hex itself.
+    return "0x" + hexs
 
 
 def _is_revert(code: object, msg: str) -> bool:
@@ -148,18 +188,24 @@ class RpcClient:
                     last_exc = RuntimeError(f"RPC error {code}: {msg}")
                     await asyncio.sleep(delay)
                     continue
-                # Distinguish a genuine contract revert (→ phantom, (False, msg))
+                # Distinguish a genuine contract revert (→ phantom, (False, reason))
                 # from any other RPC error (→ infra, raise → UNKNOWN verdict).
                 if _is_revert(code, msg):
+                    # The real reason often hides in err.data (providers mask the
+                    # message as a bare "execution reverted"). Surface it so the
+                    # stored revert_reason is diagnostic, not the generic string.
+                    detail = _decode_revert_data(err.get("data")) if isinstance(err, dict) else None
+                    reason = f"{msg}: {detail}" if detail and detail not in msg else msg
                     # ...unless the revert is the onlySolver gate rejecting OUR
                     # caller: that's our misconfiguration, not a phantom solution.
-                    if _is_caller_auth_revert(msg):
+                    # Inspect the decoded reason — the marker may live in err.data.
+                    if _is_caller_auth_revert(reason):
                         raise RuntimeError(
-                            f"RPC error {code}: {msg} "
+                            f"RPC error {code}: {reason} "
                             "(eth_call `from` is not an allowlisted solver — "
                             "config issue, not a phantom solution)"
                         )
-                    return False, msg
+                    return False, reason
                 raise RuntimeError(f"RPC error {code}: {msg}")
 
             if "result" not in body:

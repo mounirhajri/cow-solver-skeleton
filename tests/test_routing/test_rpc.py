@@ -2,7 +2,23 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.routing.rpc import RpcClient
+from src.routing.rpc import RpcClient, _decode_revert_data
+
+# Canonical Solidity Error(string) reverts: selector 08c379a0 + abi.encode(string).
+# Many providers (e.g. PublicNode) return a generic "execution reverted" message
+# and put the real reason here in error.data. Fixtures generated via eth_abi.
+_ERR_STF = (
+    "0x08c379a0"
+    "0000000000000000000000000000000000000000000000000000000000000020"
+    "0000000000000000000000000000000000000000000000000000000000000003"
+    "5354460000000000000000000000000000000000000000000000000000000000"
+)
+_ERR_NOT_A_SOLVER = (
+    "0x08c379a0"
+    "0000000000000000000000000000000000000000000000000000000000000020"
+    "0000000000000000000000000000000000000000000000000000000000000012"
+    "475076323a206e6f74206120736f6c7665720000000000000000000000000000"
+)
 
 
 def _mock_client(responses: list) -> MagicMock:
@@ -263,6 +279,73 @@ async def test_eth_call_capture_sends_from_address() -> None:
         await client.eth_call_capture("0xto", "0xdata", from_addr="0xSOLVER")
     assert captured["params"][0]["from"] == "0xSOLVER"
     assert captured["params"][0]["to"] == "0xto"
+
+
+# ── _decode_revert_data ───────────────────────────────────────────────────────
+
+def test_decode_revert_data_error_string() -> None:
+    """Canonical Error(string) data decodes back to the human reason."""
+    assert _decode_revert_data(_ERR_STF) == "STF"
+
+
+def test_decode_revert_data_custom_selector_surfaces_hex() -> None:
+    """A custom-error selector (no decodable string) surfaces the raw hex."""
+    custom = "0xdeadbeef"
+    assert _decode_revert_data(custom) == "0xdeadbeef"
+
+
+def test_decode_revert_data_empty_returns_none() -> None:
+    assert _decode_revert_data("0x") is None
+    assert _decode_revert_data("") is None
+    assert _decode_revert_data(None) is None
+
+
+def test_decode_revert_data_nested_dict() -> None:
+    """Some providers nest the payload under data.data — unwrap it."""
+    assert _decode_revert_data({"data": _ERR_STF}) == "STF"
+
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_surfaces_err_data_reason() -> None:
+    """A generic 'execution reverted' message + Error(string) data → decoded reason.
+
+    This is the PublicNode shape: the message is generic and the real revert
+    string lives in error.data. Without decoding it, every such revert is stored
+    as the useless 'execution reverted' (the bare-revert capture artifact).
+    """
+    fake_web3 = MagicMock()
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = _mock_client([
+            _resp({"jsonrpc": "2.0", "id": 1,
+                   "error": {"code": 3, "message": "execution reverted",
+                             "data": _ERR_STF}})
+        ])
+        client = RpcClient("https://rpc.example")
+        ok, payload = await client.eth_call_capture("0xto", "0xdata", from_addr="0xsolver")
+    assert ok is False
+    assert "STF" in payload
+
+
+@pytest.mark.asyncio
+async def test_eth_call_capture_caller_auth_detected_in_err_data() -> None:
+    """`not a solver` hidden in err.data (generic message) must still RAISE.
+
+    PublicNode masks the message as 'execution reverted' and puts the caller-auth
+    string in data. The caller-auth guard must inspect the decoded reason, else a
+    config misconfiguration would be falsely reported as a phantom solution.
+    """
+    fake_web3 = MagicMock()
+    with patch("src.routing.rpc.Web3", return_value=fake_web3), \
+         patch("src.routing.rpc.httpx.AsyncClient") as mock_cls:
+        mock_cls.return_value = _mock_client([
+            _resp({"jsonrpc": "2.0", "id": 1,
+                   "error": {"code": 3, "message": "execution reverted",
+                             "data": _ERR_NOT_A_SOLVER}})
+        ])
+        client = RpcClient("https://rpc.example")
+        with pytest.raises(RuntimeError, match="not a solver"):
+            await client.eth_call_capture("0xto", "0xdata", from_addr="0xunallowlisted")
 
 
 @pytest.mark.asyncio
