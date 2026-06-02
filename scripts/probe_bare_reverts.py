@@ -981,6 +981,86 @@ async def run_quantify(days: int, limit: int, strategy: str) -> None:
     )
 
 
+# PR #81 (17b7c6c) — "emit Settlement→SwapRouter approve before each V3 swap" —
+# merged 2026-06-02 00:39 UTC; deploy.yml takes ~10 min, so simulations run with
+# the approve from ~01:00 UTC. feasrate mode splits at this boundary so the
+# approve fix's effect on feas% is isolated from pre-fix rows.
+_FIX81_DEPLOYED_AT = datetime(2026, 6, 2, 1, 0, tzinfo=UTC)
+
+
+async def run_feasrate(days: int, limit: int, strategy: str) -> None:
+    """Offline feasibility-rate breakdown (no RPC), split at the #81 deploy.
+
+    Answers the prerequisite to any win-rate claim: how often does a solved
+    solution actually pass on-chain? Counts feasible True/False/None over --days
+    and isolates the post-#81 slice so the Settlement→Router approve fix's effect
+    is visible. feas% = True/(True+False) (decidable rate); check% =
+    (True+False)/total (how many got a decidable verdict at all).
+    """
+    since = datetime.now(UTC) - timedelta(days=days)
+    print(
+        f"\nFeasibility-rate breakdown (offline)  "
+        f"(last {days} day(s), since {since:%Y-%m-%d %H:%M} UTC) [strategy={strategy}]"
+    )
+
+    Session = get_session_factory()
+    async with Session() as session:
+        q = (
+            select(ShadowSolution.feasible, ShadowSolution.created_at)
+            .where(ShadowSolution.strategy == strategy)
+            .where(ShadowSolution.status == "solved")
+            .where(ShadowSolution.solution.is_not(None))
+            .where(ShadowSolution.created_at >= since)
+            .order_by(ShadowSolution.created_at.desc())
+            .limit(limit)
+        )
+        rows = (await session.execute(q)).all()
+
+    print(f"  matched {len(rows)} solved {strategy} solution(s)\n")
+    if not rows:
+        print("  Nothing to probe in window. Widen --days / --limit or check strategy.\n")
+        return
+
+    def _tally(subset: list[Any]) -> tuple[int, int, int]:
+        t = sum(1 for f in subset if f is True)
+        fa = sum(1 for f in subset if f is False)
+        no = sum(1 for f in subset if f is None)
+        return t, fa, no
+
+    def _report(label: str, feas_flags: list[Any]) -> None:
+        t, fa, no = _tally(feas_flags)
+        total = t + fa + no
+        decidable = t + fa
+        feas_pct = 100 * t / decidable if decidable else 0.0
+        check_pct = 100 * decidable / total if total else 0.0
+        print(f"  {label}")
+        print(
+            f"    feasible(True)={t}  phantom(False)={fa}  unknown(None)={no}  "
+            f"(n={total})"
+        )
+        print(
+            f"    feas% (True/decidable) = {feas_pct:.1f}%   "
+            f"check% (decidable/total) = {check_pct:.1f}%"
+        )
+
+    all_flags = [f for f, _ in rows]
+    pre = [f for f, c in rows if c < _FIX81_DEPLOYED_AT]
+    post = [f for f, c in rows if c >= _FIX81_DEPLOYED_AT]
+
+    print("=" * 72)
+    _report("FULL WINDOW:", all_flags)
+    print()
+    _report(f"PRE-#81  (before {_FIX81_DEPLOYED_AT:%Y-%m-%d %H:%M} UTC):", pre)
+    print()
+    _report(f"POST-#81 (since {_FIX81_DEPLOYED_AT:%Y-%m-%d %H:%M} UTC):", post)
+    print(
+        "\n  feas% is the prerequisite to any win-rate: a phantom solution can never\n"
+        "  be a win. If POST-#81 feas% is still ≈0, the approve fix alone did not\n"
+        "  unblock execution — order-validity (filled / presig / fundability) and the\n"
+        "  not-a-solver artifact dominate. Do NOT pitch feas% to CoW.\n"
+    )
+
+
 _GENERIC_REASON = "execution reverted (generic / pre-fix / empty-data)"
 
 
@@ -1194,7 +1274,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=("offline", "requote", "delivery", "quantify", "reasons"),
+        choices=("offline", "requote", "delivery", "quantify", "reasons", "feasrate"),
         default="offline",
         help=(
             "offline (default): reconstruct GPv2 limit/conservation math from stored "
@@ -1205,6 +1285,8 @@ def main() -> None:
             "concentration, ghost-set cross-ref, and a per-distinct-order fundability "
             "spot-check. reasons: offline, surplus-weighted tally of the decoded "
             "revert_reason strings over --days (reads the err.data-decode payoff). "
+            "feasrate: offline feasible True/False/None breakdown over --days, split "
+            "at the #81 approve-fix deploy (the prerequisite to any win-rate). "
             "requote/delivery are bounded by the ~100-min non-archive RPC window."
         ),
     )
@@ -1244,6 +1326,10 @@ def main() -> None:
     elif args.mode == "reasons":
         asyncio.run(
             run_reasons(days=args.days, limit=args.limit, strategy=args.strategy)
+        )
+    elif args.mode == "feasrate":
+        asyncio.run(
+            run_feasrate(days=args.days, limit=args.limit, strategy=args.strategy)
         )
     elif args.mode == "delivery":
         asyncio.run(
