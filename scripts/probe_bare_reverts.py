@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from eth_abi import decode
+from eth_abi import decode, encode
 from sqlalchemy import select
 
 from src.config import settings
@@ -114,6 +114,37 @@ _FLAG_RANK = {
     _OFFLINE_NO_PRICE: 1,
     _EXPLAINED_NONE: 0,
     _PARSE_ERROR: -1,
+}
+
+# ---------------------------------------------------------------------------
+# Delivery-mode (router-vs-quoter + counterparty) flags & ERC-20 plumbing
+# ---------------------------------------------------------------------------
+# Canonical CoW GPv2VaultRelayer — the SAME address on every chain CoW supports.
+# Users grant their sell-token allowance to THIS contract (not the settlement);
+# settle() pulls each trade's sell tokens through it. Checking allowance against
+# the settlement instead would falsely report every order as un-approved.
+GPV2_VAULT_RELAYER = "0xC92E8bdf79f0507f65a392b0ab4667716BFE0110"
+
+# ERC-20 view selectors: balanceOf(address) / allowance(address,address).
+_BALANCE_OF_SELECTOR = bytes.fromhex("70a08231")
+_ALLOWANCE_SELECTOR = bytes.fromhex("dd62ed3e")
+
+# Delivery flags, ranked by on-chain revert *order* — settle() pulls every
+# trade's sell tokens (transferIn, through the relayer) BEFORE running the swap
+# interactions, so a counterparty-delivery failure aborts the settlement first.
+_USER_NO_ALLOWANCE = "user_no_allowance"  # transferIn reverts: owner hasn't approved
+_USER_NO_BALANCE = "user_no_balance"  # transferIn reverts: owner lacks the sell tokens
+_SWAP_PATH_REVERTS = "swap_path_reverts"  # QuoterV2 reverts → pool/fee path broken
+_AMOUNT_OUT_MIN_UNMET = "amount_out_min_unmet"  # swap delivers < amountOutMinimum
+_SWAP_CLEAN_USER_OK = "swap_clean_user_ok"  # both legs pass → bare cause is deeper
+
+# Higher rank = earlier/more-decisive on-chain revert point.
+_DELIVERY_RANK = {
+    _USER_NO_ALLOWANCE: 6,
+    _USER_NO_BALANCE: 5,
+    _SWAP_PATH_REVERTS: 4,
+    _AMOUNT_OUT_MIN_UNMET: 3,
+    _SWAP_CLEAN_USER_OK: 0,
 }
 
 
@@ -557,6 +588,211 @@ async def run_offline(days: int, limit: int, strategy: str) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Delivery mode: router-vs-quoter + counterparty on-chain delivery check
+# ---------------------------------------------------------------------------
+
+
+def _balance_calldata(owner: str) -> str:
+    return "0x" + (_BALANCE_OF_SELECTOR + encode(["address"], [owner])).hex()
+
+
+def _allowance_calldata(owner: str, spender: str) -> str:
+    return "0x" + (_ALLOWANCE_SELECTOR + encode(["address", "address"], [owner, spender])).hex()
+
+
+async def _erc20_uint(rpc: RpcClient, token: str, calldata: str, block: str) -> int | None:
+    """eth_call an ERC-20 uint256 view at ``block``.
+
+    Returns the value, or ``None`` if the token call itself reverts (non-standard
+    token / not a contract at this block). RAISES RuntimeError on infra-class
+    errors (aged-out block, rate-limit) so the caller buckets the row ``aged_out``
+    rather than misreading an RPC failure as a delivery shortfall.
+    """
+    ok, ret = await rpc.eth_call_capture(token, calldata, block=block)
+    if not ok:
+        return None
+    h = ret[2:] if ret.startswith("0x") else ret
+    if not h:
+        return None
+    return int(h, 16)
+
+
+@dataclass
+class DeliveryRow:
+    uid: str
+    block: int | None
+    verdict: str
+    detail: str = ""
+
+
+async def _analyse_delivery(
+    rpc: RpcClient,
+    solution: dict[str, Any],
+    raw_auction: dict[str, Any],
+    sim_block: int | None,
+) -> DeliveryRow:
+    """Attribute a bare revert: our swap under-delivers vs the user can't deliver.
+
+    Leg 1 (router-vs-quoter): QuoterV2 runs the *same* pool-swap code SwapRouter
+    does, so the quote IS the real router delivery. A quote revert ⇒ the encoded
+    pool/fee path is broken (the swap is the bare source); a quote below
+    amountOutMinimum ⇒ the swap would revert "Too little received".
+
+    Leg 2 (counterparty): settle() pulls each trade's sell tokens through the vault
+    relayer BEFORE the swap. If the order's owner lacks balance/allowance at the
+    sim-block, transferIn reverts first (bare for USDT-class tokens) — and that is
+    a stale/underfunded order, NOT our bug (CoW's own driver would fail it too).
+    """
+    uid = _first_uid(solution)
+    if not sim_block or sim_block <= 0:
+        return DeliveryRow(uid, sim_block, _NO_SIM_BLOCK)
+    block = hex(sim_block)
+    prices = _price_map(solution)
+
+    order_map: dict[str, Any] = {}
+    try:
+        auction = Auction.model_validate(raw_auction)
+        order_map = {o.uid: o for o in auction.orders}
+    except Exception as exc:  # noqa: BLE001 — diagnostic: never crash on one row
+        log.debug("delivery_parse_error", uid=uid, error=str(exc))  # Leg 2 degrades
+
+    worst = _SWAP_CLEAN_USER_OK
+    detail = ""
+
+    def consider(flag: str, det: str) -> None:
+        nonlocal worst, detail
+        if _DELIVERY_RANK[flag] > _DELIVERY_RANK[worst]:
+            worst, detail = flag, det
+
+    # Leg 1 — swap delivery (router-vs-quoter).
+    for cd in _find_swap_interactions(solution):
+        try:
+            sw = _decode_swap(cd)
+        except Exception:  # noqa: BLE001
+            continue
+        if sw is None or sw.kind == "buy":
+            continue
+        try:
+            ok, realised = await _requote(rpc, sw, block)
+        except RuntimeError as exc:
+            log.debug("delivery_requote_infra", uid=uid, error=str(exc))
+            return DeliveryRow(uid, sim_block, _AGED_OUT)
+        if not ok:
+            consider(
+                _SWAP_PATH_REVERTS,
+                f"{sw.token_in[:8]}->{sw.token_out[:8]} fee={sw.fee} pool reverts",
+            )
+        elif realised < sw.amount_out_minimum:
+            consider(_AMOUNT_OUT_MIN_UNMET, f"R={realised} < min={sw.amount_out_minimum}")
+
+    # Leg 2 — counterparty (user) delivery.
+    for tr in solution.get("trades", []) or []:
+        order = order_map.get(str(tr.get("orderUid", "")))
+        if order is None:
+            continue
+        try:
+            executed = int(tr.get("executedAmount"))
+        except (TypeError, ValueError):
+            continue
+        # Amount transferIn pulls from the owner = the order's executed SELL side.
+        if order.kind == "sell":
+            need = executed
+        else:  # buy order: derive the sell-side amount GPv2 pulls (ceil rounding).
+            p_sell = prices.get(order.sell_token.lower())
+            p_buy = prices.get(order.buy_token.lower())
+            need = (
+                _ceil_div(executed * p_buy, p_sell)
+                if p_sell and p_buy
+                else int(order.sell_amount)
+            )
+        token = order.sell_token
+        owner = order.owner
+        try:
+            bal = await _erc20_uint(rpc, token, _balance_calldata(owner), block)
+            alw = await _erc20_uint(
+                rpc, token, _allowance_calldata(owner, GPV2_VAULT_RELAYER), block
+            )
+        except RuntimeError as exc:
+            log.debug("delivery_erc20_infra", uid=uid, error=str(exc))
+            return DeliveryRow(uid, sim_block, _AGED_OUT)
+        if bal is not None and bal < need:
+            consider(_USER_NO_BALANCE, f"bal={bal} < need={need} ({token[:10]})")
+        if alw is not None and alw < need:
+            consider(_USER_NO_ALLOWANCE, f"allow={alw} < need={need} ({token[:10]})")
+
+    return DeliveryRow(uid, sim_block, worst, detail)
+
+
+async def run_delivery(minutes: int, limit: int, strategy: str) -> None:
+    since = datetime.now(UTC) - timedelta(minutes=minutes)
+    print(
+        f"\nBare-revert DELIVERY probe (router-vs-quoter + counterparty)  "
+        f"(last {minutes} min, since {since:%Y-%m-%d %H:%M} UTC) [strategy={strategy}]"
+    )
+
+    Session = get_session_factory()
+    async with Session() as session:
+        q = (
+            select(ShadowSolution.solution, ShadowAuction.raw_auction)
+            .join(ShadowAuction, ShadowSolution.auction_id == ShadowAuction.auction_id)
+            .where(ShadowSolution.strategy == strategy)
+            .where(ShadowSolution.feasible.is_(False))
+            .where(ShadowSolution.revert_reason == BARE_REVERT)
+            .where(ShadowSolution.created_at >= since)
+            .order_by(ShadowSolution.created_at.desc())
+            .limit(limit)
+        )
+        rows = (await session.execute(q)).all()
+
+    print(f"  matched {len(rows)} bare-revert {strategy} solution(s)\n")
+    if not rows:
+        print("  Nothing to probe in window. Widen --minutes or check the strategy.\n")
+        return
+
+    rpc = RpcClient(settings.rpc_arbitrum)
+
+    header = f"  {'uid':<14} {'block':>10}  {'verdict':<22}  detail"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    tally: dict[str, int] = {}
+    for solution, raw_auction in rows:
+        if not isinstance(solution, dict) or not isinstance(raw_auction, dict):
+            tally[_PARSE_ERROR] = tally.get(_PARSE_ERROR, 0) + 1
+            continue
+        sim_block_raw = raw_auction.get("simulationBlock")
+        sim_block = int(sim_block_raw) if isinstance(sim_block_raw, int) else None
+        res = await _analyse_delivery(rpc, solution, raw_auction, sim_block)
+        tally[res.verdict] = tally.get(res.verdict, 0) + 1
+        block_s = str(res.block) if res.block else "-"
+        print(f"  {res.uid:<14} {block_s:>10}  {res.verdict:<22}  {res.detail}")
+
+    print("\n" + "=" * 72)
+    print("Summary")
+    print("=" * 72)
+    total = sum(tally.values())
+    for verdict in sorted(tally, key=lambda k: (-_DELIVERY_RANK.get(k, -99), -tally[k])):
+        n = tally[verdict]
+        pct = 100 * n / total if total else 0.0
+        print(f"  {n:>4}  ({pct:5.1f}%)  {verdict}")
+
+    print(
+        "\n  Decision gate:\n"
+        f"    • {_USER_NO_ALLOWANCE}/{_USER_NO_BALANCE} dominate → NOT our bug:\n"
+        "      stale/underfunded orders; settle()'s transferIn reverts first. CoW's\n"
+        "      own driver would fail these too — exclude from our phantom accounting.\n"
+        f"    • {_SWAP_PATH_REVERTS} dominates → encoder path/fee selection is broken;\n"
+        "      the swap itself is the bare source (pool absent at the encoded block).\n"
+        f"    • {_AMOUNT_OUT_MIN_UNMET} dominates → amountOutMinimum set too high vs\n"
+        "      realised pool output (drift > slippage) → block-aligned quoting lever.\n"
+        f"    • {_SWAP_CLEAN_USER_OK} dominates → both legs pass; the bare revert is\n"
+        "      deeper (signature / deadline / ERC20 return-value quirk) → next lever\n"
+        "      is decoding the trade signature + the settlement's own accounting.\n"
+        "    • Either way: do NOT pitch feas% to CoW — this only identifies the lever.\n"
+    )
+
+
 async def run_requote(
     minutes: int,
     limit: int,
@@ -659,12 +895,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=("offline", "requote"),
+        choices=("offline", "requote", "delivery"),
         default="offline",
         help=(
             "offline (default): reconstruct GPv2 limit/conservation math from stored "
-            "rows, no RPC, full-window. requote: re-quote each swap at the sim-block "
-            "(bounded by the ~100-min non-archive RPC window)."
+            "rows, no RPC, full-window. requote: re-quote each swap at the sim-block. "
+            "delivery: router-vs-quoter swap delivery + counterparty balance/allowance "
+            "check at the sim-block. requote/delivery are bounded by the ~100-min "
+            "non-archive RPC window (use --minutes)."
         ),
     )
     parser.add_argument(
@@ -695,6 +933,10 @@ def main() -> None:
     if args.mode == "offline":
         asyncio.run(
             run_offline(days=args.days, limit=args.limit, strategy=args.strategy)
+        )
+    elif args.mode == "delivery":
+        asyncio.run(
+            run_delivery(minutes=args.minutes, limit=args.limit, strategy=args.strategy)
         )
     else:
         asyncio.run(
