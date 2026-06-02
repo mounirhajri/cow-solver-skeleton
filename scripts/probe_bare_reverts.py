@@ -981,6 +981,117 @@ async def run_quantify(days: int, limit: int, strategy: str) -> None:
     )
 
 
+_GENERIC_REASON = "execution reverted (generic / pre-fix / empty-data)"
+
+
+def _normalise_reason(reason: str | None) -> str:
+    """Group key for a stored revert_reason.
+
+    Strips the generic ``execution reverted`` prefix so the real detail — now
+    decoded from ``err.data`` (f283c27) — becomes the group key (e.g. "STF",
+    "Too little received", "GPv2: invalid signature"). Rows captured before that
+    fix (or genuine empty-data reverts) collapse to a single generic bucket.
+    """
+    if not reason:
+        return "(none)"
+    text = reason.strip()
+    prefix = "execution reverted"
+    if text.lower().startswith(prefix):
+        rest = text[len(prefix):].lstrip(": ").strip()
+        return rest if rest else _GENERIC_REASON
+    return text
+
+
+@dataclass
+class ReasonAgg:
+    reason: str
+    n: int = 0
+    surplus_wei: int = 0
+
+
+async def run_reasons(days: int, limit: int, strategy: str) -> None:
+    """Offline, surplus-weighted tally of stored revert reasons (no RPC).
+
+    Reads the payoff of the err.data decode fix: groups every infeasible solution
+    by its real revert reason and ranks by claimed surplus, so the fundable-revert
+    tail's true cause (deadline / Too little received / signature) is visible
+    instead of the generic "execution reverted". NOT filtered to bare reverts —
+    that filter is exactly what this fix dissolves.
+    """
+    since = datetime.now(UTC) - timedelta(days=days)
+    print(
+        f"\nRevert-reason tally (offline, surplus-weighted)  "
+        f"(last {days} day(s), since {since:%Y-%m-%d %H:%M} UTC) [strategy={strategy}]"
+    )
+
+    Session = get_session_factory()
+    async with Session() as session:
+        q = (
+            select(ShadowSolution.revert_reason, ShadowSolution.our_score_wei)
+            .where(ShadowSolution.strategy == strategy)
+            .where(ShadowSolution.feasible.is_(False))
+            .where(ShadowSolution.created_at >= since)
+            .order_by(ShadowSolution.created_at.desc())
+            .limit(limit)
+        )
+        rows = (await session.execute(q)).all()
+
+    print(f"  matched {len(rows)} infeasible {strategy} solution(s)\n")
+    if not rows:
+        print("  Nothing to probe in window. Widen --days / --limit or check strategy.\n")
+        return
+
+    aggs: dict[str, ReasonAgg] = {}
+    for reason, score_wei in rows:
+        key = _normalise_reason(reason)
+        agg = aggs.get(key)
+        if agg is None:
+            agg = ReasonAgg(reason=key)
+            aggs[key] = agg
+        agg.n += 1
+        agg.surplus_wei += int(score_wei) if score_wei is not None else 0
+
+    total_n = sum(a.n for a in aggs.values())
+    total_surplus = sum(a.surplus_wei for a in aggs.values())
+    ordered = sorted(aggs.values(), key=lambda a: (-a.surplus_wei, -a.n))
+
+    print(f"  {'reason':<46} {'n':>4} {'n%':>6} {'surplus_eth':>14} {'sur%':>6}")
+    print("  " + "-" * 80)
+    for a in ordered:
+        n_pct = 100 * a.n / total_n if total_n else 0.0
+        s_pct = 100 * a.surplus_wei / total_surplus if total_surplus else 0.0
+        label = a.reason if len(a.reason) <= 45 else a.reason[:44] + "…"
+        print(
+            f"  {label:<46} {a.n:>4} {n_pct:>5.1f}% "
+            f"{a.surplus_wei / 1e18:>14.6f} {s_pct:>5.1f}%"
+        )
+
+    generic = aggs.get(_GENERIC_REASON)
+    n_generic = generic.n if generic else 0
+    n_decoded = total_n - n_generic
+    print("\n" + "=" * 72)
+    print("Summary")
+    print("=" * 72)
+    print(f"  {total_n} infeasible solution(s), {len(aggs)} distinct reason(s)")
+    print(
+        f"  decoded reasons: {n_decoded}/{total_n}  ·  still-generic: {n_generic}/{total_n}\n"
+        f"  total claimed surplus: {total_surplus / 1e18:.6f} ETH"
+    )
+    if n_decoded == 0:
+        print(
+            "\n  All rows are still generic → the err.data decode fix (f283c27) has not\n"
+            "  yet captured fresh reverts in this window. Re-run after solutions are\n"
+            "  validated post-deploy (going-forward only; no backfill)."
+        )
+    else:
+        print(
+            "\n  Decoded reasons present → the fundable-revert tail's true cause is now\n"
+            "  visible. Read the top surplus rows: 'Too little received' → router-vs-\n"
+            "  quoter delivery gap; 'Transaction too old' → deadline; signature/STF →\n"
+            "  encoding. Do NOT pitch feas% to CoW — this only identifies the lever.\n"
+        )
+
+
 async def run_requote(
     minutes: int,
     limit: int,
@@ -1083,7 +1194,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=("offline", "requote", "delivery", "quantify"),
+        choices=("offline", "requote", "delivery", "quantify", "reasons"),
         default="offline",
         help=(
             "offline (default): reconstruct GPv2 limit/conservation math from stored "
@@ -1092,8 +1203,9 @@ def main() -> None:
             "check at the sim-block (use --minutes). quantify: aggregate the bare-revert "
             "tail by DISTINCT order over --days — recurrence, claimed-surplus "
             "concentration, ghost-set cross-ref, and a per-distinct-order fundability "
-            "spot-check. requote/delivery are bounded by the ~100-min non-archive RPC "
-            "window."
+            "spot-check. reasons: offline, surplus-weighted tally of the decoded "
+            "revert_reason strings over --days (reads the err.data-decode payoff). "
+            "requote/delivery are bounded by the ~100-min non-archive RPC window."
         ),
     )
     parser.add_argument(
@@ -1128,6 +1240,10 @@ def main() -> None:
     elif args.mode == "quantify":
         asyncio.run(
             run_quantify(days=args.days, limit=args.limit, strategy=args.strategy)
+        )
+    elif args.mode == "reasons":
+        asyncio.run(
+            run_reasons(days=args.days, limit=args.limit, strategy=args.strategy)
         )
     elif args.mode == "delivery":
         asyncio.run(
