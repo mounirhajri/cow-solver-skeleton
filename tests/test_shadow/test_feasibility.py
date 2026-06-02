@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.shadow.feasibility import validate_solution
+from src.shadow.feasibility import FeasibilityGate, validate_solution
 
 _SELL = "0x1111111111111111111111111111111111111111"
 _BUY = "0x2222222222222222222222222222222222222222"
@@ -165,3 +165,46 @@ async def test_multi_trade_resolves_each_order() -> None:
     assert v.feasible is True
     assert cache.get.await_count == 2
     rpc.eth_call_capture.assert_awaited_once()
+
+
+# ── FeasibilityGate: the hard pre-submission wrapper ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_gate_check_forwards_deps_and_latest_block() -> None:
+    """The gate threads its stored deps + block='latest' into validate_solution."""
+    cache, api, rpc = _deps(rpc_result=(True, "0x"))
+    gate = FeasibilityGate(
+        cache=cache, api=api, rpc=rpc,
+        settlement_addr="0xset", solver_addr="0xslv",
+    )
+    v = await gate.check(_SOLUTION)
+    assert v.feasible is True
+    assert rpc.eth_call_capture.await_args.kwargs["block"] == "latest"
+    assert rpc.eth_call_capture.await_args.kwargs["from_addr"] == "0xslv"
+    assert rpc.eth_call_capture.await_args.kwargs["to"] == "0xset"
+
+
+@pytest.mark.asyncio
+async def test_gate_check_propagates_phantom_verdict() -> None:
+    cache, api, rpc = _deps(rpc_result=(False, "execution reverted: STF"))
+    gate = FeasibilityGate(
+        cache=cache, api=api, rpc=rpc,
+        settlement_addr="0xset", solver_addr="0xslv",
+    )
+    v = await gate.check(_SOLUTION)
+    assert v.feasible is False
+    assert "STF" in v.reason
+
+
+@pytest.mark.asyncio
+async def test_gate_check_propagates_unknown_verdict() -> None:
+    """Infra failure → UNKNOWN propagates unchanged (caller treats as no-submit)."""
+    cache, api, rpc = _deps(rpc_result=(True, "0x"))
+    rpc.eth_call_capture = AsyncMock(side_effect=TimeoutError("rpc down"))
+    gate = FeasibilityGate(
+        cache=cache, api=api, rpc=rpc,
+        settlement_addr="0xset", solver_addr="0xslv",
+    )
+    v = await gate.check(_SOLUTION)
+    assert v.feasible is None

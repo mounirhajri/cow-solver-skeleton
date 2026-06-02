@@ -428,3 +428,154 @@ async def test_composer_receives_cip14_surplus_estimate(auction: Auction) -> Non
     assert by_strategy["router-v2"] > by_strategy["cow-matching-bipartite"], (
         "router-v2 clears at higher price → must rank above bipartite"
     )
+
+
+# ── Hard feasibility gate (pre-submission safety) ───────────────────────────
+
+
+def _phantom_uid() -> str:
+    return "0x" + "c" * 112
+
+
+async def test_feasibility_gate_rejects_phantom_falls_through(
+    auction: Auction,
+) -> None:
+    """A phantom-verdict solution must be rejected and the next candidate tried.
+
+    The gate guarantees we never SUBMIT a reverting solution: the first
+    candidate simulates as phantom → falls through to the second feasible one.
+    """
+    from src.shadow.feasibility import Verdict
+
+    sol_first = _solution()
+    sol_second = _solution()
+    sol_second.trades = [
+        Trade(kind="fulfillment", order_uid=_phantom_uid(), executed_amount=10**18)
+    ]
+    s1 = AsyncMock(name="s1")
+    s1.name = "s1"
+    s1.solve.return_value = sol_first
+    s2 = AsyncMock(name="s2")
+    s2.name = "s2"
+    s2.solve.return_value = sol_second
+
+    calls = {"n": 0}
+
+    class FakeGate:
+        async def check(self, solution_dict: dict) -> Verdict:  # noqa: ANN101
+            calls["n"] += 1
+            uid = solution_dict["trades"][0]["orderUid"]
+            if uid == _phantom_uid():
+                return Verdict(True, None)
+            return Verdict(False, "phantom: STF")
+
+    orch = SolverOrchestrator(
+        strategies=[s1, s2],
+        per_strategy_timeout=1.0,
+        run_all_strategies=True,
+        compose=False,
+        feasibility_gate=FakeGate(),
+    )
+    result, attempts = await orch.solve(auction)
+
+    assert result is sol_second
+    assert calls["n"] == 2  # both candidates gated
+    rejected = [a for a in attempts if a.strategy == "feasibility-rejected"]
+    assert len(rejected) == 1
+    assert "STF" in (rejected[0].error or "")
+
+
+async def test_feasibility_gate_rejects_unknown_verdict(auction: Auction) -> None:
+    """UNKNOWN (None) is treated as no-submit: a NoSolution is always safe."""
+    from src.shadow.feasibility import Verdict
+
+    sol = _solution()
+    s1 = AsyncMock(name="s1")
+    s1.name = "s1"
+    s1.solve.return_value = sol
+
+    class FakeGate:
+        async def check(self, solution_dict: dict) -> Verdict:  # noqa: ANN101, ARG002
+            return Verdict(None, "infra: rpc down")
+
+    orch = SolverOrchestrator(
+        strategies=[s1],
+        per_strategy_timeout=1.0,
+        compose=False,
+        feasibility_gate=FakeGate(),
+    )
+    result, attempts = await orch.solve(auction)
+
+    assert isinstance(result, NoSolution)
+    assert any(a.strategy == "feasibility-rejected" for a in attempts)
+
+
+async def test_feasibility_gate_fails_closed_on_error(auction: Auction) -> None:
+    """A gate exception must FAIL CLOSED (never submit), unlike EBBO's fail-open.
+
+    The whole point of the gate is safety: if we cannot prove feasibility, we
+    must not submit. An RPC blip → NoSolution, not a possible on-chain revert.
+    """
+    sol = _solution()
+    s1 = AsyncMock(name="s1")
+    s1.name = "s1"
+    s1.solve.return_value = sol
+
+    class FakeGate:
+        async def check(self, solution_dict: dict) -> object:  # noqa: ANN101, ARG002
+            raise RuntimeError("boom")
+
+    orch = SolverOrchestrator(
+        strategies=[s1],
+        per_strategy_timeout=1.0,
+        compose=False,
+        feasibility_gate=FakeGate(),
+    )
+    result, _attempts = await orch.solve(auction)
+
+    assert isinstance(result, NoSolution)
+
+
+async def test_feasibility_gate_times_out_fails_closed(auction: Auction) -> None:
+    """A gate slower than its budget must FAIL CLOSED (reject), not hang/submit."""
+    sol = _solution()
+    s1 = AsyncMock(name="s1")
+    s1.name = "s1"
+    s1.solve.return_value = sol
+
+    class SlowGate:
+        async def check(self, solution_dict: dict) -> object:  # noqa: ANN101, ARG002
+            await asyncio.sleep(1.0)  # far longer than the 0.05s budget
+            raise AssertionError("should have been cancelled by the timeout")
+
+    orch = SolverOrchestrator(
+        strategies=[s1],
+        per_strategy_timeout=1.0,
+        compose=False,
+        feasibility_gate=SlowGate(),
+        feasibility_gate_timeout=0.05,
+    )
+    result, attempts = await orch.solve(auction)
+
+    assert isinstance(result, NoSolution)
+    rejected = [a for a in attempts if a.strategy == "feasibility-rejected"]
+    assert len(rejected) == 1
+    assert rejected[0].error == "gate timeout"
+
+
+async def test_feasibility_gate_disabled_passes_through(auction: Auction) -> None:
+    """No gate injected → behaviour unchanged (solution returned as before)."""
+    sol = _solution()
+    s1 = AsyncMock(name="s1")
+    s1.name = "s1"
+    s1.solve.return_value = sol
+
+    orch = SolverOrchestrator(
+        strategies=[s1],
+        per_strategy_timeout=1.0,
+        compose=False,
+        feasibility_gate=None,
+    )
+    result, _attempts = await orch.solve(auction)
+
+    assert result is sol

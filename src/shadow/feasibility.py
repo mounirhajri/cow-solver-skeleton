@@ -32,6 +32,41 @@ class Verdict:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class FeasibilityGate:
+    """Hard pre-submission feasibility check, bound to its RPC/API deps.
+
+    Wraps :func:`validate_solution` with the long-lived dependencies the
+    orchestrator already has on hand (order cache, CoW orderbook client, RPC
+    client, contract addresses) so the hot path can ask a single question:
+    "would this exact solution clear on-chain right now?".
+
+    Always simulates against ``latest`` — for a live submission the only state
+    that matters is the block we are about to settle into. The orchestrator
+    submits a solution ONLY on a ``True`` verdict; ``False`` (phantom) and
+    ``None`` (UNKNOWN/infra) both mean "do not submit", because a NoSolution is
+    always safe whereas winning with a revert gets the solver slashed.
+    """
+
+    cache: Any
+    api: Any
+    rpc: Any
+    settlement_addr: str
+    solver_addr: str
+
+    async def check(self, solution: dict[str, Any]) -> Verdict:
+        """Validate one solution dict. Never raises (validate_solution swallows)."""
+        return await validate_solution(
+            solution,
+            cache=self.cache,
+            api=self.api,
+            rpc=self.rpc,
+            settlement_addr=self.settlement_addr,
+            solver_addr=self.solver_addr,
+            block="latest",
+        )
+
+
 def _to_int(v: Any, default: int = 0) -> int:
     try:
         return int(v)

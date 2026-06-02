@@ -42,6 +42,8 @@ class SolverOrchestrator:
         ebbo_multicall: object = None,
         ebbo_intermediates: list[str] | None = None,
         ebbo_tolerance_bps: int = DEFAULT_TOLERANCE_BPS,
+        feasibility_gate: object = None,
+        feasibility_gate_timeout: float = 4.0,
     ) -> None:
         if not strategies:
             raise ValueError("at least one strategy required")
@@ -49,6 +51,16 @@ class SolverOrchestrator:
         self._timeout = per_strategy_timeout
         self._run_all = run_all_strategies
         self._compose = compose
+        # Hard pre-submission feasibility gate (launch safety). When set, the
+        # FINAL candidate is re-simulated as a real settle() against latest and
+        # only RETURNED on a True verdict; a phantom (False), UNKNOWN (None), or
+        # any gate error falls through to the next candidate or NoSolution.
+        # This FAILS CLOSED — the opposite of EBBO's fail-open — because the
+        # gate's only job is to guarantee we never submit a reverting solution.
+        # None disables it (tests + shadow-only deployments). See
+        # src.shadow.feasibility.FeasibilityGate.
+        self._feasibility_gate = feasibility_gate
+        self._feasibility_gate_timeout = feasibility_gate_timeout
         # EBBO pre-submission validator.  None for ebbo_multicall disables the
         # check — used in tests and in the public-clone path where multicall
         # plumbing might not be wired up.  See src/solver/ebbo.py for the
@@ -231,8 +243,10 @@ class SolverOrchestrator:
                     ))
                     final = await self._ebbo_validate(composed, auction, attempts)
                     if final is not None:
+                        final = await self._feasibility_validate(final, auction, attempts)
+                    if final is not None:
                         return final, attempts
-                    # EBBO violated → drop composed, try first-winner fallback
+                    # EBBO/feasibility rejected → drop composed, try first-winner
             except ImportError:
                 pass  # edge not present — fall through to first-winner
 
@@ -243,6 +257,8 @@ class SolverOrchestrator:
         # second candidate that WOULD pass never gets a chance.
         for _name, candidate in composable_solutions:
             final = await self._ebbo_validate(candidate, auction, attempts)
+            if final is not None:
+                final = await self._feasibility_validate(final, auction, attempts)
             if final is not None:
                 return final, attempts
         return NoSolution(), attempts
@@ -306,6 +322,80 @@ class SolverOrchestrator:
             ))
             return None
         return solution
+
+    async def _feasibility_validate(
+        self,
+        solution: Solution,
+        auction: Auction,
+        attempts: list[AttemptRecord],
+    ) -> Solution | None:
+        """Hard pre-submission gate: only let provably-feasible solutions ship.
+
+        Re-simulates the candidate as a real GPv2Settlement.settle() against
+        latest (the block we would settle INTO — note this differs from the
+        post-hoc persist.py validation, which judges against the auction's
+        simulationBlock; the two reject-reason populations are therefore not
+        directly comparable). Returns the solution ONLY on a True verdict. A
+        phantom (False), UNKNOWN (None), a timeout, or any error returns None →
+        caller falls through to the next candidate or NoSolution.
+
+        FAILS CLOSED on error, unlike ``_ebbo_validate``: EBBO is a best-effort
+        safety net that must never deny revenue, but THIS gate's entire purpose
+        is to guarantee we never submit a reverting solution. When we cannot
+        prove feasibility, not submitting (NoSolution) is always the safe move —
+        winning the auction with an on-chain revert gets the solver slashed.
+
+        Records a ``feasibility-rejected`` AttemptRecord on rejection so shadow
+        data measures how often the gate fires (and on what reason).
+        """
+        if self._feasibility_gate is None:
+            return solution
+
+        reason: str | None
+        try:
+            # Dedicated budget: the gate runs after the strategy loop, so bound
+            # it so a slow settle-sim can't eat the outer solve deadline. A
+            # timeout FAILS CLOSED (rejection) — never submits the unproven.
+            async with asyncio.timeout(self._feasibility_gate_timeout):
+                verdict = await self._feasibility_gate.check(  # type: ignore[attr-defined]
+                    solution.model_dump(mode="json", by_alias=True)
+                )
+            feasible = verdict.feasible
+            reason = verdict.reason
+        except TimeoutError:
+            log.warning(
+                "feasibility_gate_timeout",
+                auction_id=auction.id,
+                timeout_s=self._feasibility_gate_timeout,
+            )
+            feasible = False
+            reason = "gate timeout"
+        except Exception as exc:  # noqa: BLE001
+            # Fail CLOSED: an error means we could not prove feasibility.
+            log.warning(
+                "feasibility_gate_error", auction_id=auction.id, error=str(exc)
+            )
+            feasible = False
+            reason = f"gate error: {exc}"
+
+        if feasible is True:
+            log.info("feasibility_gate_passed", auction_id=auction.id)
+            return solution
+
+        log.warning(
+            "feasibility_gate_rejected",
+            auction_id=auction.id,
+            verdict="phantom" if feasible is False else "unknown",
+            reason=(reason or "")[:200],
+        )
+        attempts.append(AttemptRecord(
+            strategy="feasibility-rejected",
+            status="rejected",
+            latency_ms=None,
+            solution=solution.model_dump(mode="json", by_alias=True),
+            error=reason,
+        ))
+        return None
 
 
 def load_default_strategies() -> list[SolverStrategy]:
@@ -452,13 +542,54 @@ def load_default_orchestrator() -> SolverOrchestrator:
     strategies = _load_default_strategies_with_multicall(multicall)
 
     ebbo_multicall = multicall if settings.ebbo_enabled else None
+
+    # Hard pre-submission feasibility gate. Off by default (shadow-only); flip
+    # settings.feasibility_gate_enabled at live launch so we never SUBMIT a
+    # reverting solution. Shares the orchestrator's RpcClient (no extra
+    # connections). Construction is best-effort: a missing Redis/import must
+    # not break the solver — it just degrades to the ungated path (same as a
+    # shadow deployment), so a gate-construction failure can never deny output.
+    feasibility_gate = _build_feasibility_gate(rpc) if settings.feasibility_gate_enabled else None
+
     return SolverOrchestrator(
         strategies=strategies,
         per_strategy_timeout=settings.solve_timeout_seconds / max(1, len(strategies)),
         ebbo_multicall=ebbo_multicall,
         ebbo_intermediates=settings.router_intermediate_tokens,
         ebbo_tolerance_bps=settings.ebbo_tolerance_bps,
+        feasibility_gate=feasibility_gate,
+        feasibility_gate_timeout=settings.feasibility_gate_timeout_seconds,
     )
+
+
+def _build_feasibility_gate(rpc: Any) -> Any:
+    """Construct the FeasibilityGate, sharing the orchestrator's RpcClient.
+
+    Returns None on any construction failure (missing Redis, edge-less clone,
+    import error) so the solver degrades to the ungated path rather than
+    crashing — a gate that cannot be built must never deny solver output.
+    """
+    from src.config import settings
+    try:
+        import redis.asyncio as aioredis
+
+        from src.shadow.cow_api import CowApiClient
+        from src.shadow.feasibility import FeasibilityGate
+        from src.shadow.order_cache import OrderCache
+
+        redis_client = aioredis.Redis.from_url(settings.redis_url, decode_responses=False)
+        gate = FeasibilityGate(
+            cache=OrderCache(redis=redis_client, key_prefix=settings.redis_key_prefix),
+            api=CowApiClient(network="arbitrum_one"),
+            rpc=rpc,
+            settlement_addr=settings.gpv2_settlement,
+            solver_addr=settings.feasibility_solver_address,
+        )
+        log.info("feasibility_gate_enabled")
+        return gate
+    except Exception as exc:  # noqa: BLE001
+        log.warning("feasibility_gate_build_failed", error=str(exc))
+        return None
 
 
 def _load_default_strategies_with_multicall(multicall: Any) -> list[SolverStrategy]:

@@ -154,6 +154,21 @@ class Settings(BaseSettings):
     # empirically verified allowlisted via scripts/smoke_settle_decode (it
     # submitted a real AMM-only settlement that our encoder byte-matched).
     feasibility_solver_address: str = "0x4CdbA844CEB949567eA18b9EF185515fA626c69D"
+    # Hard pre-submission gate (Phase 0a launch safety). When true, the
+    # orchestrator simulates the FINAL candidate's settle() against latest and
+    # only RETURNS it if the simulation passes — a phantom or UNKNOWN verdict
+    # falls through to the next candidate or NoSolution. This guarantees we
+    # never SUBMIT a reverting solution to CoW (a NoSolution is always safe; a
+    # winning revert gets the solver slashed). Default False so shadow-mode
+    # behaviour is unchanged until we flip it on at live launch. Distinct from
+    # feasibility_enabled, which only LABELS solutions post-hoc in persist.py.
+    feasibility_gate_enabled: bool = False
+    # Dedicated time budget for the gate's settle-sim, separate from the
+    # per-strategy budget. The gate runs AFTER the strategy loop, so without
+    # its own bound a slow RPC would eat into the outer solve deadline and
+    # self-deny revenue (a cancelled gate → NoSolution even for a feasible
+    # solution). On timeout the gate FAILS CLOSED (rejects) — safe by design.
+    feasibility_gate_timeout_seconds: float = 4.0
     v3_swap_router: str = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
     v2_routers: list[str] = Field(
         default_factory=lambda: [
