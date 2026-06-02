@@ -60,7 +60,7 @@ from src.encoder.v3_path import EXACT_INPUT_SELECTOR, EXACT_OUTPUT_SELECTOR
 from src.log import get_logger
 from src.models.auction import Auction
 from src.persistence.db import get_session_factory
-from src.persistence.models import ShadowAuction, ShadowSolution
+from src.persistence.models import GhostOrder, ShadowAuction, ShadowSolution
 from src.routing.amm_v3 import QUOTER_V2_ADDRESS
 from src.routing.rpc import RpcClient
 from src.routing.v3_batched import (
@@ -793,6 +793,194 @@ async def run_delivery(minutes: int, limit: int, strategy: str) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Quantify mode: size the un-fundable-order tail (distinct orders + surplus
+# concentration + ghost-set cross-ref + on-chain fundability spot-check)
+# ---------------------------------------------------------------------------
+
+
+def _short_uid(uid: str) -> str:
+    return uid[:10] + "…" if len(uid) > 11 else uid
+
+
+def _transfer_in_need(order: Any, executed: int, prices: dict[str, int]) -> int:
+    """Sell-side amount settle()'s transferIn pulls from the order owner."""
+    if order.kind == "sell":
+        return executed
+    p_sell = prices.get(order.sell_token.lower())
+    p_buy = prices.get(order.buy_token.lower())
+    return _ceil_div(executed * p_buy, p_sell) if p_sell and p_buy else int(order.sell_amount)
+
+
+@dataclass
+class OrderAgg:
+    uid: str
+    short: str
+    n_solutions: int = 0
+    total_score_wei: int = 0  # summed claimed CIP-14 surplus across recurrences
+    sell_token: str = ""
+    owner: str = ""
+    latest_sim_block: int | None = None
+    need: int = 0
+    is_ghost: bool = False
+    ghost_seen: int = 0
+    fundable: str = "unchecked"  # unfundable | fundable | aged_out | no_block
+
+
+async def run_quantify(days: int, limit: int, strategy: str) -> None:
+    since = datetime.now(UTC) - timedelta(days=days)
+    print(
+        f"\nBare-revert QUANTIFY probe (distinct un-fundable orders + surplus)  "
+        f"(last {days} day(s), since {since:%Y-%m-%d %H:%M} UTC) [strategy={strategy}]"
+    )
+
+    Session = get_session_factory()
+    async with Session() as session:
+        q = (
+            select(
+                ShadowSolution.solution,
+                ShadowSolution.our_score_wei,
+                ShadowAuction.raw_auction,
+            )
+            .join(ShadowAuction, ShadowSolution.auction_id == ShadowAuction.auction_id)
+            .where(ShadowSolution.strategy == strategy)
+            .where(ShadowSolution.feasible.is_(False))
+            .where(ShadowSolution.revert_reason == BARE_REVERT)
+            .where(ShadowSolution.created_at >= since)
+            .order_by(ShadowSolution.created_at.desc())
+            .limit(limit)
+        )
+        rows = (await session.execute(q)).all()
+
+    print(f"  matched {len(rows)} bare-revert {strategy} solution(s)\n")
+    if not rows:
+        print("  Nothing to probe in window. Widen --days / --limit or check strategy.\n")
+        return
+
+    aggs: dict[str, OrderAgg] = {}
+    n_solutions_total = 0
+    for solution, score_wei, raw_auction in rows:
+        if not isinstance(solution, dict) or not isinstance(raw_auction, dict):
+            continue
+        trades = solution.get("trades") or []
+        if not trades:
+            continue
+        uid = str(trades[0].get("orderUid", ""))
+        if not uid:
+            continue
+        n_solutions_total += 1
+        agg = aggs.get(uid)
+        if agg is None:
+            agg = OrderAgg(uid=uid, short=_short_uid(uid))
+            aggs[uid] = agg
+        agg.n_solutions += 1
+        agg.total_score_wei += int(score_wei) if score_wei is not None else 0
+        if agg.sell_token == "":  # enrich once, from the most-recent row (desc order)
+            try:
+                auction = Auction.model_validate(raw_auction)
+                order = {o.uid: o for o in auction.orders}.get(uid)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("quantify_parse_error", uid=uid, error=str(exc))
+                order = None
+            if order is not None:
+                try:
+                    executed = int(trades[0].get("executedAmount"))
+                except (TypeError, ValueError):
+                    executed = 0
+                agg.sell_token = order.sell_token
+                agg.owner = order.owner
+                agg.need = _transfer_in_need(order, executed, _price_map(solution))
+                sb = raw_auction.get("simulationBlock")
+                agg.latest_sim_block = int(sb) if isinstance(sb, int) else None
+
+    # Cross-reference the existing ghost-order set (refresh_ghost_set.py) — these
+    # are the orders bipartite ALREADY filters but router-v2 does not consult.
+    uids = list(aggs)
+    if uids:
+        async with Session() as session:
+            gq = select(GhostOrder.uid, GhostOrder.n_auctions_seen).where(
+                GhostOrder.uid.in_(uids)
+            )
+            for guid, seen in (await session.execute(gq)).all():
+                a = aggs.get(str(guid))
+                if a is not None:
+                    a.is_ghost, a.ghost_seen = True, int(seen)
+
+    # On-chain fundability spot-check: ONE balanceOf+allowance per DISTINCT order
+    # (cheap — the tail is concentrated). Only decidable inside the RPC window.
+    rpc = RpcClient(settings.rpc_arbitrum)
+    for a in aggs.values():
+        if a.latest_sim_block is None or a.sell_token == "":
+            a.fundable = "no_block"
+            continue
+        block = hex(a.latest_sim_block)
+        try:
+            bal = await _erc20_uint(rpc, a.sell_token, _balance_calldata(a.owner), block)
+            alw = await _erc20_uint(
+                rpc, a.sell_token, _allowance_calldata(a.owner, GPV2_VAULT_RELAYER), block
+            )
+        except RuntimeError:
+            a.fundable = "aged_out"
+            continue
+        short = (bal is not None and bal < a.need) or (alw is not None and alw < a.need)
+        a.fundable = "unfundable" if short else "fundable"
+
+    ordered = sorted(aggs.values(), key=lambda a: (-a.n_solutions, -a.total_score_wei))
+    total_score = sum(a.total_score_wei for a in aggs.values())
+
+    print(
+        f"  {'order':<14} {'n_sol':>5} {'sol%':>6} {'claimed_surplus_eth':>20} "
+        f"{'ghost(seen)':>12}  fundability"
+    )
+    print("  " + "-" * 78)
+    for a in ordered:
+        sol_pct = 100 * a.n_solutions / n_solutions_total if n_solutions_total else 0.0
+        eth = a.total_score_wei / 1e18
+        ghost_s = f"yes({a.ghost_seen})" if a.is_ghost else "no"
+        print(
+            f"  {a.short:<14} {a.n_solutions:>5} {sol_pct:>5.1f}% {eth:>20.6f} "
+            f"{ghost_s:>12}  {a.fundable}"
+        )
+
+    print("\n" + "=" * 72)
+    print("Summary")
+    print("=" * 72)
+    n_distinct = len(aggs)
+    print(f"  {n_solutions_total} solution(s) ← {n_distinct} DISTINCT order(s)")
+
+    # Concentration: share of solutions + claimed surplus held by the top-k orders.
+    for k in (1, 3, 5):
+        top = ordered[:k]
+        if not top:
+            continue
+        top_sol = sum(a.n_solutions for a in top)
+        top_sur = sum(a.total_score_wei for a in top)
+        sol_share = 100 * top_sol / n_solutions_total if n_solutions_total else 0.0
+        sur_share = 100 * top_sur / total_score if total_score else 0.0
+        print(
+            f"  top-{k:<2} order(s): {sol_share:5.1f}% of solutions, "
+            f"{sur_share:5.1f}% of claimed surplus"
+        )
+
+    # Ghost-set + fundability splits over DISTINCT orders.
+    n_ghost = sum(1 for a in aggs.values() if a.is_ghost)
+    print(
+        f"\n  already in ghost set: {n_ghost}/{n_distinct} distinct order(s) "
+        "(bipartite filters these; router-v2 does NOT consult the set)"
+    )
+    fund_tally: dict[str, int] = {}
+    for a in aggs.values():
+        fund_tally[a.fundable] = fund_tally.get(a.fundable, 0) + 1
+    parts = "  ".join(f"{k}={v}" for k, v in sorted(fund_tally.items()))
+    print(f"  fundability (distinct, RPC-window only): {parts}")
+    print(
+        f"  total claimed surplus across the bare-revert tail: {total_score / 1e18:.6f} ETH\n"
+        "  → if the un-fundable distinct orders concentrate the surplus, a solve-time\n"
+        "    deliverability pre-filter (reuse the ghost set in router-v2) removes the\n"
+        "    tail truthfully. Do NOT pitch feas% to CoW — this only sizes the lever.\n"
+    )
+
+
 async def run_requote(
     minutes: int,
     limit: int,
@@ -895,14 +1083,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=("offline", "requote", "delivery"),
+        choices=("offline", "requote", "delivery", "quantify"),
         default="offline",
         help=(
             "offline (default): reconstruct GPv2 limit/conservation math from stored "
             "rows, no RPC, full-window. requote: re-quote each swap at the sim-block. "
             "delivery: router-vs-quoter swap delivery + counterparty balance/allowance "
-            "check at the sim-block. requote/delivery are bounded by the ~100-min "
-            "non-archive RPC window (use --minutes)."
+            "check at the sim-block (use --minutes). quantify: aggregate the bare-revert "
+            "tail by DISTINCT order over --days — recurrence, claimed-surplus "
+            "concentration, ghost-set cross-ref, and a per-distinct-order fundability "
+            "spot-check. requote/delivery are bounded by the ~100-min non-archive RPC "
+            "window."
         ),
     )
     parser.add_argument(
@@ -933,6 +1124,10 @@ def main() -> None:
     if args.mode == "offline":
         asyncio.run(
             run_offline(days=args.days, limit=args.limit, strategy=args.strategy)
+        )
+    elif args.mode == "quantify":
+        asyncio.run(
+            run_quantify(days=args.days, limit=args.limit, strategy=args.strategy)
         )
     elif args.mode == "delivery":
         asyncio.run(
