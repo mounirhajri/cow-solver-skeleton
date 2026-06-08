@@ -209,19 +209,17 @@ async def test_batched_v3_quote_revert_returns_zero_amount() -> None:
 
 
 @pytest.mark.asyncio
-async def test_batched_v3_quote_batches_all_in_one_aggregate_call() -> None:
-    """One Multicall3.aggregate() — not N of them."""
+async def test_batched_v3_quote_chunks_to_stay_under_gas_cap() -> None:
+    """Paths are batched (few round-trips) but chunked to stay under the node
+    eth_call gas cap — 12 paths at chunk=8 → 2 aggregate calls, not 12."""
     rpc = AsyncMock()
     mc = Multicall3(rpc)
     ok_data = encode(["uint256", "uint160", "uint32", "uint256"], [1, 0, 0, 0])
 
-    call_count = 0
-    last_call_size = 0
+    chunk_sizes: list[int] = []
 
     async def fake_aggregate(calls: list[Call]) -> list[CallResult]:
-        nonlocal call_count, last_call_size
-        call_count += 1
-        last_call_size = len(calls)
+        chunk_sizes.append(len(calls))
         return [CallResult(success=True, return_data=ok_data) for _ in calls]
 
     mc.aggregate = fake_aggregate  # type: ignore[assignment]
@@ -238,9 +236,98 @@ async def test_batched_v3_quote_batches_all_in_one_aggregate_call() -> None:
         for fee in (100, 500, 3000, 10000)
     ]
     quotes = await batched_v3_quote(mc, paths)
-    assert call_count == 1
-    assert last_call_size == 12
+    assert chunk_sizes == [8, 4]  # _MAX_CALLS_PER_BATCH=8
     assert len(quotes) == 12
+
+
+@pytest.mark.asyncio
+async def test_batched_v3_quote_bisects_on_out_of_gas() -> None:
+    """A chunk that overflows the node gas cap is recursively bisected so the
+    whole quote pass doesn't abort — every quote still resolves once the
+    sub-batch is small enough to fit."""
+    rpc = AsyncMock()
+    mc = Multicall3(rpc)
+    ok_data = encode(["uint256", "uint160", "uint32", "uint256"], [42, 0, 0, 0])
+
+    async def fake_aggregate(calls: list[Call]) -> list[CallResult]:
+        # Simulate the provider gas cap: any batch > 2 reverts the whole call.
+        if len(calls) > 2:
+            raise RuntimeError("RPC error -32000: out of gas")
+        return [CallResult(success=True, return_data=ok_data) for _ in calls]
+
+    mc.aggregate = fake_aggregate  # type: ignore[assignment]
+
+    paths = [
+        V3Path(
+            order_uid=f"o{i}",
+            token_in="0x" + "11" * 20,
+            token_out="0x" + "22" * 20,
+            amount_in=10**18,
+            fee_tier_in=500,
+        )
+        for i in range(5)
+    ]
+    quotes = await batched_v3_quote(mc, paths)
+    assert len(quotes) == 5
+    assert all(q.amount_out == 42 for q in quotes)  # none lost to the overflow
+
+
+@pytest.mark.asyncio
+async def test_batched_v3_quote_drops_only_the_overcap_quote() -> None:
+    """A single quote that overflows even alone is dropped (amount_out 0)
+    rather than aborting the batch; its siblings still resolve."""
+    rpc = AsyncMock()
+    mc = Multicall3(rpc)
+    ok_data = encode(["uint256", "uint160", "uint32", "uint256"], [99, 0, 0, 0])
+    poison_uid = "o-poison"
+
+    async def fake_aggregate(calls: list[Call]) -> list[CallResult]:
+        # The poison path overflows even as a singleton; mixing it into any
+        # multi-call batch overflows the whole batch.
+        if len(calls) > 1:
+            raise RuntimeError("RPC error -32000: out of gas")
+        # Singleton: the poison call still overflows; others succeed.
+        if calls[0].call_data == _poison_calldata:
+            raise RuntimeError("RPC error -32000: out of gas")
+        return [CallResult(success=True, return_data=ok_data)]
+
+    paths = [
+        V3Path(order_uid="o0", token_in="0x" + "11" * 20, token_out="0x" + "22" * 20,
+               amount_in=10**18, fee_tier_in=500),
+        V3Path(order_uid=poison_uid, token_in="0x" + "33" * 20, token_out="0x" + "44" * 20,
+               amount_in=10**18, fee_tier_in=500),
+        V3Path(order_uid="o2", token_in="0x" + "55" * 20, token_out="0x" + "66" * 20,
+               amount_in=10**18, fee_tier_in=500),
+    ]
+    _poison_calldata = _build_call(paths[1], "0x" + "9" * 40).call_data
+    mc.aggregate = fake_aggregate  # type: ignore[assignment]
+
+    quotes = await batched_v3_quote(mc, paths, quoter_address="0x" + "9" * 40)
+    assert len(quotes) == 3
+    by_uid = {q.path.order_uid: q.amount_out for q in quotes}
+    assert by_uid["o0"] == 99
+    assert by_uid["o2"] == 99
+    assert by_uid[poison_uid] == 0  # dropped, not crashed
+
+
+@pytest.mark.asyncio
+async def test_batched_v3_quote_reraises_non_gas_error() -> None:
+    """A non-gas RPC error must propagate (not fan out into N retries that
+    would multiply load on a real outage)."""
+    rpc = AsyncMock()
+    mc = Multicall3(rpc)
+
+    async def fake_aggregate(_calls: list[Call]) -> list[CallResult]:
+        raise RuntimeError("RPC error 500: internal server error")
+
+    mc.aggregate = fake_aggregate  # type: ignore[assignment]
+    paths = [
+        V3Path(order_uid=f"o{i}", token_in="0x" + "11" * 20, token_out="0x" + "22" * 20,
+               amount_in=10**18, fee_tier_in=500)
+        for i in range(4)
+    ]
+    with pytest.raises(RuntimeError, match="internal server error"):
+        await batched_v3_quote(mc, paths)
 
 
 @pytest.mark.asyncio

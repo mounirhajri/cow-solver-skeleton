@@ -29,7 +29,7 @@ from src.routing.amm_v3 import (
     QUOTE_EXACT_INPUT_SINGLE_SELECTOR,
     QUOTER_V2_ADDRESS,
 )
-from src.routing.multicall import Call, Multicall3
+from src.routing.multicall import Call, CallResult, Multicall3
 
 log = get_logger(__name__)
 
@@ -224,11 +224,60 @@ def _build_call(path: V3Path, quoter_address: str) -> Call:
     return Call(target=quoter_address, call_data=call_data, allow_failure=True)
 
 
-# Each QuoterV2 call costs ~200–300k gas; Multicall3 adds dispatch overhead.
-# Alchemy and most providers cap eth_call at 30M gas. Empirically a single
-# aggregate of 72 quotes overflowed ("out of gas" -32000) — chunk to stay
-# comfortably under the cap. 25 quotes ≈ 7M gas, well within budget.
-_MAX_CALLS_PER_BATCH = 25
+# QuoterV2 *simulates* the swap, so a quote over a deep/volatile tick range
+# can cost millions of gas — far more than the ~200-300k nominal. Batches that
+# looked safe (25 ≈ "7M") still overflowed the production node's eth_call gas
+# cap with "-32000 out of gas", which aborted the WHOLE quote pass and left
+# router-v2 producing nothing. Two defences: (1) a conservative initial chunk,
+# and (2) ``_aggregate_resilient`` bisects any chunk that still overflows down
+# to single calls, so only the individual over-cap quote is dropped.
+_MAX_CALLS_PER_BATCH = 8
+
+
+def _is_gas_overflow(exc: Exception) -> bool:
+    """True when an eth_call failed because the aggregate exceeded the node's
+    gas cap — as opposed to a transient/other RPC error we must NOT fan out on
+    (fanning out a real outage would multiply the failing round-trips).
+
+    Match on gas-specific phrasings rather than the bare ``-32000`` code: that
+    code is the generic JSON-RPC "server error" (also used for plain reverts,
+    "header not found", etc.), so keying on it would misclassify non-gas
+    failures as overflow. Rate-limit codes (-32005 / 429) never reach here —
+    rpc.eth_call retries them internally before raising."""
+    s = str(exc).lower()
+    return any(
+        p in s
+        for p in ("out of gas", "gas required exceeds", "intrinsic gas", "gas limit")
+    )
+
+
+async def _aggregate_resilient(
+    multicall: Multicall3, calls: list[Call]
+) -> list[CallResult]:
+    """``multicall.aggregate`` that survives a node gas-cap overflow.
+
+    A single QuoterV2 call over a deep tick range can cost millions of gas, so
+    a batch can blow the provider's eth_call cap and revert the ENTIRE call
+    with ``-32000 out of gas``. Rather than abort the whole quote pass (router
+    then emits no solution), recursively bisect the batch so only the
+    individual over-cap quote is dropped (as a failed result → amount_out 0)
+    while every other quote still resolves. Non-gas errors are re-raised
+    unchanged so a real RPC outage surfaces instead of fanning out.
+    """
+    if not calls:
+        return []
+    try:
+        return await multicall.aggregate(calls)
+    except Exception as exc:  # noqa: BLE001
+        if not _is_gas_overflow(exc):
+            raise
+        if len(calls) == 1:
+            log.warning("v3_quote_dropped_out_of_gas", target=calls[0].target)
+            return [CallResult(success=False, return_data=b"")]
+        mid = len(calls) // 2
+        left = await _aggregate_resilient(multicall, calls[:mid])
+        right = await _aggregate_resilient(multicall, calls[mid:])
+        return left + right
 
 
 async def batched_v3_quote(
@@ -254,7 +303,7 @@ async def batched_v3_quote(
     results: list[Any] = []
     for i in range(0, len(calls), _MAX_CALLS_PER_BATCH):
         chunk = calls[i : i + _MAX_CALLS_PER_BATCH]
-        results.extend(await multicall.aggregate(chunk))
+        results.extend(await _aggregate_resilient(multicall, chunk))
 
     quotes: list[V3BatchedQuote] = []
     for path, result in zip(paths, results, strict=True):
