@@ -171,6 +171,32 @@ def test_solve_ignores_unknown_driver_fields() -> None:
     assert resp.status_code == 200
 
 
+def test_solve_returns_422_on_malformed_auction() -> None:
+    """A malformed auction (order missing required fields) is the driver's
+    input error → 422, never an unhandled 500, and the orchestrator is not
+    invoked on un-parseable input."""
+    payload = _driver_shaped_auction()
+    payload["orders"] = [{"uid": "0x" + "ab" * 56}]  # missing owner/sellToken/...
+    orch = AsyncMock()
+    orch.solve.return_value = (NoSolution(), [])
+    app = create_app(orchestrator=orch)
+    client = TestClient(app)
+
+    resp = client.post("/solve", json=payload)
+    assert resp.status_code == 422
+    orch.solve.assert_not_called()
+
+
+def test_solve_returns_400_on_invalid_json() -> None:
+    """Non-JSON body → 400, not a 500."""
+    app = create_app(orchestrator=AsyncMock())
+    client = TestClient(app)
+    resp = client.post(
+        "/solve", content=b"not json", headers={"Content-Type": "application/json"}
+    )
+    assert resp.status_code == 400
+
+
 def test_notify_accepts_driver_status_callbacks() -> None:
     """Driver POSTs a notification per auction with the outcome of our
     solution. We acknowledge with 200 — non-200 would make the driver

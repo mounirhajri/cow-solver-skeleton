@@ -69,9 +69,9 @@ async def fetch_orders_by_uid(uids: list[str]) -> dict[str, dict[str, Any]]:
 def _extract_order_uids(solution: dict[str, Any]) -> list[str]:
     """Pull orderUid from all fulfillment trades in a solution."""
     return [
-        t["orderUid"]
+        t.get("order") or t["orderUid"]
         for t in (solution.get("trades") or [])
-        if t.get("kind") == "fulfillment" and t.get("orderUid")
+        if t.get("kind") == "fulfillment" and (t.get("order") or t.get("orderUid"))
     ]
 
 

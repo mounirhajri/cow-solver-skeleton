@@ -88,7 +88,10 @@ async def quote_v3_all_fee_tiers(
         )
         for fee in fee_tiers
     ]
-    results = await multicall.aggregate(calls)
+    # Resilient: a single deep-tick QuoterV2 simulation can over-cap even this
+    # small (≤4-tier) batch and revert the whole eth_call; bisect so one
+    # over-cap tier is dropped rather than losing the entire hop's V3 quote.
+    results = await multicall.aggregate_resilient(calls)
     quotes: list[V3Quote] = []
     for fee, r in zip(fee_tiers, results, strict=True):
         if not r.success:

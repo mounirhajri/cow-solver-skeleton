@@ -4,8 +4,9 @@ from contextlib import asynccontextmanager
 from contextlib import suppress as _suppress
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, Request, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from pydantic import ValidationError
 
 from src.config import settings
 from src.log import configure_logging, get_logger
@@ -44,8 +45,21 @@ def create_app(
         # leaves room for future multi-solution emission (e.g. variants
         # exploring different fee tiers).
         start = time.perf_counter()
-        body = await request.json()
-        auction = Auction.model_validate(body)
+        # A malformed request is the driver's input, not a solver failure —
+        # answer 400/422 (not an unhandled 500) so the cause is legible during
+        # onboarding rather than looking like the endpoint crashed.
+        try:
+            body = await request.json()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("solve_invalid_json", error=str(exc))
+            raise HTTPException(status_code=400, detail="invalid JSON body") from exc
+        try:
+            auction = Auction.model_validate(body)
+        except ValidationError as exc:
+            log.warning("solve_invalid_auction", n_errors=exc.error_count())
+            raise HTTPException(
+                status_code=422, detail="auction failed schema validation"
+            ) from exc
 
         # Quote-only requests: spec allows ``id=null`` when the driver asks
         # the solver to price tokens without running an auction. Our

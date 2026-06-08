@@ -65,6 +65,10 @@ def _make_source(
     """
     multicall = MagicMock()
     multicall.aggregate = AsyncMock()
+    # quote_v3_all_fee_tiers calls aggregate_resilient (a thin wrapper over
+    # aggregate that bisects on gas-overflow); these tests don't exercise
+    # overflow, so delegate it to the same mock to drive both code paths.
+    multicall.aggregate_resilient = multicall.aggregate
     source = V3Source(
         multicall=multicall,
         router_address=ROUTER,
@@ -169,7 +173,18 @@ async def test_two_hop_is_picked_when_better_than_direct() -> None:
     two_hop = [CallResult(success=True, return_data=_qv2_multi_hop_return(50)) for _ in range(16)]
     # Make one two-hop the global winner
     two_hop[5] = CallResult(success=True, return_data=_qv2_multi_hop_return(999))
-    aggregate.return_value = direct + two_hop
+    # 20 paths span multiple chunks (_MAX_CALLS_PER_BATCH=8), so return the
+    # positional slice per chunk rather than the whole list each call.
+    master = direct + two_hop
+    cursor = 0
+
+    async def _chunked(calls: list) -> list:
+        nonlocal cursor
+        out = master[cursor : cursor + len(calls)]
+        cursor += len(calls)
+        return out
+
+    aggregate.side_effect = _chunked
 
     req = SwapRequest(
         sell_token=USDC, buy_token=DAI,

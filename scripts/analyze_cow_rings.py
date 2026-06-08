@@ -47,7 +47,7 @@ def _detect_rings(solution: dict[str, Any] | None, orders_by_uid: dict[str, Any]
     # Build directed graph: sell_token → buy_token per trade
     edges: list[tuple[str, str]] = []
     for t in trades:
-        uid = (t.get("orderUid") or t.get("order_uid") or "").lower()
+        uid = (t.get("order") or t.get("orderUid") or t.get("order_uid") or "").lower()
         order = orders_by_uid.get(uid)
         if not order:
             continue

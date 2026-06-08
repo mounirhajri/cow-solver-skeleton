@@ -135,7 +135,7 @@ async def _run(hours: int, min_eth_value: float) -> None:
 
             # Collect unique order UIDs in this solution
             order_uids = [
-                (t.get("orderUid") or "").lower()
+                (t.get("order") or t.get("orderUid") or "").lower()
                 for t in trades
                 if t.get("kind") == "fulfillment"
             ]

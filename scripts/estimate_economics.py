@@ -116,7 +116,9 @@ def _ring_signature(solution: dict | None) -> str | None:
         return None
     trades = solution.get("trades") or []
     uids = sorted(
-        t.get("orderUid") for t in trades if isinstance(t, dict) and t.get("orderUid")
+        (t.get("order") or t.get("orderUid"))
+        for t in trades
+        if isinstance(t, dict) and (t.get("order") or t.get("orderUid"))
     )
     if not uids:
         return None

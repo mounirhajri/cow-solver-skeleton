@@ -264,7 +264,7 @@ def _first_uid(solution: dict[str, Any]) -> str:
     trades = solution.get("trades", []) or []
     if not trades:
         return "(no-trade)"
-    uid = str(trades[0].get("orderUid", "?"))
+    uid = str(trades[0].get("order") or trades[0].get("orderUid", "?"))
     short = uid[:10] + "…" if len(uid) > 11 else uid
     return short + (f"+{len(trades) - 1}" if len(trades) > 1 else "")
 
@@ -431,7 +431,7 @@ def _analyse_offline(
     buy_owed: dict[str, int] = defaultdict(int)
 
     for tr in trades:
-        order = order_map.get(str(tr.get("orderUid", "")))
+        order = order_map.get(str(tr.get("order") or tr.get("orderUid", "")))
         if order is None:
             _consider(_ORDER_MISSING, 0, float("nan"))
             continue
@@ -688,7 +688,7 @@ async def _analyse_delivery(
 
     # Leg 2 — counterparty (user) delivery.
     for tr in solution.get("trades", []) or []:
-        order = order_map.get(str(tr.get("orderUid", "")))
+        order = order_map.get(str(tr.get("order") or tr.get("orderUid", "")))
         if order is None:
             continue
         try:
@@ -865,7 +865,7 @@ async def run_quantify(days: int, limit: int, strategy: str) -> None:
         trades = solution.get("trades") or []
         if not trades:
             continue
-        uid = str(trades[0].get("orderUid", ""))
+        uid = str(trades[0].get("order") or trades[0].get("orderUid", ""))
         if not uid:
             continue
         n_solutions_total += 1
