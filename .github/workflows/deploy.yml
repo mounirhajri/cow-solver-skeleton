@@ -176,5 +176,22 @@ jobs:
           sudo docker compose -f docker-compose.yml exec -T cow-solver /app/.venv/bin/alembic upgrade head
           sudo docker compose -f docker-compose.yml ps \
             cow-solver reconciler ghost-refresh shadow-poller cow-solver-comp-sync
+
+          # ── Reclaim disk: prune superseded images ─────────────────────
+          # Every deploy pushes a :<sha> tag; without cleanup they pile up
+          # and on 2026-06-02 filled the 38G disk → ~6-day stack outage
+          # (every healthcheck exec failed "no space left on device"). Drop
+          # every local cow-solver image EXCEPT :latest (the one we just
+          # deployed, now pinned by the running containers) — rmi on the
+          # in-use digest fails harmlessly via ``|| true``. Then sweep
+          # dangling layers. Targeted by repo name so the pre-cached
+          # cowprotocol/services image and everything else stay intact.
+          # NEVER prunes volumes (the shadow-data DB is untouchable).
+          for tag in $(sudo docker images 'ghcr.io/mounirhajri/cow-solver' --format '{{.Tag}}' | grep -v '^latest$' | sort -u); do
+            sudo docker rmi "ghcr.io/mounirhajri/cow-solver:$tag" 2>/dev/null || true
+          done
+          sudo docker image prune -f || true
+          echo "Disk after prune:"; df -h / | tail -1
+
           curl -fsS http://localhost:8000/health
           ENDSSH

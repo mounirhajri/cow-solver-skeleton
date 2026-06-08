@@ -1,3 +1,17 @@
+# ── Log rotation (disk-fill prevention) ────────────────────────────────
+# Without this, the default json-file driver grows each container's logs
+# unbounded. On 2026-06-02 unbounded logs + accumulated :sha images filled
+# the 38G host disk and wedged the whole stack for ~6 days — every
+# healthcheck `docker exec` failed with "no space left on device", so
+# every service went (unhealthy) and the shadow pipeline stopped writing.
+# Cap every service to 3×10M so a chatty or error-looping container can
+# never run the disk dry again. Applied to all services via *default-logging.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   cow-solver:
     # Image tag falls back to the local-built ``cow-solver:dev`` for dev /
@@ -10,6 +24,7 @@ services:
     image: ${COW_SOLVER_IMAGE:-cow-solver:dev}
     container_name: cow-solver
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "8000:8000"
     networks:
@@ -39,6 +54,7 @@ services:
     image: ${COW_SOLVER_IMAGE:-cow-solver:dev}
     container_name: cow-reconciler
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - stack
     command: ["python", "-m", "scripts.reconcile_loop"]
@@ -60,6 +76,7 @@ services:
     image: ${COW_SOLVER_IMAGE:-cow-solver:dev}
     container_name: cow-ghost-refresh
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - stack
     command: ["python", "-m", "scripts.refresh_ghost_set", "--loop"]
@@ -75,6 +92,8 @@ services:
   redis:
     image: redis:7-alpine
     container_name: cow-solver-redis
+    restart: unless-stopped
+    logging: *default-logging
     ports:
       - "6379:6379"
     networks:
@@ -104,6 +123,7 @@ services:
     image: ${COW_SOLVER_IMAGE:-cow-solver:dev}
     container_name: cow-shadow-poller
     restart: unless-stopped
+    logging: *default-logging
     user: app
     networks:
       - stack
@@ -139,6 +159,7 @@ services:
     image: ${COW_SOLVER_IMAGE:-cow-solver:dev}
     container_name: cow-solver-comp-sync
     restart: unless-stopped
+    logging: *default-logging
     user: app
     networks:
       - stack
@@ -200,6 +221,7 @@ services:
     container_name: cow-driver
     profiles: ["cow-stack"]
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - stack
     ports:
@@ -216,6 +238,7 @@ services:
     container_name: cow-autopilot
     profiles: ["cow-stack"]
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - stack
     # Modern autopilot only accepts ``--config <PATH>``; the individual
@@ -237,6 +260,8 @@ services:
     image: ghcr.io/cowprotocol/services:latest
     container_name: cow-shadow-driver
     profiles: ["shadow"]
+    restart: unless-stopped
+    logging: *default-logging
     networks:
       - stack
     command: ["driver", "--config", "/etc/driver.shadow.toml", "--shadow"]
