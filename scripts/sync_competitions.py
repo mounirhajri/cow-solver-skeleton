@@ -2,7 +2,7 @@
 
 For each auction in shadow_auctions that does not yet have rows in
 shadow_competitors, fetches:
-    GET https://api.cow.fi/arbitrum_one/api/v1/solver_competition/{auction_id}
+    GET https://api.cow.fi/arbitrum_one/api/v2/solver_competition/{auction_id}
 
 and inserts one ShadowCompetitor row per solver in the ``solutions`` array.
 
@@ -52,8 +52,9 @@ from src.persistence.models import ShadowAuction, ShadowCompetitor
 
 log = get_logger(__name__)
 
+# CoW moved solver_competition to /api/v2 in 2026-06 (v1 now 404s).
 COW_COMPETITION_URL = (
-    "https://api.cow.fi/arbitrum_one/api/v1/solver_competition/{auction_id}"
+    "https://api.cow.fi/arbitrum_one/api/v2/solver_competition/{auction_id}"
 )
 # CoW Production rate-limiter rejected the bare "cow-solver-skeleton/1.0" UA
 # with sustained 429s even at 1 rps after a previous 5-rps burst on the same
@@ -190,7 +191,9 @@ def _parse_solutions(
         rows.append(
             {
                 "auction_id": auction_id,
-                "solver_name": str(sol.get("solver") or "")[:50],
+                # v2 dropped the ``solver`` name field; fall back to the address
+                # so solver_name is never empty.
+                "solver_name": str(sol.get("solver") or sol.get("solverAddress") or "")[:50],
                 "solver_address": str(sol.get("solverAddress") or "")[:42],
                 "score": score_val,
                 "ranking": int(sol.get("ranking") or 0),

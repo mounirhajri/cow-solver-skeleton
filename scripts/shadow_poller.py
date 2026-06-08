@@ -28,6 +28,10 @@ from scripts.liveness import touch_liveness
 from src.shadow.persist import persist_skipped_auction_safe, persist_winner_and_outcomes_safe
 
 BASE_URL = "https://api.cow.fi/arbitrum_one/api/v1"
+# CoW moved solver_competition to /api/v2 in 2026-06; the v1 path now 404s,
+# which silently stalled this poller for ~6 days. Order endpoints (/orders/...)
+# are STILL v1, so only the competition fetch uses this v2 base.
+COMP_BASE_URL = "https://api.cow.fi/arbitrum_one/api/v2"
 # Max UIDs per POST /orders/by_uids call (API limit).
 BY_UIDS_BATCH_SIZE = 128
 # Solver timeout — full 1200-order auctions may take longer than small batches.
@@ -149,7 +153,7 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
     Returns ``"ok"`` on success and ``"rate_limited"`` if CoW API returned HTTP 429.
     """
     try:
-        comp = await _cow_get(f"{BASE_URL}/solver_competition/latest")
+        comp = await _cow_get(f"{COMP_BASE_URL}/solver_competition/latest")
     except RateLimitedError as exc:
         log.warning("rate_limited", extra={"url": str(exc)})
         return "rate_limited"
@@ -186,9 +190,12 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
         "deadline": None,
         # The block CoW simulated this competition against. Forwarded so the
         # feasibility validator evaluates settle() at auction-time state (orders
-        # open, pools un-drifted) instead of "latest". May be absent on older
-        # competitions → None → validator falls back to "latest".
-        "simulationBlock": comp.get("competitionSimulationBlock"),
+        # open, pools un-drifted) instead of "latest". v2 renamed this from
+        # ``competitionSimulationBlock`` to ``auctionStartBlock`` (the block the
+        # auction opened at); keep the old key first for any cached v1 payloads.
+        # Absent → None → validator falls back to "latest".
+        "simulationBlock": comp.get("competitionSimulationBlock")
+        or comp.get("auctionStartBlock"),
     }
 
     our_solution = None
@@ -264,7 +271,11 @@ async def poll_once(solver: httpx.AsyncClient, seen: set[int]) -> str:
         "orders_fetched": len(auction_payload["orders"]),
         "our_solution": our_solution,
         "winner_solution": (
-            {"solver": winner["solver"], "score": winner.get("score")}
+            # v2 dropped ``solver`` (name); fall back to ``solverAddress``.
+            {
+                "solver": winner.get("solver") or winner.get("solverAddress"),
+                "score": winner.get("score"),
+            }
             if winner
             else None
         ),

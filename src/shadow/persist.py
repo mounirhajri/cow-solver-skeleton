@@ -341,7 +341,12 @@ async def persist_winner_and_outcomes(
                 session.add(
                     ShadowWinner(
                         auction_id=auction_id,
-                        winner_solver=str(winner_sol.get("solver", "unknown")),
+                        # v2 dropped ``solver`` (name); fall back to address.
+                        winner_solver=str(
+                            winner_sol.get("solver")
+                            or winner_sol.get("solverAddress")
+                            or "unknown"
+                        ),
                         score=score,
                         raw_solution=winner_sol,
                     )

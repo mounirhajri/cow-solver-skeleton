@@ -32,10 +32,16 @@ class CowApiClient:
 
     def __init__(self, network: str = "arbitrum_one") -> None:
         self._base = self.BASE_BY_NETWORK[network]
+        # CoW moved the solver_competition endpoints to /api/v2 in 2026-06;
+        # the old /api/v1/solver_competition/* now 404s (this silently killed
+        # the shadow poller for ~6 days). The order endpoints (/orders/...)
+        # are STILL v1, so we keep a separate v2 base only for competition
+        # calls rather than bumping the whole client to v2.
+        self._comp_base = self._base.replace("/api/v1", "/api/v2")
 
-    def _get(self, path: str) -> "dict[str, Any] | None":
+    def _get(self, path: str, base: str | None = None) -> "dict[str, Any] | None":
         req = urllib.request.Request(
-            f"{self._base}{path}", headers={"User-Agent": _UA}
+            f"{base or self._base}{path}", headers={"User-Agent": _UA}
         )
         try:
             with urllib.request.urlopen(req, context=_SSL_CTX, timeout=10) as resp:
@@ -47,17 +53,23 @@ class CowApiClient:
             raise
 
     async def fetch_competition(self, auction_id: int) -> CompetitionResult | None:
-        data = await asyncio.to_thread(self._get, f"/solver_competition/{auction_id}")
+        data = await asyncio.to_thread(
+            self._get, f"/solver_competition/{auction_id}", self._comp_base
+        )
         if data is None:
             return None
         solutions = data.get("solutions", [])
-        winner = next((s for s in solutions if s.get("ranking") == 1), None)
+        winner = next(
+            (s for s in solutions if s.get("isWinner") or s.get("ranking") == 1), None
+        )
         if not winner:
             return None
+        # v2 dropped the human-readable ``solver`` name field; only
+        # ``solverAddress`` remains. Fall back so the identifier is never empty.
         return CompetitionResult(
             auction_id=int(data["auctionId"]),
-            winner_solver=winner["solver"],
-            winner_score=int(winner["score"]),
+            winner_solver=str(winner.get("solver") or winner.get("solverAddress") or "unknown"),
+            winner_score=int(winner.get("score") or 0),
         )
 
     async def fetch_order(self, uid: str) -> dict[str, Any] | None:
