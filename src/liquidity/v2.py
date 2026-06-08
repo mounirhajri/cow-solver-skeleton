@@ -126,7 +126,15 @@ class V2Source:
                 amount_out_minimum=_apply_slippage_down(quote.buy_amount, self._slippage_bps),
             )
 
-        return Interaction(target=self._router_address, value=0, call_data=calldata)
+        # Token flow for the driver's conservation accounting: settlement
+        # provides sell_amount of token_in, receives buy_amount of token_out.
+        return Interaction(
+            target=self._router_address,
+            value=0,
+            call_data=calldata,
+            inputs=((token_in, quote.sell_amount),),
+            outputs=((token_out, quote.buy_amount),),
+        )
 
     def required_allowances(self, quote: Quote) -> list[tuple[str, str]]:
         meta = quote.route_metadata["v2_route"]

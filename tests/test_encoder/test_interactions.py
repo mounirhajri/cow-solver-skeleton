@@ -7,17 +7,39 @@ from src.encoder.interactions import Interaction
 V3_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
 
 
-def test_to_gpv2_dict_emits_driver_wire_format() -> None:
-    """The CoW driver expects {target, value, callData} with value as
-    decimal string and callData as 0x-prefixed hex. Wire-format drift
-    here would silently reject every solution."""
+def test_to_gpv2_dict_emits_custom_interaction_wire_format() -> None:
+    """The CoW driver's CustomInteraction REQUIRES kind/inputs/outputs in
+    addition to target/value/callData. An interaction with no token flow
+    (e.g. approve) carries empty inputs/outputs. Missing any required key →
+    serde rejects the whole solution."""
     i = Interaction(target=V3_ROUTER, value=0, call_data=bytes.fromhex("deadbeef"))
     d = i.to_gpv2_dict()
     assert d == {
+        "kind": "custom",
         "target": V3_ROUTER,
         "value": "0",
         "callData": "0xdeadbeef",
+        "inputs": [],
+        "outputs": [],
     }
+
+
+def test_to_gpv2_dict_emits_typed_token_flows() -> None:
+    """A swap interaction declares the tokens it consumes/produces so the
+    driver can verify settlement token conservation. Amounts are U256 strings."""
+    tin = "0x" + "11" * 20
+    tout = "0x" + "22" * 20
+    i = Interaction(
+        target=V3_ROUTER,
+        value=0,
+        call_data=b"\x01",
+        inputs=((tin, 1000),),
+        outputs=((tout, 950),),
+    )
+    d = i.to_gpv2_dict()
+    assert d["kind"] == "custom"
+    assert d["inputs"] == [{"token": tin, "amount": "1000"}]
+    assert d["outputs"] == [{"token": tout, "amount": "950"}]
 
 
 def test_to_gpv2_dict_preserves_nonzero_value() -> None:

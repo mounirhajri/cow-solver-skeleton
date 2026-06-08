@@ -464,7 +464,7 @@ async def test_feasibility_gate_rejects_phantom_falls_through(
     class FakeGate:
         async def check(self, solution_dict: dict) -> Verdict:  # noqa: ANN101
             calls["n"] += 1
-            uid = solution_dict["trades"][0]["orderUid"]
+            uid = solution_dict["trades"][0]["order"]
             if uid == _phantom_uid():
                 return Verdict(True, None)
             return Verdict(False, "phantom: STF")

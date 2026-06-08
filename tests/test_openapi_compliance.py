@@ -72,6 +72,8 @@ def test_solve_response_matches_openapi_shape() -> None:
     """
     weth = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
     usdc = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+    from src.encoder.interactions import Interaction
+
     orch = AsyncMock()
     orch.solve.return_value = (
         Solution(
@@ -84,7 +86,17 @@ def test_solve_response_matches_openapi_shape() -> None:
                     executed_amount=10**18,
                 ),
             ],
-            interactions=[],
+            # A real swap interaction so the CustomInteraction shape is exercised
+            # (empty list would never surface a kind/inputs/outputs regression).
+            interactions=[
+                Interaction(
+                    target="0xe592427a0aece92de3edee1f18e0157c05861564",
+                    value=0,
+                    call_data=b"\xde\xad\xbe\xef",
+                    inputs=((weth, 10**18),),
+                    outputs=((usdc, 3500 * 10**6),),
+                ).to_gpv2_dict()
+            ],
         ),
         [],
     )
@@ -107,8 +119,17 @@ def test_solve_response_matches_openapi_shape() -> None:
     assert all(isinstance(v, str) for v in sol["prices"].values())
     assert isinstance(sol["trades"], list)
     assert isinstance(sol["interactions"], list)
-    # Trade.executedAmount must also be U256-string
-    assert isinstance(sol["trades"][0]["executedAmount"], str)
+    # Fulfillment trade: spec field is ``order`` (NOT ``orderUid``).
+    trade = sol["trades"][0]
+    assert trade["order"] == "0x" + "a" * 112
+    assert "orderUid" not in trade
+    assert isinstance(trade["executedAmount"], str)
+    # CustomInteraction: kind/inputs/outputs are required by the spec.
+    ix = sol["interactions"][0]
+    assert ix["kind"] == "custom"
+    assert {"target", "value", "callData", "inputs", "outputs"} <= ix.keys()
+    assert ix["inputs"] == [{"token": weth, "amount": str(10**18)}]
+    assert ix["outputs"] == [{"token": usdc, "amount": str(3500 * 10**6)}]
 
 
 def test_solve_accepts_nullable_id() -> None:

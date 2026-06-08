@@ -17,7 +17,9 @@ def test_solution_serializes_to_cow_schema() -> None:
     payload = sol.model_dump(by_alias=True, mode="json")
     assert payload["id"] == 1
     assert payload["trades"][0]["kind"] == "fulfillment"
-    assert payload["trades"][0]["orderUid"] == "0x" + "a" * 112
+    # Spec field is ``order`` (NOT ``orderUid``); the driver's serde requires it.
+    assert payload["trades"][0]["order"] == "0x" + "a" * 112
+    assert "orderUid" not in payload["trades"][0]
     assert payload["trades"][0]["executedAmount"] == str(10**18)
 
 

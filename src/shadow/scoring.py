@@ -119,7 +119,7 @@ def compute_solution_score(
     for trade in solution.get("trades") or []:
         if trade.get("kind") != "fulfillment":
             continue
-        uid = (trade.get("orderUid") or trade.get("order_uid") or "").lower()
+        uid = (trade.get("order") or trade.get("orderUid") or trade.get("order_uid") or "").lower()
         order = orders_by_uid.get(uid)
         if order is None:
             continue
@@ -154,7 +154,7 @@ def compute_solution_score(
         if trade.get("kind") != "fulfillment":
             continue
 
-        uid = (trade.get("orderUid") or trade.get("order_uid") or "").lower()
+        uid = (trade.get("order") or trade.get("orderUid") or trade.get("order_uid") or "").lower()
         order = orders_by_uid.get(uid)
         if order is None:
             continue

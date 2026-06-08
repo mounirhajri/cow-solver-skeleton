@@ -109,7 +109,16 @@ def encode_v3_swap(
                 amount_out_minimum=apply_slippage_down(executed_buy, slippage_bps),
             )
 
-    return Interaction(target=router_address, value=0, call_data=calldata)
+    # Token flow for the driver's conservation accounting: the settlement
+    # provides ``executed_sell`` of ``token_in`` to the router and receives
+    # ``executed_buy`` of ``token_out`` back (recipient is the settlement).
+    return Interaction(
+        target=router_address,
+        value=0,
+        call_data=calldata,
+        inputs=((token_in, executed_sell),),
+        outputs=((token_out, executed_buy),),
+    )
 
 
 def apply_slippage_down(amount: int, slippage_bps: int) -> int:

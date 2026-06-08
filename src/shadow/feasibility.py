@@ -140,7 +140,7 @@ async def validate_solution(
 
         settle_trades: list[SettleTrade] = []
         for t in trades_in:
-            uid = (t.get("orderUid") or t.get("order_uid") or "").lower()
+            uid = (t.get("order") or t.get("orderUid") or t.get("order_uid") or "").lower()
             order = await _resolve_order(uid, cache, api)
             if order is None:
                 return Verdict(None, f"order {uid} unfetchable")

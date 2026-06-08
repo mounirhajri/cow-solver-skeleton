@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_serializer
 
 
 class Trade(BaseModel):
@@ -9,8 +9,19 @@ class Trade(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     kind: Literal["fulfillment", "jit"]
-    order_uid: str = Field(alias="orderUid")
-    executed_amount: int = Field(alias="executedAmount")
+    # Serialises as ``order`` — the field name the solver-engine spec's
+    # Fulfillment schema requires (NOT ``orderUid``; the driver's serde
+    # rejects a trade missing ``order``). Validation still accepts the legacy
+    # ``orderUid`` alias and the Python name ``order_uid`` so existing callers
+    # and stored data keep parsing.
+    order_uid: str = Field(
+        validation_alias=AliasChoices("order", "orderUid", "order_uid"),
+        serialization_alias="order",
+    )
+    executed_amount: int = Field(
+        validation_alias=AliasChoices("executedAmount", "executed_amount"),
+        serialization_alias="executedAmount",
+    )
 
     @field_serializer("executed_amount")
     def serialize_amount(self, v: int) -> str:
