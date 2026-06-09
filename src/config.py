@@ -58,6 +58,14 @@ class Settings(BaseSettings):
     router_max_orders: int = 4         # top-N sell orders by sell_amount
     router_max_concurrent: int = 3     # parallel RPC quote slots (semaphore)
     router_strategy_timeout: float = 11.0  # per-strategy timeout for router-v2 (s)
+    # Global cap on concurrent in-flight eth_calls to the shared RPC node,
+    # across ALL RpcClient instances in the process (orchestrator client + the
+    # background feasibility validator's feas_rpc). PublicNode free tier
+    # throttles under concurrency — 1 concurrent pass = clean, 30 = ~93% fail
+    # (429/-32005). 4 is conservative with headroom for feas_rpc, well under the
+    # throttle cliff; raise/lower via RPC_MAX_CONCURRENT from the live
+    # router_v3_batched_failed signal without a redeploy. No higher RPC tier.
+    rpc_max_concurrent: int = 4
     # Intermediates for router-v2.  Restricted to WETH only (vs the full list used
     # by naive) to halve the per-order call count: direct + WETH 2-hop = 9 calls
     # instead of direct + WETH/USDC/USDT 2-hop = 21 calls.

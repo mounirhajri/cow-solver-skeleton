@@ -29,7 +29,7 @@ from src.routing.amm_v3 import (
     QUOTE_EXACT_INPUT_SINGLE_SELECTOR,
     QUOTER_V2_ADDRESS,
 )
-from src.routing.multicall import Call, Multicall3
+from src.routing.multicall import Call, CallResult, Multicall3
 
 log = get_logger(__name__)
 
@@ -257,7 +257,18 @@ async def batched_v3_quote(
     results: list[Any] = []
     for i in range(0, len(calls), _MAX_CALLS_PER_BATCH):
         chunk = calls[i : i + _MAX_CALLS_PER_BATCH]
-        results.extend(await multicall.aggregate_resilient(chunk))
+        try:
+            results.extend(await multicall.aggregate_resilient(chunk))
+        except Exception as exc:  # noqa: BLE001
+            # aggregate_resilient swallows gas-overflow but RE-RAISES other
+            # errors (rate-limit / timeout under RPC contention). Drop only
+            # THIS chunk's quotes — positionally aligned (success=False →
+            # amount_out 0) — rather than aborting the whole pass, so the router
+            # still produces a partial solution from the chunks that succeeded.
+            log.warning(
+                "v3_chunk_dropped", error=str(exc), chunk_start=i, chunk_len=len(chunk)
+            )
+            results.extend(CallResult(success=False, return_data=b"") for _ in chunk)
 
     quotes: list[V3BatchedQuote] = []
     for path, result in zip(paths, results, strict=True):

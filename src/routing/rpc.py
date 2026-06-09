@@ -1,14 +1,45 @@
 import asyncio
+import weakref
 
 import eth_abi
 import httpx
 from web3 import Web3
 from web3.providers.rpc import HTTPProvider
 
+from src.config import settings
+
 # Retry schedule for HTTP 429 / JSON-RPC -32005 (rate limit).
 # Waits: 200 ms, 600 ms, 1 800 ms  (×3 factor, 3 attempts max).
 _RETRY_DELAYS = (0.2, 0.6, 1.8)
 _RATE_LIMIT_CODES = {429, -32005}
+
+# ── Global RPC concurrency gate ─────────────────────────────────────────────
+# The shared node (PublicNode free tier) THROTTLES under concurrent eth_calls:
+# a single V3 quote pass is ~3s clean, but 30 concurrent passes over one client
+# fail 28/30 (429/-32005 after retries, or empty httpx timeouts). The
+# concurrency is real in prod — naive's price_refiner fans out 3-10 parallel
+# quotes, and the background feasibility validator (a SEPARATE RpcClient) runs
+# for every auction overlapping the next /solve. So we bound TOTAL in-flight
+# eth_calls process-wide with a semaphore shared across ALL RpcClient instances
+# (no higher RPC tier — hard constraint).
+#
+# Keyed by event loop (via WeakKeyDictionary so finished test loops are GC'd):
+# in prod there is exactly one uvicorn loop → one global gate; under
+# pytest-asyncio's per-test loops each gets its own, avoiding "future attached
+# to a different loop" errors. The semaphore binds lazily on first await
+# (Python >=3.12), so reading settings here — after env load — is correct.
+_rpc_semaphores: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _rpc_gate() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _rpc_semaphores.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(settings.rpc_max_concurrent)
+        _rpc_semaphores[loop] = sem
+    return sem
 
 # JSON-RPC error code 3 is the EVM "execution reverted" code (EIP-1474).
 # Geth/Erigon also surface reverts under -32000 with a "revert" message, so we
@@ -109,7 +140,10 @@ class RpcClient:
         }
         last_exc: Exception = RuntimeError("eth_call: no attempts made")
         for _attempt, delay in enumerate((*_RETRY_DELAYS, None), start=1):
-            resp = await self._client.post(self.url, json=payload, timeout=5.0)
+            # Gate only the in-flight request; the backoff sleep below runs
+            # OUTSIDE the gate so a retrying caller doesn't idle a slot.
+            async with _rpc_gate():
+                resp = await self._client.post(self.url, json=payload, timeout=5.0)
 
             # HTTP-level rate limit (some providers return 429 directly)
             if resp.status_code == 429:
@@ -171,7 +205,9 @@ class RpcClient:
         }
         last_exc: Exception = RuntimeError("eth_call: no attempts made")
         for _attempt, delay in enumerate((*_RETRY_DELAYS, None), start=1):
-            resp = await self._client.post(self.url, json=payload, timeout=5.0)
+            # Gate only the in-flight request (see eth_call); backoff is outside.
+            async with _rpc_gate():
+                resp = await self._client.post(self.url, json=payload, timeout=5.0)
 
             if resp.status_code == 429:
                 last_exc = RuntimeError("RPC error 429: Too Many Requests")

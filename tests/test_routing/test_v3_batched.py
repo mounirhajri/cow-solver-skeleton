@@ -311,23 +311,33 @@ async def test_batched_v3_quote_drops_only_the_overcap_quote() -> None:
 
 
 @pytest.mark.asyncio
-async def test_batched_v3_quote_reraises_non_gas_error() -> None:
-    """A non-gas RPC error must propagate (not fan out into N retries that
-    would multiply load on a real outage)."""
+async def test_batched_v3_quote_drops_chunk_on_non_gas_error() -> None:
+    """A non-gas error from one chunk (rate-limit/timeout under contention) must
+    drop ONLY that chunk's quotes — not abort the whole pass — so the router
+    still gets the surviving chunks. 12 paths at chunk=8 → 2 chunks; the 2nd
+    raises 429, its 4 quotes become amount_out=0, the first 8 resolve."""
     rpc = AsyncMock()
     mc = Multicall3(rpc)
+    ok_data = encode(["uint256", "uint160", "uint32", "uint256"], [55, 0, 0, 0])
+    seen = {"n": 0}
 
-    async def fake_aggregate(_calls: list[Call]) -> list[CallResult]:
-        raise RuntimeError("RPC error 500: internal server error")
+    async def fake_aggregate_resilient(calls: list[Call]) -> list[CallResult]:
+        seen["n"] += 1
+        if seen["n"] == 2:  # second chunk fails with a non-gas error
+            raise RuntimeError("RPC error 429: Too Many Requests")
+        return [CallResult(success=True, return_data=ok_data) for _ in calls]
 
-    mc.aggregate = fake_aggregate  # type: ignore[assignment]
+    mc.aggregate_resilient = fake_aggregate_resilient  # type: ignore[assignment]
+
     paths = [
         V3Path(order_uid=f"o{i}", token_in="0x" + "11" * 20, token_out="0x" + "22" * 20,
-               amount_in=10**18, fee_tier_in=500)
-        for i in range(4)
-    ]
-    with pytest.raises(RuntimeError, match="internal server error"):
-        await batched_v3_quote(mc, paths)
+               amount_in=10**18, fee_tier_in=fee)
+        for i in range(3) for fee in (100, 500, 3000, 10000)
+    ]  # 12 paths → chunks of 8 + 4
+    quotes = await batched_v3_quote(mc, paths)
+    assert len(quotes) == 12  # nothing lost, positionally aligned
+    assert sum(1 for q in quotes if q.amount_out == 55) == 8   # first chunk survived
+    assert sum(1 for q in quotes if q.amount_out == 0) == 4    # dropped chunk → 0
 
 
 @pytest.mark.asyncio
