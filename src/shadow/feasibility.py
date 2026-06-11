@@ -84,9 +84,43 @@ def _app_data_bytes(order: dict[str, Any]) -> bytes:
 
 
 def _sig_bytes(order: dict[str, Any]) -> bytes:
-    raw = order.get("signature") or "0x"
-    h = raw[2:] if raw.startswith("0x") else raw
-    return bytes.fromhex(h)
+    """Encode the trade signature the way GPv2Signing expects PER SCHEME.
+
+    The orderbook API's ``signature`` field is scheme-relative, but the
+    on-chain trade signature has scheme-specific framing:
+
+    - ecdsa (eip712/ethsign): the raw 65-byte signature, verbatim.
+    - eip1271: ``owner (20 bytes) ++ signature`` — GPv2 reads the FIRST 20
+      bytes as the verifier address to staticcall. The API does NOT prefix
+      the owner; passing the raw payload made GPv2 staticcall a garbage
+      address decoded from ABI padding → empty returndata → abi.decode
+      reverts with EMPTY data. That single gap silently condemned EVERY
+      smart-wallet (Composable-CoW/TWAP) solution as phantom (117/117
+      measured 2026-06-11).
+    - presign: exactly the 20-byte owner address. The API sends ``0x`` —
+      passing that through produced "GPv2: malformed presignature", which we
+      long mis-read as missing on-chain pre-signatures.
+    """
+    raw_hex = order.get("signature") or "0x"
+    raw = bytes.fromhex(raw_hex[2:] if raw_hex.startswith("0x") else raw_hex)
+    scheme = str(order.get("signingScheme") or "eip712").lower()
+    owner_hex = str(order.get("owner") or "")
+    owner = bytes.fromhex(owner_hex[2:]) if owner_hex.startswith("0x") else b""
+
+    if scheme in ("eip1271", "erc1271", "presign") and len(owner) != 20:
+        # Without the owner we CANNOT frame these schemes — falling through to
+        # the raw payload would reproduce the exact silent-phantom bug this
+        # function fixes. Raise instead: validate_solution's outer except maps
+        # this to UNKNOWN (our encoding gap, never the solution's fault).
+        raise ValueError(f"{scheme} order without usable owner ({owner_hex!r})")
+    if scheme in ("eip1271", "erc1271"):
+        # Defensive: never double-prefix if a payload already carries it.
+        if raw[:20] == owner:
+            return raw
+        return owner + raw
+    if scheme == "presign":
+        return owner
+    return raw
 
 
 async def _resolve_order(uid: str, cache: Any, api: Any) -> dict[str, Any] | None:

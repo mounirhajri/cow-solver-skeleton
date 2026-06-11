@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.shadow.feasibility import FeasibilityGate, validate_solution
+from src.shadow.feasibility import FeasibilityGate, _sig_bytes, validate_solution
 
 _SELL = "0x1111111111111111111111111111111111111111"
 _BUY = "0x2222222222222222222222222222222222222222"
@@ -165,6 +165,58 @@ async def test_multi_trade_resolves_each_order() -> None:
     assert v.feasible is True
     assert cache.get.await_count == 2
     rpc.eth_call_capture.assert_awaited_once()
+
+
+# ── _sig_bytes: scheme-specific trade-signature framing ─────────────────────
+# GPv2Signing reads the trade signature differently per scheme. Getting this
+# wrong silently condemned every eip1271 solution (117/117 on 2026-06-11) and
+# produced the historical "malformed presignature" artifact for presign.
+
+_OWNER = "0x" + "ab" * 20
+
+
+def test_sig_bytes_ecdsa_passes_raw_signature() -> None:
+    o = {"signature": "0x" + "11" * 65, "signingScheme": "eip712", "owner": _OWNER}
+    assert _sig_bytes(o) == bytes.fromhex("11" * 65)
+
+
+def test_sig_bytes_eip1271_prefixes_owner() -> None:
+    """GPv2 reads signature[0:20] as the verifier address — without the owner
+    prefix it staticcalls a garbage address decoded from ABI padding, whose
+    empty returndata makes GPv2 revert with EMPTY data (the silent-phantom
+    class)."""
+    payload = "00" * 12 + "af" * 20 + "cd" * 100  # ABI-ish, NOT owner-prefixed
+    o = {"signature": "0x" + payload, "signingScheme": "eip1271", "owner": _OWNER}
+    out = _sig_bytes(o)
+    assert out[:20] == bytes.fromhex("ab" * 20)        # owner first
+    assert out[20:] == bytes.fromhex(payload)          # payload verbatim
+
+
+def test_sig_bytes_eip1271_does_not_double_prefix() -> None:
+    already = bytes.fromhex("ab" * 20 + "cd" * 64)
+    o = {"signature": "0x" + already.hex(), "signingScheme": "eip1271", "owner": _OWNER}
+    assert _sig_bytes(o) == already
+
+
+def test_sig_bytes_presign_is_exactly_the_owner() -> None:
+    """presign trade signature = the 20-byte owner. The API sends '0x';
+    passing that through produced 'GPv2: malformed presignature'."""
+    o = {"signature": "0x", "signingScheme": "presign", "owner": _OWNER}
+    assert _sig_bytes(o) == bytes.fromhex("ab" * 20)
+
+
+def test_sig_bytes_smart_wallet_without_owner_raises_to_unknown() -> None:
+    """eip1271/presign without a usable owner can NOT be framed — raising lets
+    validate_solution map it to UNKNOWN instead of re-creating the silent
+    phantom (reviewer-flagged wrong-direction failure)."""
+    for scheme in ("eip1271", "presign"):
+        with pytest.raises(ValueError):
+            _sig_bytes({"signature": "0x" + "cd" * 32, "signingScheme": scheme})
+
+
+def test_sig_bytes_missing_scheme_defaults_to_raw() -> None:
+    o = {"signature": "0x" + "22" * 65, "owner": _OWNER}
+    assert _sig_bytes(o) == bytes.fromhex("22" * 65)
 
 
 # ── FeasibilityGate: the hard pre-submission wrapper ────────────────────────
