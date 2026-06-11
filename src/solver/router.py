@@ -275,8 +275,51 @@ class RouterSolver:
             return NoSolution()
 
         if self._v3_only_batched:
-            return await self._solve_v3_batched(auction, orders)
-        return await self._solve_legacy(auction, orders)
+            result = await self._solve_v3_batched(auction, orders)
+        else:
+            result = await self._solve_legacy(auction, orders)
+        return await self._funding_gate(auction, result)
+
+    async def _funding_gate(
+        self, auction: Auction, result: Solution | NoSolution
+    ) -> Solution | NoSolution:
+        """Final guard: no solution leaves the router containing an order whose
+        owner provably cannot fund the sell side.
+
+        The candidate pre-filter covers the top-K QUOTE candidates, but orders
+        can enter a solution through other paths (joint solves, partial-fill
+        legs, V2 fallback) — measured 2026-06-11: a handful of permanently
+        unfunded composable zombie orders (balance 0 for days, infinite
+        allowance) were re-solved hundreds of times per day, solo and as joint
+        partners, condemning every settlement they touched. One extra cheap
+        multicall per SOLVED auction re-checks every order in the final
+        solution; any provably-dead order rejects the whole solution (a
+        settlement with one dead leg reverts entirely on-chain anyway).
+        Fail-open inherits from filter_valid_orders.
+        """
+        if isinstance(result, NoSolution) or not self._order_validity_filter:
+            return result
+        uids = {t.order_uid for t in result.trades}
+        solution_orders = [o for o in auction.orders if o.uid in uids]
+        if not solution_orders:
+            return result
+        sim = auction.simulation_block
+        block = hex(sim) if sim is not None and sim > 0 else "latest"
+        _, dropped = await filter_valid_orders(
+            self._multicall,
+            solution_orders,
+            settlement_addr=self._gpv2_settlement,
+            block=block,
+        )
+        if dropped:
+            log.warning(
+                "router_solution_dropped_unfunded_order",
+                auction_id=auction.id,
+                n_trades=len(result.trades),
+                dropped={u[:18]: r for u, r in dropped.items()},
+            )
+            return NoSolution()
+        return result
 
     # ── V3-only batched path ──────────────────────────────────────────────────
 

@@ -200,30 +200,48 @@ async def test_partial_sell_funding_checked_against_remaining() -> None:
     assert dropped == {}
 
 
-@pytest.mark.asyncio
-async def test_permit_hook_order_skips_funding_checks() -> None:
-    """An order with preInteractions (e.g. an EIP-2612 permit hook) may only
-    receive its allowance AT settlement — solve-time wallet reads must not
-    condemn it (reviewer-flagged false-drop class)."""
-    o = Order.model_validate({
-        "uid": _uid(1), "sellToken": USDC, "buyToken": WETH,
+def _permit_order(i: int = 1) -> Order:
+    return Order.model_validate({
+        "uid": _uid(i), "sellToken": USDC, "buyToken": WETH,
         "sellAmount": "1000000", "buyAmount": "300000000000000",
         "validTo": 2_000_000_000, "kind": "sell",
-        "owner": "0x" + "11" * 20, "partiallyFillable": False,
+        "owner": "0x" + f"{i:02x}" * 20, "partiallyFillable": False,
         "class": "limit", "signingScheme": "eip712",
         "preInteractions": [{"target": "0x" + "22" * 20, "value": "0", "callData": "0x"}],
     })
+
+
+@pytest.mark.asyncio
+async def test_permit_hook_order_skips_only_the_allowance_check() -> None:
+    """preInteractions exempt ONLY the allowance check: a permit hook can mint
+    the ALLOWANCE at settlement, but nothing mints BALANCE — the measured
+    zombie class (permanent balance 0, hundreds of re-solves/day) slipped
+    through a blanket exemption. Funded-but-unapproved permit order → kept,
+    allowance not even queried."""
+    o = _permit_order(1)
     record: dict[str, Any] = {}
     mc = _fake_multicall(
-        balance={o.owner.lower(): 0},  # would drop WITHOUT the exemption
-        allowance={o.owner.lower(): 0},
+        balance={o.owner.lower(): 10**12},  # funded
+        allowance={o.owner.lower(): 0},     # would drop WITHOUT the exemption
         record=record,
     )
     kept, dropped = await filter_valid_orders(mc, [o], settlement_addr=SETTLEMENT)
     assert kept == [o]
     assert dropped == {}
-    sels = {c.call_data[2:10] for c in record["calls"]}
-    assert BALANCE_OF_SELECTOR not in sels  # funding checks not even queried
+    sels = [c.call_data[2:10] for c in record["calls"]]
+    assert BALANCE_OF_SELECTOR in sels       # balance IS checked
+    assert ALLOWANCE_SELECTOR not in sels    # allowance is exempt
+
+
+@pytest.mark.asyncio
+async def test_permit_hook_order_with_zero_balance_is_dropped() -> None:
+    """The zombie shape: preInteractions present, balance permanently 0 —
+    MUST be dropped despite the hook exemption."""
+    o = _permit_order(1)
+    mc = _fake_multicall(balance={o.owner.lower(): 0})
+    kept, dropped = await filter_valid_orders(mc, [o], settlement_addr=SETTLEMENT)
+    assert kept == []
+    assert dropped == {o.uid: "insufficient_balance"}
 
 
 @pytest.mark.asyncio
@@ -364,7 +382,8 @@ async def test_router_validity_filter_redirects_to_next_order(monkeypatch) -> No
 
     async def fake_filter(_mc, orders, *, settlement_addr, vault_relayer=None, block):
         kept = [o for o in orders if o.uid != zombie.uid]
-        return kept, {zombie.uid: "filled"}
+        dropped = {zombie.uid: "filled"} if len(kept) < len(orders) else {}
+        return kept, dropped
 
     monkeypatch.setattr("src.solver.router.filter_valid_orders", fake_filter)
     quoted: list[str] = []
@@ -402,6 +421,54 @@ async def test_router_validity_filter_disabled_is_inert(monkeypatch) -> None:
     )
     await solver.solve(_auction([_order(1)]))
     assert calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_router_funding_gate_rejects_solution_with_dead_order(monkeypatch) -> None:
+    """The final guard: even when an unfunded order slips past the candidate
+    pre-filter (joint legs, exemptions, ranking edge), the post-solve gate
+    re-checks every order in the FINAL solution and rejects the whole thing —
+    a settlement with one dead leg reverts entirely on-chain anyway."""
+    from src.solver.base import NoSolution
+    from src.solver.router import RouterSolver
+
+    calls = {"n": 0}
+
+    async def fake_filter(_mc, orders, *, settlement_addr, vault_relayer=None, block):
+        calls["n"] += 1
+        if calls["n"] == 1:  # candidate pre-filter lets everything through
+            return list(orders), {}
+        return [], {orders[0].uid: "insufficient_balance"}  # gate finds the zombie
+
+    monkeypatch.setattr("src.solver.router.filter_valid_orders", fake_filter)
+    _mock_quoter(monkeypatch, [])
+
+    solver = RouterSolver(
+        multicall=MagicMock(), intermediates=[],
+        max_orders=1, order_validity_filter=True,
+    )
+    result = await solver.solve(_auction([_order(1)]))
+    assert isinstance(result, NoSolution)
+    assert calls["n"] == 2  # pre-filter + gate both ran
+
+
+@pytest.mark.asyncio
+async def test_router_funding_gate_passes_clean_solution(monkeypatch) -> None:
+    from src.solver.base import NoSolution
+    from src.solver.router import RouterSolver
+
+    async def fake_filter(_mc, orders, *, settlement_addr, vault_relayer=None, block):
+        return list(orders), {}
+
+    monkeypatch.setattr("src.solver.router.filter_valid_orders", fake_filter)
+    _mock_quoter(monkeypatch, [])
+
+    solver = RouterSolver(
+        multicall=MagicMock(), intermediates=[],
+        max_orders=1, order_validity_filter=True,
+    )
+    result = await solver.solve(_auction([_order(1)]))
+    assert not isinstance(result, NoSolution)
 
 
 @pytest.mark.asyncio

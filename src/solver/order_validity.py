@@ -113,23 +113,27 @@ def _build_checks(
                 allow_failure=True,
             ))
             checks.append(_Check(o.uid, "presig"))
-        # Funding checks only when wallet state is authoritative: plain erc20
-        # sell balance AND no pre-interactions (a permit hook can mint the
-        # allowance at settlement, so solve-time wallet reads would falsely
-        # condemn such orders).
-        if o.sell_token_balance.lower() == "erc20" and not o.pre_interactions:
+        # Funding checks only when wallet state is authoritative (plain erc20
+        # sell balance). preInteractions exempt ONLY the allowance check: a
+        # permit hook can mint the ALLOWANCE at settlement, but nothing mints
+        # BALANCE out of thin air — and the measured zombie class (composable
+        # orders with permanent balance 0, re-solved hundreds of times/day,
+        # 2026-06-11) slipped through precisely via a blanket preInteractions
+        # exemption. Balance is always checked.
+        if o.sell_token_balance.lower() == "erc20":
             calls.append(Call(
                 target=o.sell_token,
                 call_data=_encode_balance_of(o.owner),
                 allow_failure=True,
             ))
             checks.append(_Check(o.uid, "balance"))
-            calls.append(Call(
-                target=o.sell_token,
-                call_data=_encode_allowance(o.owner, vault_relayer),
-                allow_failure=True,
-            ))
-            checks.append(_Check(o.uid, "allowance"))
+            if not o.pre_interactions:
+                calls.append(Call(
+                    target=o.sell_token,
+                    call_data=_encode_allowance(o.owner, vault_relayer),
+                    allow_failure=True,
+                ))
+                checks.append(_Check(o.uid, "allowance"))
     return calls, checks
 
 
