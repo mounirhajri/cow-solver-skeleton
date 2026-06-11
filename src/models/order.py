@@ -53,6 +53,20 @@ class Order(BaseModel):
     # Optional — older fixtures and EOA-only auctions omit it entirely.  We
     # tolerate the field being absent and default to None (treated as EOA).
     signing_scheme: str | None = Field(alias="signingScheme", default=None)
+    # Where the sell funds live: "erc20" (default, plain wallet balance) or a
+    # Balancer-vault variant ("external"/"internal"). The order-validity
+    # pre-filter checks wallet balanceOf/allowance, which is only meaningful
+    # for plain erc20 funding — vault-funded orders skip those checks rather
+    # than risk a false drop.
+    sell_token_balance: str = Field(alias="sellTokenBalance", default="erc20")
+    # Driver-provided pre-settlement interactions (e.g. an EIP-2612 permit
+    # from app-data hooks). When present, balance/allowance may only come
+    # into existence AT settlement — wallet-state checks at solve time would
+    # falsely condemn such orders, so the validity filter skips funding
+    # checks for them. Opaque payload; we only care about emptiness.
+    pre_interactions: list[dict[str, object]] = Field(
+        alias="preInteractions", default_factory=list
+    )
 
     @field_validator("signing_scheme")
     @classmethod

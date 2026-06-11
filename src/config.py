@@ -66,6 +66,14 @@ class Settings(BaseSettings):
     # throttle cliff; raise/lower via RPC_MAX_CONCURRENT from the live
     # router_v3_batched_failed signal without a redeploy. No higher RPC tier.
     rpc_max_concurrent: int = 4
+    # Order-validity pre-filter (router-v2): before quoting, check the top-K
+    # candidates with one cheap Multicall (filledAmount / preSignature /
+    # balanceOf / vault-relayer allowance, at the auction's simulation block)
+    # and drop provably-dead orders so they stop occupying the top-N quote
+    # slots. Proven phantom causes from the feasibility work: order filled,
+    # missing presignature, un-fundable counterparty. Fail-open on any infra
+    # error — this kill-switch exists for emergencies, not for tuning.
+    order_validity_filter_enabled: bool = True
     # Intermediates for router-v2.  Restricted to WETH only (vs the full list used
     # by naive) to halve the per-order call count: direct + WETH 2-hop = 9 calls
     # instead of direct + WETH/USDC/USDT 2-hop = 21 calls.

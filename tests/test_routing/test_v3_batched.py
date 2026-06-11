@@ -121,7 +121,7 @@ async def test_batched_v3_quote_single_hop_decode() -> None:
         [123456, 0, 0, 50000],
     )
 
-    async def fake_aggregate(_calls: list[Call]) -> list[CallResult]:
+    async def fake_aggregate(_calls: list[Call], block: str = "latest") -> list[CallResult]:
         return [CallResult(success=True, return_data=return_data)]
 
     mc.aggregate = fake_aggregate  # type: ignore[assignment]
@@ -149,7 +149,7 @@ async def test_batched_v3_quote_multi_hop_decode() -> None:
         [999999, [1, 2], [3, 4], 80000],
     )
 
-    async def fake_aggregate(_calls: list[Call]) -> list[CallResult]:
+    async def fake_aggregate(_calls: list[Call], block: str = "latest") -> list[CallResult]:
         return [CallResult(success=True, return_data=return_data)]
 
     mc.aggregate = fake_aggregate  # type: ignore[assignment]
@@ -177,7 +177,7 @@ async def test_batched_v3_quote_revert_returns_zero_amount() -> None:
         [777, 0, 0, 0],
     )
 
-    async def fake_aggregate(_calls: list[Call]) -> list[CallResult]:
+    async def fake_aggregate(_calls: list[Call], block: str = "latest") -> list[CallResult]:
         return [
             CallResult(success=False, return_data=b""),  # revert
             CallResult(success=True, return_data=ok_data),
@@ -218,7 +218,7 @@ async def test_batched_v3_quote_chunks_to_stay_under_gas_cap() -> None:
 
     chunk_sizes: list[int] = []
 
-    async def fake_aggregate(calls: list[Call]) -> list[CallResult]:
+    async def fake_aggregate(calls: list[Call], block: str = "latest") -> list[CallResult]:
         chunk_sizes.append(len(calls))
         return [CallResult(success=True, return_data=ok_data) for _ in calls]
 
@@ -249,7 +249,7 @@ async def test_batched_v3_quote_bisects_on_out_of_gas() -> None:
     mc = Multicall3(rpc)
     ok_data = encode(["uint256", "uint160", "uint32", "uint256"], [42, 0, 0, 0])
 
-    async def fake_aggregate(calls: list[Call]) -> list[CallResult]:
+    async def fake_aggregate(calls: list[Call], block: str = "latest") -> list[CallResult]:
         # Simulate the provider gas cap: any batch > 2 reverts the whole call.
         if len(calls) > 2:
             raise RuntimeError("RPC error -32000: out of gas")
@@ -281,7 +281,7 @@ async def test_batched_v3_quote_drops_only_the_overcap_quote() -> None:
     ok_data = encode(["uint256", "uint160", "uint32", "uint256"], [99, 0, 0, 0])
     poison_uid = "o-poison"
 
-    async def fake_aggregate(calls: list[Call]) -> list[CallResult]:
+    async def fake_aggregate(calls: list[Call], block: str = "latest") -> list[CallResult]:
         # The poison path overflows even as a singleton; mixing it into any
         # multi-call batch overflows the whole batch.
         if len(calls) > 1:
@@ -321,7 +321,9 @@ async def test_batched_v3_quote_drops_chunk_on_non_gas_error() -> None:
     ok_data = encode(["uint256", "uint160", "uint32", "uint256"], [55, 0, 0, 0])
     seen = {"n": 0}
 
-    async def fake_aggregate_resilient(calls: list[Call]) -> list[CallResult]:
+    async def fake_aggregate_resilient(
+        calls: list[Call], block: str = "latest"
+    ) -> list[CallResult]:
         seen["n"] += 1
         if seen["n"] == 2:  # second chunk fails with a non-gas error
             raise RuntimeError("RPC error 429: Too Many Requests")
@@ -346,7 +348,7 @@ async def test_batched_v3_quote_empty_paths_skips_rpc() -> None:
     mc = Multicall3(rpc)
     calls_made = 0
 
-    async def fake_aggregate(_calls: list[Call]) -> list[CallResult]:
+    async def fake_aggregate(_calls: list[Call], block: str = "latest") -> list[CallResult]:
         nonlocal calls_made
         calls_made += 1
         return []

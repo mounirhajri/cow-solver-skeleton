@@ -53,7 +53,7 @@ async def test_aggregate_resilient_passthrough_when_fits() -> None:
     from src.routing.multicall import CallResult
     mc = Multicall3(AsyncMock())
 
-    async def fake(calls: list[Call]) -> list[CallResult]:
+    async def fake(calls: list[Call], block: str = "latest") -> list[CallResult]:
         return [CallResult(success=True, return_data=b"\x01") for _ in calls]
 
     mc.aggregate = fake  # type: ignore[assignment]
@@ -67,7 +67,7 @@ async def test_aggregate_resilient_bisects_on_overflow_and_stays_aligned() -> No
     from src.routing.multicall import CallResult
     mc = Multicall3(AsyncMock())
 
-    async def fake(calls: list[Call]) -> list[CallResult]:
+    async def fake(calls: list[Call], block: str = "latest") -> list[CallResult]:
         if len(calls) > 2:
             raise RuntimeError("RPC error -32000: out of gas")
         # Echo the call index (last byte of target) so we can assert alignment.
@@ -85,7 +85,7 @@ async def test_aggregate_resilient_drops_single_overcap_call() -> None:
     from src.routing.multicall import CallResult
     mc = Multicall3(AsyncMock())
 
-    async def fake(calls: list[Call]) -> list[CallResult]:
+    async def fake(calls: list[Call], block: str = "latest") -> list[CallResult]:
         # Any multi-call batch overflows; the poison singleton (_call(1),
         # call_data "0x01") overflows even alone; other singletons succeed.
         if len(calls) > 1 or calls[0].call_data == "0x01":
@@ -103,7 +103,7 @@ async def test_aggregate_resilient_drops_single_overcap_call() -> None:
 async def test_aggregate_resilient_reraises_non_gas_error() -> None:
     mc = Multicall3(AsyncMock())
 
-    async def fake(_calls: list[Call]) -> list:
+    async def fake(_calls: list[Call], block: str = "latest") -> list:
         raise RuntimeError("RPC error 500: internal server error")
 
     mc.aggregate = fake  # type: ignore[assignment]

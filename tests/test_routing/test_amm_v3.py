@@ -54,7 +54,7 @@ async def test_quote_v3_all_fee_tiers_returns_quotes() -> None:
     rpc = AsyncMock()
     mc = Multicall3(rpc)
 
-    async def fake_aggregate(calls: list) -> list[CallResult]:
+    async def fake_aggregate(calls: list, block: str = "latest") -> list[CallResult]:
         return [
             CallResult(success=True, return_data=successful_data),
             CallResult(success=True, return_data=successful_data),
@@ -78,7 +78,7 @@ async def test_best_v3_quote_picks_highest_amount_out() -> None:
     rpc = AsyncMock()
     mc = Multicall3(rpc)
 
-    async def fake_aggregate(calls: list) -> list[CallResult]:
+    async def fake_aggregate(calls: list, block: str = "latest") -> list[CallResult]:
         # All 4 fee tiers return different amounts
         results = []
         for amt in (100, 500, 200, 50):
@@ -105,7 +105,7 @@ async def test_quote_v3_zero_amount_out_filtered() -> None:
     rpc = AsyncMock()
     mc = Multicall3(rpc)
 
-    async def fake_aggregate(calls: list) -> list[CallResult]:
+    async def fake_aggregate(calls: list, block: str = "latest") -> list[CallResult]:
         return [
             CallResult(
                 success=True,
@@ -127,7 +127,7 @@ async def test_best_v3_quote_all_fail_returns_none() -> None:
     rpc = AsyncMock()
     mc = Multicall3(rpc)
 
-    async def fake_aggregate(calls: list) -> list[CallResult]:
+    async def fake_aggregate(calls: list, block: str = "latest") -> list[CallResult]:
         return [CallResult(success=False, return_data=b"")] * len(calls)
 
     mc.aggregate = fake_aggregate  # type: ignore[assignment]

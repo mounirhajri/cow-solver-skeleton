@@ -36,6 +36,7 @@ from src.models.order import Order
 from src.models.solution import Solution, Trade
 from src.routing.amm_v3 import FEE_TIERS
 from src.routing.multicall import Multicall3
+from src.solver.order_validity import filter_valid_orders
 
 if TYPE_CHECKING:
     from edge.matching.ghost_detector import GhostDetector
@@ -160,6 +161,12 @@ class RouterSolver:
         # 1-WBTC TWAP at +22 % oracle observed 2026-05-27) don't dominate
         # the top-N selection.
         ghost_detector: GhostDetector | None = None,
+        # Order-validity pre-filter — one cheap Multicall over the top-K
+        # candidates (filledAmount / preSignature / balance / allowance at the
+        # auction's simulation block) so dead orders don't occupy the top-N
+        # quote slots. None defers to settings (kill-switch:
+        # order_validity_filter_enabled); explicit values for tests.
+        order_validity_filter: bool | None = None,
     ) -> None:
         self._multicall = multicall
         self._intermediates = intermediates
@@ -185,6 +192,11 @@ class RouterSolver:
         # being non-empty AND the settings flag — either off → V3-only as before.
         self._v2_sources = v2_sources or []
         self._ghost_detector = ghost_detector
+        self._order_validity_filter = (
+            settings.order_validity_filter_enabled
+            if order_validity_filter is None
+            else order_validity_filter
+        )
         # Advertise a custom timeout so the orchestrator gives us more headroom
         # than the default 5 s per-strategy limit.
         self.timeout: float = strategy_timeout
@@ -221,11 +233,43 @@ class RouterSolver:
         # is symmetric across kinds. The V3-batched path quotes sells with
         # exactInput and buys with exactOutput. The legacy path filters
         # buys out (quote_best_path is exact-input only).
-        orders = sorted(
+        ranked = sorted(
             candidate_orders,
             key=lambda o: _expected_surplus_sort_key(o, auction),
             reverse=True,
-        )[: self._max_orders]
+        )
+
+        # Order-validity pre-filter: check the top-K (K = 3×N) candidates with
+        # ONE cheap Multicall (filled / presign / balance / allowance) so that
+        # dead zombie orders — which otherwise sit at the top of the surplus
+        # sort auction after auction — don't occupy the N quote slots. The
+        # check runs at the auction's simulation block when present: the
+        # shadow poller solves POST-settlement, and at `latest` the orders the
+        # real winner just filled would falsely read as dead. Live driver
+        # auctions carry no simulation block → `latest` (correct). Fail-open:
+        # any infra error keeps every candidate.
+        if self._order_validity_filter and ranked:
+            top_k = ranked[: self._max_orders * 3]
+            sim = auction.simulation_block
+            block = hex(sim) if sim is not None and sim > 0 else "latest"
+            kept, dropped = await filter_valid_orders(
+                self._multicall,
+                top_k,
+                settlement_addr=self._gpv2_settlement,
+                block=block,
+            )
+            if dropped:
+                log.info(
+                    "router_order_validity_filter",
+                    auction_id=auction.id,
+                    n_dropped=len(dropped),
+                    n_kept=len(kept),
+                    reasons=sorted(dropped.values()),
+                    block=block,
+                )
+            orders = kept[: self._max_orders]
+        else:
+            orders = ranked[: self._max_orders]
 
         if not orders:
             return NoSolution()

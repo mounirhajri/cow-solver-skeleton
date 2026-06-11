@@ -52,7 +52,7 @@ class Multicall3:
         self.rpc = rpc
         self.address = address
 
-    async def aggregate(self, calls: list[Call]) -> list[CallResult]:
+    async def aggregate(self, calls: list[Call], block: str = "latest") -> list[CallResult]:
         if not calls:
             return []
         tuples = [
@@ -65,13 +65,15 @@ class Multicall3:
         ]
         encoded_args = encode(["(address,bool,bytes)[]"], [tuples])
         data = "0x" + AGGREGATE3_SELECTOR + encoded_args.hex()
-        result_hex = await self.rpc.eth_call(self.address, data)
+        result_hex = await self.rpc.eth_call(self.address, data, block=block)
         # Decode (bool, bytes)[]
         raw = bytes.fromhex(result_hex[2:] if result_hex.startswith("0x") else result_hex)
         (decoded,) = decode(["(bool,bytes)[]"], raw)
         return [CallResult(success=bool(d[0]), return_data=bytes(d[1])) for d in decoded]
 
-    async def aggregate_resilient(self, calls: list[Call]) -> list[CallResult]:
+    async def aggregate_resilient(
+        self, calls: list[Call], block: str = "latest"
+    ) -> list[CallResult]:
         """``aggregate`` that survives a node gas-cap overflow.
 
         A single QuoterV2 call over a deep tick range can cost millions of gas,
@@ -89,7 +91,7 @@ class Multicall3:
         if not calls:
             return []
         try:
-            return await self.aggregate(calls)
+            return await self.aggregate(calls, block=block)
         except Exception as exc:  # noqa: BLE001
             if not _is_gas_overflow(exc):
                 raise
@@ -97,8 +99,8 @@ class Multicall3:
                 log.warning("multicall_call_dropped_out_of_gas", target=calls[0].target)
                 return [CallResult(success=False, return_data=b"")]
             mid = len(calls) // 2
-            left = await self.aggregate_resilient(calls[:mid])
-            right = await self.aggregate_resilient(calls[mid:])
+            left = await self.aggregate_resilient(calls[:mid], block=block)
+            right = await self.aggregate_resilient(calls[mid:], block=block)
             return left + right
 
     @staticmethod
