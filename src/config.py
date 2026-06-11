@@ -74,6 +74,22 @@ class Settings(BaseSettings):
     # missing presignature, un-fundable counterparty. Fail-open on any infra
     # error — this kill-switch exists for emergencies, not for tuning.
     order_validity_filter_enabled: bool = True
+    # ── Driver-deadline awareness ───────────────────────────────────────────
+    # The CoW driver aborts /solve after ~5.8 s (measured 2026-06-11 from the
+    # Caddy access log: aborts cluster at 5.5-5.8 s; the auction `deadline`
+    # field confirms the same budget). We must answer BEFORE that cutoff or
+    # the driver records a timeout and our solution never competes. The
+    # effective solve timeout becomes min(solve_timeout_seconds,
+    # deadline - now - this margin); the margin covers response serialization
+    # + network RTT back to the driver. Auctions without a deadline (our
+    # internal poller) keep the full solve_timeout_seconds.
+    solve_deadline_margin_seconds: float = 0.7
+    # naive's price refiner previously burned a hardcoded 3.0 s — more than
+    # half the driver budget — refining a solution that is NEVER submitted
+    # (excluded from the composer) and whose score is NULLed at persist time.
+    # 1.0 s keeps a rough refinement for shadow observability without
+    # starving the strategies that actually compete.
+    naive_refine_timeout: float = 1.0
     # Intermediates for router-v2.  Restricted to WETH only (vs the full list used
     # by naive) to halve the per-order call count: direct + WETH 2-hop = 9 calls
     # instead of direct + WETH/USDC/USDT 2-hop = 21 calls.

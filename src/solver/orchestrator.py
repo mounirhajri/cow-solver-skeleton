@@ -429,7 +429,7 @@ def load_default_strategies() -> list[SolverStrategy]:
     strategies.append(NaiveSolver(
         multicall=multicall,
         intermediates=settings.intermediate_tokens,
-        refine_timeout=3.0,
+        refine_timeout=settings.naive_refine_timeout,
     ))
 
     try:
@@ -611,7 +611,7 @@ def _load_default_strategies_with_multicall(multicall: Any) -> list[SolverStrate
     strategies.append(NaiveSolver(
         multicall=multicall,
         intermediates=settings.intermediate_tokens,
-        refine_timeout=3.0,
+        refine_timeout=settings.naive_refine_timeout,
     ))
 
     try:

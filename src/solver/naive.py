@@ -35,13 +35,14 @@ class NaiveSolver:
         self._multicall = multicall
         self._intermediates = intermediates or []
         self._refine_timeout = refine_timeout
-        # Declare a custom per-strategy timeout so the orchestrator gives the
-        # price refiner enough room.  The budget-divided default (13 s / 5
-        # strategies ≈ 2.6 s) is shorter than refine_timeout (3 s), so naive
-        # would be cancelled before the refiner finishes without this override.
-        # A global asyncio.wait_for(solve_timeout_seconds=13 s) in main.py caps
-        # the entire solve call, so individual strategy overrides cannot cause
-        # the server to miss CoW Protocol's 15 s response deadline.
+        # Declare a custom per-strategy timeout (refine + 1 s headroom) so the
+        # orchestrator's budget-divided default can't cancel the refiner
+        # mid-flight. The production refine_timeout comes from
+        # settings.naive_refine_timeout (1.0 s as of 2026-06-11 — the CoW
+        # driver aborts /solve at ~5.8 s, and naive is never submitted, so it
+        # must not starve the strategies that actually compete). main.py's
+        # outer wait_for is bounded by the auction's driver deadline, so a
+        # strategy override can never push the response past CoW's cutoff.
         self.timeout: float = refine_timeout + 1.0
 
     async def solve(self, auction: Auction) -> Solution | NoSolution:

@@ -1,7 +1,9 @@
 import asyncio
+import re
 import time
 from contextlib import asynccontextmanager
 from contextlib import suppress as _suppress
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
@@ -18,6 +20,32 @@ from src.solver.base import NoSolution
 from src.solver.orchestrator import AttemptRecord, SolverOrchestrator, load_default_orchestrator
 
 log = get_logger(__name__)
+
+# CoW timestamps carry NANOsecond precision ("…T13:11:54.833852274Z");
+# datetime.fromisoformat only accepts up to microseconds → trim to 6 digits.
+_FRACTION_TRIM = re.compile(r"\.(\d{6})\d+")
+
+
+def _deadline_budget_seconds(deadline: str | None) -> float | None:
+    """Seconds remaining until the driver's deadline; None when unknown.
+
+    Fail-open: an absent or unparseable deadline returns None and the caller
+    falls back to the configured solve timeout — a malformed timestamp must
+    never reject an auction.
+    """
+    if not deadline:
+        return None
+    try:
+        s = _FRACTION_TRIM.sub(r".\1", deadline.strip())
+        if s.endswith(("Z", "z")):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return (dt - datetime.now(UTC)).total_seconds()
+    except Exception:  # noqa: BLE001
+        log.warning("solve_deadline_unparseable", deadline=deadline)
+        return None
 
 
 def create_app(
@@ -75,17 +103,35 @@ def create_app(
         # wait_for cancels mid-strategy (e.g. multi-party LP exceeding the
         # solve_timeout). Without this, every timeout left shadow_solutions
         # un-written (verified outage 2026-05-24 → 2026-05-25).
+        # Respect the driver's deadline: the CoW driver aborts the request at
+        # its own cutoff (~5.8 s measured live), so a solution returned later
+        # never competes — it only shows up as kind=timeout in /notify. Bound
+        # the solve to (deadline - now - margin) and ALWAYS answer in time;
+        # auctions without a deadline (internal poller) keep the full budget.
+        timeout = settings.solve_timeout_seconds
+        budget = _deadline_budget_seconds(auction.deadline)
+        if budget is not None:
+            timeout = min(timeout, budget - settings.solve_deadline_margin_seconds)
+            if timeout <= 0:
+                log.warning(
+                    "solve_deadline_already_passed",
+                    auction_id=auction.id,
+                    budget_seconds=round(budget, 3),
+                )
+                SOLVE_TOTAL.labels(outcome="no_solution").inc()
+                return _empty_solutions()
+
         attempts: list[AttemptRecord] = []
         try:
             result, _ = await asyncio.wait_for(
                 orchestrator.solve(auction, attempts),
-                timeout=settings.solve_timeout_seconds,
+                timeout=timeout,
             )
         except TimeoutError:
             log.warning(
                 "solve_timeout",
                 auction_id=auction.id,
-                timeout=settings.solve_timeout_seconds,
+                timeout=round(timeout, 3),
             )
             SOLVE_TOTAL.labels(outcome="error").inc()
             background_tasks.add_task(persist_shadow_attempt_safe, auction, attempts, None)

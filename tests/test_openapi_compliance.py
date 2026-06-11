@@ -46,7 +46,7 @@ def _driver_shaped_auction() -> dict:
         "orders": [],
         "liquidity": [],
         "effectiveGasPrice": "1500000000",
-        "deadline": "2026-06-01T12:00:00Z",
+        "deadline": "2030-01-01T00:00:00Z",
         "surplusCapturingJitOrderOwners": [],
     }
 
@@ -185,6 +185,65 @@ def test_solve_returns_422_on_malformed_auction() -> None:
     resp = client.post("/solve", json=payload)
     assert resp.status_code == 422
     orch.solve.assert_not_called()
+
+
+def test_deadline_budget_parses_cow_nanosecond_format() -> None:
+    """The driver sends NANOsecond timestamps ('…54.833852274Z') which
+    datetime.fromisoformat rejects — the parser must trim and parse them.
+    Measured live 2026-06-11: driver aborts at ~5.8 s, so respecting this
+    field is what keeps our solutions in the competition."""
+    from datetime import UTC, datetime, timedelta
+
+    from src.main import _deadline_budget_seconds
+
+    future = (datetime.now(UTC) + timedelta(seconds=30)).strftime(
+        "%Y-%m-%dT%H:%M:%S.123456789Z"  # 9-digit fraction like the driver's
+    )
+    budget = _deadline_budget_seconds(future)
+    assert budget is not None
+    assert 25 < budget < 35
+
+    past = "2026-06-11T13:11:54.833852274Z"  # real captured driver value
+    b2 = _deadline_budget_seconds(past)
+    assert b2 is not None and b2 < 0  # parseable, in the past
+
+
+def test_deadline_budget_fails_open() -> None:
+    """Absent or garbage deadlines → None (fall back to the configured
+    timeout) — a malformed timestamp must never reject an auction."""
+    from src.main import _deadline_budget_seconds
+
+    assert _deadline_budget_seconds(None) is None
+    assert _deadline_budget_seconds("") is None
+    assert _deadline_budget_seconds("not-a-date") is None
+
+
+def test_solve_with_expired_deadline_returns_empty_without_solving() -> None:
+    """A deadline already in the past means the driver has given up — burning
+    a full solve would waste RPC budget on an answer nobody reads."""
+    payload = _driver_shaped_auction()
+    payload["deadline"] = "2026-06-01T00:00:00Z"  # past
+    orch = AsyncMock()
+    orch.solve.return_value = (NoSolution(), [])
+    app = create_app(orchestrator=orch)
+    client = TestClient(app)
+
+    resp = client.post("/solve", json=payload)
+    assert resp.status_code == 200
+    assert resp.json() == {"solutions": []}
+    orch.solve.assert_not_called()
+
+
+def test_solve_with_future_deadline_still_solves() -> None:
+    payload = _driver_shaped_auction()  # deadline 2030 → ample budget
+    orch = AsyncMock()
+    orch.solve.return_value = (NoSolution(), [])
+    app = create_app(orchestrator=orch)
+    client = TestClient(app)
+
+    resp = client.post("/solve", json=payload)
+    assert resp.status_code == 200
+    orch.solve.assert_called_once()
 
 
 def test_solve_returns_400_on_invalid_json() -> None:
