@@ -357,6 +357,99 @@ async def _view_score_gap(
 
 
 # ---------------------------------------------------------------------------
+# View 4: honest win-rate — feasible solutions vs the winner's OWN score
+# ---------------------------------------------------------------------------
+
+
+async def _view_honest_winrate(session: AsyncSession, since: datetime) -> None:
+    """The first defensible head-to-head, per strategy.
+
+    Two honesty restrictions that the older views lack:
+
+    1. **feasible = True only** — a phantom solution can never win, so its
+       score must not enter a win-rate. (Views 1/3 include every scored row
+       and are therefore upper-bound-biased.)
+    2. **The winner's OWN score** from the v2 competition data
+       (``shadow_competitors.is_winner``) — not our score re-priced at winner
+       prices, which was never a real head-to-head yardstick.
+
+    Remaining caveats (printed, do not quote a single number without them):
+    our CIP-14 score is computed by our own scorer (formula-matched but never
+    settled on-chain), fee/gas treatment may differ from the winner's
+    reported score, and the feasible population is small until the validity
+    filter has soaked. Directional, not pitch-grade.
+    """
+    q = (
+        select(
+            ShadowSolution.strategy,
+            ShadowSolution.auction_id,
+            ShadowSolution.our_score_wei,
+        )
+        .join(ShadowAuction, ShadowAuction.auction_id == ShadowSolution.auction_id)
+        .where(ShadowSolution.feasible.is_(True))
+        .where(ShadowSolution.our_score_wei.is_not(None))
+        .where(ShadowAuction.polled_at >= since)
+    )
+    rows = (await session.execute(q)).all()
+
+    print(f"\n{'='*60}")
+    print("View 4 — HONEST win-rate (feasible=True vs winner's own score)")
+    print(f"{'='*60}")
+    if not rows:
+        print("  No feasible scored solutions in window — let the validity")
+        print("  filter soak and re-run.")
+        return
+
+    auction_ids = sorted({r[1] for r in rows})
+    winner_q = await session.execute(
+        select(ShadowCompetitor.auction_id, ShadowCompetitor.score)
+        .where(
+            and_(
+                ShadowCompetitor.auction_id.in_(auction_ids),
+                ShadowCompetitor.is_winner.is_(True),
+                ShadowCompetitor.score.is_not(None),
+            )
+        )
+    )
+    winner_score: dict[int, int] = {r[0]: int(r[1]) for r in winner_q.all()}
+
+    # Per strategy: best feasible score per auction, then head-to-head.
+    per_strategy: dict[str, dict[int, int]] = defaultdict(dict)
+    for strategy, auction_id, score_wei in rows:
+        score = int(score_wei)
+        bucket = per_strategy[strategy]
+        if auction_id not in bucket or score > bucket[auction_id]:
+            bucket[auction_id] = score
+
+    print(f"  {'strategy':<26} {'n_feas':>6} {'n_h2h':>6} {'wins':>5} "
+          f"{'win%':>6}  {'median our/winner':>18}")
+    print("  " + "-" * 76)
+    for strategy in sorted(per_strategy):
+        bucket = per_strategy[strategy]
+        ratios: list[float] = []
+        wins = 0
+        n_h2h = 0
+        for auction_id, our_score in bucket.items():
+            w = winner_score.get(auction_id)
+            if w is None or w <= 0:
+                continue
+            n_h2h += 1
+            if our_score > w:
+                wins += 1
+            ratios.append(our_score / w)
+        win_pct = 100 * wins / n_h2h if n_h2h else float("nan")
+        med = statistics.median(ratios) if ratios else float("nan")
+        print(f"  {strategy:<26} {len(bucket):>6} {n_h2h:>6} {wins:>5} "
+              f"{win_pct:>5.1f}%  {med:>18.3f}")
+
+    print()
+    print("  Caveats: our score = our own CIP-14 computation (never settled")
+    print("  on-chain); fee/gas treatment may differ from the winner's score;")
+    print("  small n until the validity filter soaks. Directional only —")
+    print("  do NOT pitch these numbers.")
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -385,6 +478,11 @@ async def run_analysis(
 
     async with factory() as session:
         await _view_score_gap(session, since, strategy=strategy)
+
+    async with factory() as session:
+        # View 4 is per-strategy by construction; the --strategy flag does not
+        # apply (it always reports every strategy side by side).
+        await _view_honest_winrate(session, since)
 
     print()
 
