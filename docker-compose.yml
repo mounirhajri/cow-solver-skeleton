@@ -37,6 +37,9 @@ services:
       REWARDS_ADDRESS: ${REWARDS_ADDRESS:-0x0000000000000000000000000000000000000000}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       SHADOW_LOG_PATH: /data/shadow.jsonl
+      # Uniswap-V4 kill-switch: set ROUTER_V4_ENABLED=false in /opt/.../.env
+      # + `docker compose up -d` to disable V4 quoting without a code deploy.
+      ROUTER_V4_ENABLED: ${ROUTER_V4_ENABLED:-true}
     volumes:
       - ./data:/data
     depends_on:
@@ -88,6 +91,35 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+
+  cow-solver-retention:
+    # Image tag falls back to the local-built ``cow-solver:dev`` for dev /
+    # CI / tests where the GHCR image is unreachable. Production deploys
+    # override via the ``COW_SOLVER_IMAGE`` env var (set in /opt/.../​.env
+    # by the deploy step) to ``ghcr.io/mounirhajri/cow-solver:latest`` so
+    # ``docker compose pull`` and ``up`` resolve the registry image
+    # without trying to build a Dockerfile that isn't present on the host.
+    #
+    # Slims shadow_auctions.raw_auction rows older than 48h down to the
+    # orders referenced by a shadow_solutions row (raw_auction grows at
+    # ~2 GB/day from live driver traffic — the disk filled twice the week
+    # of 2026-06-08). See scripts/retention_loop.py for the consumer
+    # analysis behind the 48h cutoff. No redis dependency: the loop only
+    # talks to the shared postgres on the external stack network.
+    build: .
+    image: ${COW_SOLVER_IMAGE:-cow-solver:dev}
+    container_name: cow-solver-retention
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - stack
+    command: ["python", "-m", "scripts.retention_loop", "--loop"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      RETENTION_INTERVAL_SECONDS: ${RETENTION_INTERVAL_SECONDS:-900}
+    volumes:
+      - ./data:/data
 
   redis:
     image: redis:7-alpine

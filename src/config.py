@@ -104,6 +104,19 @@ class Settings(BaseSettings):
     # RPC load (~80x) but loses access to V2-only pools (rare on Arbitrum).
     router_v3_only_batched: bool = True
 
+    # Uniswap V4 quoting alongside V3 in the batched router pass. The
+    # 2026-06-12 loss decomposition showed V4 as the single biggest venue edge
+    # of the winning Arbitrum solver (12 of 30 analyzed winner settlements
+    # swapped on the V4 PoolManager). Sell orders only (exact-input), vanilla
+    # pools (hooks = 0). Best quote across V3+V4 wins per order; the venue of
+    # the winning path picks the encoder (V3 SwapRouter vs Universal Router +
+    # Permit2). Fail-open: any V4 quoting error leaves the V3 result intact.
+    # Addresses verified against developers.uniswap.org/contracts/v4/deployments.
+    router_v4_enabled: bool = True
+    v4_quoter_address: str = "0x3972C00F7ed4885e145823eb7C655375D275A1C5"
+    v4_universal_router: str = "0xA51afAFe0263b40EdaEf0Df8781eA9aa03E381a3"
+    v4_permit2: str = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+
     # V2 fallback: when set, RouterSolver also instantiates one V2Source per
     # configured V2 router and falls back to V2 quoting for orders the
     # V3-batched pass couldn't fill. Off by default — V2 routing adds RPC

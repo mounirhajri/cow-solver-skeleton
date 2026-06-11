@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from src.config import settings
 from src.encoder.erc20 import encode_approve
 from src.encoder.interactions import Interaction
-from src.encoder.v3 import apply_slippage_up, encode_v3_swap
+from src.encoder.v3 import apply_slippage_down, apply_slippage_up, encode_v3_swap
+from src.encoder.v4_calldata import encode_v4_swap_interactions
 from src.liquidity.base import LiquiditySource, SwapRequest
 from src.log import get_logger
 from src.models.auction import Auction
@@ -42,7 +44,14 @@ if TYPE_CHECKING:
     from edge.matching.ghost_detector import GhostDetector
 from src.routing.multihop import HopQuote, quote_best_path
 from src.routing.v3_batched import V3BatchedQuote, V3Path, batched_v3_quote
+from src.routing.v4_quoter import V4BatchedQuote, V4Path, batched_v4_quote, make_v4_paths
 from src.solver.base import NoSolution
+
+# Union of the two batched-quote shapes. Selection only touches the shared
+# surface (``amount_out`` + ``path.order_uid``/``amount_in``/``exact_output``),
+# so V3 and V4 quotes compete in one pool; the winning path's type picks the
+# encoder in _encode_path_interaction.
+RouteQuote = V3BatchedQuote | V4BatchedQuote
 
 # Deadline grace window encoded into the swap call.
 _SWAP_DEADLINE_SECONDS = 60
@@ -167,6 +176,13 @@ class RouterSolver:
         # quote slots. None defers to settings (kill-switch:
         # order_validity_filter_enabled); explicit values for tests.
         order_validity_filter: bool | None = None,
+        # Uniswap V4 quoting alongside V3 (sell orders, vanilla pools). None
+        # defers to settings (kill-switch: router_v4_enabled); explicit values
+        # for tests. Addresses default from settings the same way.
+        v4_enabled: bool | None = None,
+        v4_quoter_address: str | None = None,
+        v4_universal_router: str | None = None,
+        v4_permit2: str | None = None,
     ) -> None:
         self._multicall = multicall
         self._intermediates = intermediates
@@ -197,6 +213,14 @@ class RouterSolver:
             if order_validity_filter is None
             else order_validity_filter
         )
+        self._v4_enabled = settings.router_v4_enabled if v4_enabled is None else v4_enabled
+        self._v4_quoter_address = (
+            settings.v4_quoter_address if v4_quoter_address is None else v4_quoter_address
+        )
+        self._v4_universal_router = (
+            settings.v4_universal_router if v4_universal_router is None else v4_universal_router
+        )
+        self._v4_permit2 = settings.v4_permit2 if v4_permit2 is None else v4_permit2
         # Advertise a custom timeout so the orchestrator gives us more headroom
         # than the default 5 s per-strategy limit.
         self.timeout: float = strategy_timeout
@@ -388,12 +412,48 @@ class RouterSolver:
                         )
         return paths
 
+    def _build_v4_candidate_paths(self, orders: list[Order]) -> list[V4Path]:
+        """Per sell order: 4 direct V4 vanilla-pool paths (one per standard
+        tier), mirroring the V3 fraction scheme for partials (full + 0.75x +
+        0.5x in the same Multicall round-trip).
+
+        Buy orders are skipped: V4 exact-output is encoded in the quoter but
+        the Universal-Router encoder ships exact-input only (MVP scope from
+        the 2026-06-12 loss decomposition). Multi-hop and hooked pools are
+        likewise deferred — the decomposition showed direct vanilla V4 pools
+        as the dominant missing venue.
+        """
+        paths: list[V4Path] = []
+        for order in orders:
+            if order.kind != "sell":
+                continue
+            if order.partially_fillable:
+                amounts = [
+                    order.sell_amount,
+                    3 * order.sell_amount // 4,
+                    order.sell_amount // 2,
+                ]
+            else:
+                amounts = [order.sell_amount]
+            for amt in amounts:
+                # uint128 guard: V4 quotes carry amounts as uint128. A single
+                # garbage meme-token order with an enormous base-unit amount
+                # would make encoding raise during call building and (via the
+                # outer except) drop ALL V4 quotes for the auction. Skip the
+                # path instead — V3 still covers the order.
+                if amt >= 1 << 128:
+                    continue
+                paths.extend(
+                    make_v4_paths(order.uid, order.sell_token, order.buy_token, amt)
+                )
+        return paths
+
     @staticmethod
     def _select_best_quote_per_order(
-        quotes: list[V3BatchedQuote],
+        quotes: Sequence[RouteQuote],
         *,
         filter_amount_in: int | None = None,
-    ) -> dict[str, V3BatchedQuote]:
+    ) -> dict[str, RouteQuote]:
         """Select the best quote per order_uid.
 
         For sell orders (exact-input): higher amount_out wins — more
@@ -411,7 +471,7 @@ class RouterSolver:
         exactly this ``amount_in`` value. Used to select the best quote
         among a specific fraction (e.g. the best 0.75× route).
         """
-        best: dict[str, V3BatchedQuote] = {}
+        best: dict[str, RouteQuote] = {}
         for q in quotes:
             if q.amount_out == 0:
                 continue
@@ -444,9 +504,35 @@ class RouterSolver:
         except Exception as exc:  # noqa: BLE001
             log.warning("router_v3_batched_failed", error=str(exc))
             return NoSolution()
+        # V4 quotes join the same selection pool — best amount_out per order
+        # wins regardless of venue; the winning path's type later picks the
+        # encoder. Fail-open: a V4 quoting error must never cost us the V3
+        # result (V4 is additive, the 2026-06-12 loss-decomposition lever).
+        all_quotes: list[RouteQuote] = list(quotes)
+        if self._v4_enabled:
+            v4_paths = self._build_v4_candidate_paths(orders)
+            if v4_paths:
+                try:
+                    v4_quotes = await batched_v4_quote(
+                        self._multicall,
+                        v4_paths,
+                        quoter_address=self._v4_quoter_address,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("router_v4_batched_failed", error=str(exc))
+                else:
+                    # Drop quotes whose amount_out exceeds uint128 BEFORE they
+                    # can win selection: encode-time bounds errors would abort
+                    # the whole strategy (losing the V3 trades too). With this
+                    # filter plus the amount_in guard at path build, the V4
+                    # encoder's ValueError bounds are structurally unreachable
+                    # from the solve path.
+                    all_quotes.extend(
+                        q for q in v4_quotes if q.amount_out < 1 << 128
+                    )
         # Full-amount best quotes (exact_input sell orders use sell_amount as
         # amount_in; buy orders use buy_amount).
-        best_per_order = self._select_best_quote_per_order(quotes)
+        best_per_order = self._select_best_quote_per_order(all_quotes)
 
         # Partial-fraction best quotes — only computed once over all quotes;
         # only meaningful for partially_fillable sell orders (buy-side deferred).
@@ -602,7 +688,7 @@ class RouterSolver:
                     emitted = False
                     for partial_sell, partial_buy_limit in partial_fractions:
                         frac_best = self._select_best_quote_per_order(
-                            quotes, filter_amount_in=partial_sell
+                            all_quotes, filter_amount_in=partial_sell
                         ).get(order.uid)
                         attempt: dict[str, object] = {
                             "fraction": partial_sell / order.sell_amount,
@@ -722,12 +808,22 @@ class RouterSolver:
         if not trades:
             return NoSolution()
 
+        # Venue observability: each V4 fill contributes exactly one
+        # interaction targeting the Universal Router (the execute call), so
+        # counting those = number of V4-routed trades in this solution. This
+        # is the live signal that the loss-decomposition lever actually fires.
+        n_v4_fills = sum(
+            1
+            for ix in intra_interactions
+            if str(ix.get("target", "")).lower() == self._v4_universal_router.lower()
+        )
         log.info(
             "router_solved",
             auction_id=auction.id,
             n_quoted=len(orders),
             n_paths=len(paths),
             n_filled=len(trades),
+            n_v4_fills=n_v4_fills,
             n_interactions=len(intra_interactions),
             mode="v3_batched",
         )
@@ -960,7 +1056,7 @@ class RouterSolver:
 
     def _encode_path_interaction(
         self,
-        path: V3Path,
+        path: V3Path | V4Path,
         *,
         executed_sell: int,
         executed_buy: int,
@@ -983,6 +1079,25 @@ class RouterSolver:
         ``src.encoder.v3.encode_v3_swap`` dispatch — slippage math and the
         single/multi/sell/buy table are defined once.
         """
+        if isinstance(path, V4Path):
+            # V4 paths are quoted exact-input for sell orders only (see
+            # _build_v4_candidate_paths). The Universal-Router encoder emits
+            # [erc20→Permit2 approve, Permit2→UR approve, UR.execute(V4_SWAP)]
+            # and mirrors encode_v3_swap's slippage semantics: the promised
+            # executed_buy equals the quote, the on-chain amountOutMinimum
+            # guard sits slippage_bps below it.
+            return encode_v4_swap_interactions(
+                sell_token=path.token_in,
+                buy_token=path.token_out,
+                fee=path.fee,
+                tick_spacing=path.tick_spacing,
+                amount_in=executed_sell,
+                amount_out_minimum=apply_slippage_down(executed_buy, self._slippage_bps),
+                executed_buy=executed_buy,
+                deadline=deadline,
+                universal_router=self._v4_universal_router,
+                permit2=self._v4_permit2,
+            )
         # Cap the router can pull: exact input for sell, amountInMaximum (the
         # same slippage-up the swap encoder applies to amount_in_maximum) for
         # buy. Keeping the two in lockstep avoids an under-approval revert.
