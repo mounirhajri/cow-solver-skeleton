@@ -17,6 +17,8 @@ from src.shadow.persist import (
     EPSILON_HIGH_WEI,
     EPSILON_WEI,
     _block_param,
+    _estimated_request_block,
+    _slim_raw_auction,
     persist_shadow_attempt,
     persist_shadow_attempt_safe,
 )
@@ -905,3 +907,91 @@ async def test_persist_validates_at_simulation_block(session_factory, monkeypatc
     await persist_shadow_attempt(auction, attempts, raw_competition=raw_competition)
 
     assert seen["block"] == hex(351_234_567)
+
+
+# ── _slim_raw_auction: storage diet for driver auctions ──────────────────────
+# Driver auctions (~262 KB each, every ~5 s) filled the host disk in hours.
+# The slim form must keep everything stored-data consumers read: ghost
+# detection (uid/owner/sellToken/buyToken), offline probes (full
+# Auction.model_validate round-trip), analytics (amounts/kind/scheme).
+
+
+def _fat_dump() -> dict:
+    return {
+        "id": "123",
+        "tokens": {"0x" + "aa" * 20: {"decimals": 18, "referencePrice": "1"}},
+        "orders": [{
+            "uid": "0x" + "ab" * 56,
+            "owner": "0x" + "11" * 20,
+            "sellToken": "0x" + "aa" * 20,
+            "buyToken": "0x" + "bb" * 20,
+            "sellAmount": "1000",
+            "buyAmount": "900",
+            "validTo": 2_000_000_000,
+            "kind": "sell",
+            "partiallyFillable": False,
+            "class": "limit",
+            "signingScheme": "eip1271",
+            "sellTokenBalance": "erc20",
+            "signature": "0x" + "ff" * 736,          # the storage whale
+            "appData": "0x" + "00" * 32,
+            "feePolicies": [{"kind": "surplus"}],
+            "preInteractions": [{"target": "0x" + "22" * 20}],
+        }],
+        "liquidity": [{"kind": "constantProduct", "tokens": {"a": 1}}] * 50,
+        "effectiveGasPrice": "1500000000",
+        "deadline": "2030-01-01T00:00:00Z",
+        "simulationBlock": 471000000,
+    }
+
+
+def test_slim_drops_liquidity_and_heavy_order_fields() -> None:
+    slim = _slim_raw_auction(_fat_dump())
+    assert "liquidity" not in slim
+    o = slim["orders"][0]
+    for gone in ("signature", "appData", "feePolicies", "preInteractions"):
+        assert gone not in o
+    # Everything ghost detection + probes + analytics read survives:
+    for kept in ("uid", "owner", "sellToken", "buyToken", "sellAmount",
+                 "buyAmount", "validTo", "kind", "partiallyFillable",
+                 "class", "signingScheme", "sellTokenBalance"):
+        assert kept in o
+    # Top-level analytics fields survive:
+    assert slim["tokens"] and slim["simulationBlock"] == 471000000
+
+
+def test_slim_round_trips_auction_model() -> None:
+    """The offline probes do Auction.model_validate(raw_auction) — the slim
+    form must still parse into typed orders."""
+    slim = _slim_raw_auction(_fat_dump())
+    auction = Auction.model_validate(slim)
+    assert auction.orders[0].sell_amount == 1000
+    assert auction.orders[0].owner == "0x" + "11" * 20
+    assert auction.simulation_block == 471000000
+
+
+def test_slim_tolerates_malformed_orders() -> None:
+    slim = _slim_raw_auction({"orders": ["not-a-dict", None], "liquidity": []})
+    assert slim["orders"] == ["not-a-dict", None]
+    assert "liquidity" not in slim
+
+
+def test_slim_size_reduction_is_dramatic() -> None:
+    import json
+    fat, slim = _fat_dump(), _slim_raw_auction(_fat_dump())
+    assert len(json.dumps(slim)) < len(json.dumps(fat)) * 0.2  # >80% cut
+
+
+# ── _estimated_request_block: auction-time validation for driver flow ───────
+
+
+def test_estimated_request_block_walks_back_4_per_second() -> None:
+    # 6 s elapsed → 24 blocks back (Arbitrum ~4 blocks/s).
+    assert _estimated_request_block(1_000_000, received_at=100.0, now=106.0) == hex(999_976)
+
+
+def test_estimated_request_block_clamps() -> None:
+    # Clock skew (now < received_at) → no walk-back, never a future block.
+    assert _estimated_request_block(1_000_000, received_at=200.0, now=100.0) == hex(1_000_000)
+    # Degenerate tiny chain → never below block 1.
+    assert _estimated_request_block(2, received_at=0.0, now=100.0) == hex(1)

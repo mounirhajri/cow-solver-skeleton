@@ -73,6 +73,10 @@ def create_app(
         # leaves room for future multi-solution emission (e.g. variants
         # exploring different fee tiers).
         start = time.perf_counter()
+        # Epoch timestamp of request arrival — persisted alongside the attempt
+        # so the feasibility validation can reconstruct the auction-time block
+        # for driver auctions (which carry no simulationBlock).
+        received_at = time.time()
         # A malformed request is the driver's input, not a solver failure —
         # answer 400/422 (not an unhandled 500) so the cause is legible during
         # onboarding rather than looking like the endpoint crashed.
@@ -134,16 +138,20 @@ def create_app(
                 timeout=round(timeout, 3),
             )
             SOLVE_TOTAL.labels(outcome="error").inc()
-            background_tasks.add_task(persist_shadow_attempt_safe, auction, attempts, None)
+            background_tasks.add_task(
+                persist_shadow_attempt_safe, auction, attempts, None, received_at
+            )
             return _empty_solutions()
         except Exception as e:  # noqa: BLE001
             log.error("solve_error", auction_id=auction.id, error=str(e))
             SOLVE_TOTAL.labels(outcome="error").inc()
-            background_tasks.add_task(persist_shadow_attempt_safe, auction, attempts, None)
+            background_tasks.add_task(
+                persist_shadow_attempt_safe, auction, attempts, None, received_at
+            )
             return _empty_solutions()
 
         # Persist shadow data in the background — never blocks the hot path
-        background_tasks.add_task(persist_shadow_attempt_safe, auction, attempts, None)
+        background_tasks.add_task(persist_shadow_attempt_safe, auction, attempts, None, received_at)
 
         if isinstance(result, NoSolution):
             SOLVE_TOTAL.labels(outcome="no_solution").inc()

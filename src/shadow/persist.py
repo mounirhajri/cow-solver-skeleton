@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -57,6 +58,62 @@ EPSILON_WEI = 10**12  # 1 microETH ≈ $0.002 at €1800/ETH
 EPSILON_HIGH_WEI = 10**18  # 1 ETH
 
 
+# Arbitrum produces ~4 blocks/second — used to walk back from `latest` to the
+# request-arrival block when a driver auction carries no simulationBlock.
+_ARBITRUM_BLOCKS_PER_SECOND = 4
+
+# Per-order fields worth persisting in raw_auction. Everything else is
+# storage-hostile bulk we never read back: `signature` (eip1271 payloads are
+# 736+ bytes; the feasibility validator refetches signatures from the
+# orderbook API anyway), `appData`, `feePolicies`, `preInteractions`. What
+# stays covers every stored-data consumer: ghost detection reads
+# uid/owner/sellToken/buyToken, the offline probes re-validate via
+# Auction.model_validate (amounts/kind/validTo/owner/partiallyFillable/class),
+# and analytics read amounts + schemes.
+_ORDER_KEEP_FIELDS = frozenset({
+    "uid", "owner", "sellToken", "buyToken", "sellAmount", "buyAmount",
+    "validTo", "kind", "partiallyFillable", "class", "signingScheme",
+    "sellTokenBalance",
+})
+
+
+def _slim_raw_auction(dump: dict[str, Any]) -> dict[str, Any]:
+    """Strip storage-hostile bulk from an auction payload before persisting.
+
+    Driver auctions arrive every ~5 s with ~1200 orders plus the driver's
+    full on-chain ``liquidity`` snapshot — measured 2026-06-11 at ~262 KB per
+    auction ≈ 2.6 GB/day, which filled the host disk. ``liquidity`` is
+    dropped entirely (parsed-but-ignored by the solver, read by nothing that
+    consumes stored rows); orders keep only ``_ORDER_KEEP_FIELDS``. The
+    result must still round-trip ``Auction.model_validate`` for the offline
+    probes — covered by tests.
+    """
+    slim = dict(dump)
+    slim.pop("liquidity", None)
+    orders = slim.get("orders")
+    if isinstance(orders, list):
+        slim["orders"] = [
+            {k: v for k, v in o.items() if k in _ORDER_KEEP_FIELDS}
+            if isinstance(o, dict)
+            else o
+            for o in orders
+        ]
+    return slim
+
+
+def _estimated_request_block(latest_block: int, received_at: float, now: float) -> str:
+    """Hex block tag ≈ the chain head at request arrival.
+
+    Walking back ``elapsed × 4`` blocks from ``latest`` lands the settle
+    simulation at auction-time state instead of post-settlement drift (the
+    real winner settles the same auction seconds after we answer). An
+    over-estimate lands slightly earlier (orders still open — harmless); an
+    under-estimate degrades to today's `latest` behaviour.
+    """
+    elapsed = max(0.0, now - received_at)
+    return hex(max(1, latest_block - int(elapsed * _ARBITRUM_BLOCKS_PER_SECOND)))
+
+
 def _block_param(simulation_block: int | None) -> str:
     """RPC block tag for the feasibility settle() simulation.
 
@@ -74,8 +131,15 @@ async def persist_shadow_attempt(
     auction: Auction,
     attempts: list[AttemptRecord],
     raw_competition: dict[str, object] | None = None,
+    received_at: float | None = None,
 ) -> None:
-    """Upsert auction row + insert one row per strategy attempt."""
+    """Upsert auction row + insert one row per strategy attempt.
+
+    ``received_at`` (epoch seconds, captured by /solve at request arrival)
+    lets the feasibility validation reconstruct the auction-time block for
+    driver auctions that carry no simulationBlock — without it, those
+    validate at ``latest`` and measure post-settlement drift.
+    """
     # ``auction.id`` is ``str | None`` per the CoW solver-engine spec
     # (nullable for quote-only requests). The /solve handler short-circuits
     # those before reaching this background task, so by the time we get
@@ -106,7 +170,9 @@ async def persist_shadow_attempt(
                         polled_at=datetime.now(UTC),
                         n_orders=len(auction.orders),
                         raw_competition=raw_competition or {},
-                        raw_auction=auction.model_dump(mode="json", by_alias=True),
+                        raw_auction=_slim_raw_auction(
+                            auction.model_dump(mode="json", by_alias=True)
+                        ),
                     )
                 )
                 await session.flush()
@@ -144,6 +210,22 @@ async def persist_shadow_attempt(
                 )
                 feas_api = CowApiClient(network="arbitrum_one")
                 feas_rpc = RpcClient(settings.rpc_arbitrum)
+
+        # Block tag for feasibility validation. Poller auctions carry the
+        # competition simulationBlock; driver auctions don't — for those,
+        # walk back from `latest` to the request-arrival block so the settle
+        # simulation sees auction-time state instead of post-settlement drift
+        # (the real winner settles the same auction seconds after we answer;
+        # at `latest` our swaps under-deliver → false 'exceeds balance'
+        # phantoms — 71/73 in the first honest window 2026-06-11). Fail-open
+        # to `latest` on any error.
+        feas_block = _block_param(auction.simulation_block)
+        if feas_block == "latest" and received_at is not None and feas_rpc is not None:
+            with contextlib.suppress(Exception):
+                latest_block = await asyncio.to_thread(feas_rpc.block_number)
+                feas_block = _estimated_request_block(
+                    int(latest_block), received_at, time.time()
+                )
 
         n_sub_dust_skipped = 0
         n_phantom_above_cap = 0
@@ -212,7 +294,7 @@ async def persist_shadow_attempt(
                             rpc=feas_rpc,
                             settlement_addr=settings.gpv2_settlement,
                             solver_addr=settings.feasibility_solver_address,
-                            block=_block_param(auction.simulation_block),
+                            block=feas_block,
                         )
                         feasible = verdict.feasible
                         revert_reason = verdict.reason
@@ -261,13 +343,14 @@ async def persist_shadow_attempt_safe(
     auction: Auction,
     attempts: list[AttemptRecord],
     raw_competition: dict[str, object] | None = None,
+    received_at: float | None = None,
 ) -> None:
     """Same as persist_shadow_attempt but never raises (logs and swallows).
 
     For use in FastAPI BackgroundTasks where exceptions would be lost.
     """
     try:
-        await persist_shadow_attempt(auction, attempts, raw_competition)
+        await persist_shadow_attempt(auction, attempts, raw_competition, received_at)
     except Exception as e:  # noqa: BLE001
         log.error("shadow_persist_failed", auction_id=str(auction.id), error=str(e))
 
@@ -317,7 +400,7 @@ async def persist_winner_and_outcomes(
                         polled_at=datetime.now(UTC),
                         n_orders=n_orders,
                         raw_competition=raw_competition,
-                        raw_auction=auction_payload,
+                        raw_auction=_slim_raw_auction(auction_payload),
                     )
                 )
                 await session.flush()  # ensure FK target exists before children
@@ -493,7 +576,7 @@ async def persist_skipped_auction(
                         polled_at=datetime.now(UTC),
                         n_orders=n_orders,
                         raw_competition=raw_competition,
-                        raw_auction=auction_payload,
+                        raw_auction=_slim_raw_auction(auction_payload),
                     )
                 )
                 await session.flush()  # ensure FK target exists before child insert
