@@ -81,3 +81,141 @@ def test_notify_endpoint_acknowledges() -> None:
         "kind": "success",
     })
     assert resp.status_code == 200
+
+
+# ── Best-so-far salvage at deadline (2026-06-12) ─────────────────────────────
+
+
+def _solved_attempt(strategy: str, executed: int = 1000):
+    from src.solver.orchestrator import AttemptRecord
+
+    sol = Solution(
+        id=12345,
+        prices={"0x" + "aa" * 20: 1, "0x" + "bb" * 20: 1},
+        trades=[Trade(kind="fulfillment", order_uid="0x" + "ab" * 56, executed_amount=executed)],
+        interactions=[],
+    )
+    return AttemptRecord(
+        strategy=strategy,
+        status="solved",
+        latency_ms=100,
+        solution=sol.model_dump(mode="json"),
+        error=None,
+    )
+
+
+def _timeout_orchestrator(records):
+    """Orchestrator mock: fills attempts with completed records, then hangs
+    past the solve timeout — exactly the measured 2026-06-12 failure shape."""
+    import asyncio as _asyncio
+
+    class _Orch:
+        async def solve(self, auction, attempts):
+            attempts.extend(records)
+            await _asyncio.sleep(60)
+
+    return _Orch()
+
+
+def test_solve_timeout_salvages_completed_router_solution(
+    auction_payload: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("src.main.settings.solve_timeout_seconds", 0.05)
+    app = create_app(orchestrator=_timeout_orchestrator([_solved_attempt("router-v2")]))
+    client = TestClient(app)
+    resp = client.post("/solve", json=auction_payload)
+    assert resp.status_code == 200
+    sols = resp.json()["solutions"]
+    assert len(sols) == 1
+    # Wire format must be the OpenAPI alias form, same as the normal path.
+    assert sols[0]["trades"][0]["order"] == "0x" + "ab" * 56
+    assert "orderUid" not in sols[0]["trades"][0]
+    assert "order_uid" not in sols[0]["trades"][0]
+
+
+def test_solve_timeout_prefers_router_over_naive(
+    auction_payload: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("src.main.settings.solve_timeout_seconds", 0.05)
+    app = create_app(
+        orchestrator=_timeout_orchestrator(
+            [_solved_attempt("naive", executed=111), _solved_attempt("router-v2", executed=222)]
+        )
+    )
+    client = TestClient(app)
+    resp = client.post("/solve", json=auction_payload)
+    sols = resp.json()["solutions"]
+    assert len(sols) == 1
+    assert sols[0]["trades"][0]["executedAmount"] == "222"
+
+
+def test_solve_timeout_never_salvages_naive(
+    auction_payload: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """naive fabricates phantom CIP-14 scores (oracle prices, verified live
+    2026-05-24) — the orchestrator never submits it, and the salvage path
+    must not reintroduce it behind the composer's back."""
+    monkeypatch.setattr("src.main.settings.solve_timeout_seconds", 0.05)
+    app = create_app(orchestrator=_timeout_orchestrator([_solved_attempt("naive")]))
+    client = TestClient(app)
+    resp = client.post("/solve", json=auction_payload)
+    assert resp.json() == {"solutions": []}
+
+
+def test_salvage_accepts_production_alias_record_form(
+    auction_payload: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production AttemptRecords are model_dump(mode="json", by_alias=True) —
+    salvage must round-trip THAT form (reviewer-requested lock)."""
+    from src.solver.orchestrator import AttemptRecord
+
+    sol = Solution(
+        id=12345,
+        prices={"0x" + "aa" * 20: 1, "0x" + "bb" * 20: 1},
+        trades=[Trade(kind="fulfillment", order_uid="0x" + "cd" * 56, executed_amount=333)],
+        interactions=[],
+    )
+    rec = AttemptRecord(
+        strategy="router-v2",
+        status="solved",
+        latency_ms=100,
+        solution=sol.model_dump(mode="json", by_alias=True),
+        error=None,
+    )
+    monkeypatch.setattr("src.main.settings.solve_timeout_seconds", 0.05)
+    app = create_app(orchestrator=_timeout_orchestrator([rec]))
+    client = TestClient(app)
+    sols = client.post("/solve", json=auction_payload).json()["solutions"]
+    assert sols[0]["trades"][0]["order"] == "0x" + "cd" * 56
+    assert sols[0]["trades"][0]["executedAmount"] == "333"
+
+
+def test_salvage_falls_through_corrupt_candidate(
+    auction_payload: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupt router record must not kill the salvage — the next valid
+    candidate (bipartite) ships instead."""
+    from src.solver.orchestrator import AttemptRecord
+
+    corrupt = AttemptRecord(
+        strategy="router-v2", status="solved", latency_ms=1,
+        solution={"trades": "garbage"}, error=None,
+    )
+    good = _solved_attempt("cow-matching-bipartite", executed=444)
+    monkeypatch.setattr("src.main.settings.solve_timeout_seconds", 0.05)
+    app = create_app(orchestrator=_timeout_orchestrator([corrupt, good]))
+    client = TestClient(app)
+    sols = client.post("/solve", json=auction_payload).json()["solutions"]
+    assert len(sols) == 1
+    assert sols[0]["trades"][0]["executedAmount"] == "444"
+
+
+def test_solve_timeout_without_completed_solutions_stays_empty(
+    auction_payload: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("src.main.settings.solve_timeout_seconds", 0.05)
+    app = create_app(orchestrator=_timeout_orchestrator([]))
+    client = TestClient(app)
+    resp = client.post("/solve", json=auction_payload)
+    assert resp.status_code == 200
+    assert resp.json() == {"solutions": []}

@@ -499,37 +499,44 @@ class RouterSolver:
         paths = self._build_v3_candidate_paths(orders, auction.tokens)
         if not paths:
             return NoSolution()
-        try:
-            quotes = await batched_v3_quote(self._multicall, paths)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("router_v3_batched_failed", error=str(exc))
+        # V3 and V4 quote IN PARALLEL — running V4 serially after V3 doubled
+        # router wall-clock to 4-5s and, with the CoW driver's ~5s deadline,
+        # killed ~93% of solves mid-router (measured 2026-06-12). The global
+        # RPC gate (rpc_max_concurrent) already bounds the combined in-flight
+        # load, so gather adds no node pressure — only removes dead wait time.
+        v4_paths = self._build_v4_candidate_paths(orders) if self._v4_enabled else []
+        if v4_paths:
+            v3_result, v4_result = await asyncio.gather(
+                batched_v3_quote(self._multicall, paths),
+                batched_v4_quote(
+                    self._multicall, v4_paths, quoter_address=self._v4_quoter_address
+                ),
+                return_exceptions=True,
+            )
+        else:
+            try:
+                v3_result = await batched_v3_quote(self._multicall, paths)
+            except Exception as exc:  # noqa: BLE001
+                v3_result = exc
+            v4_result = []
+        if isinstance(v3_result, BaseException):
+            log.warning("router_v3_batched_failed", error=str(v3_result))
             return NoSolution()
+        quotes = v3_result
         # V4 quotes join the same selection pool — best amount_out per order
         # wins regardless of venue; the winning path's type later picks the
         # encoder. Fail-open: a V4 quoting error must never cost us the V3
         # result (V4 is additive, the 2026-06-12 loss-decomposition lever).
         all_quotes: list[RouteQuote] = list(quotes)
-        if self._v4_enabled:
-            v4_paths = self._build_v4_candidate_paths(orders)
-            if v4_paths:
-                try:
-                    v4_quotes = await batched_v4_quote(
-                        self._multicall,
-                        v4_paths,
-                        quoter_address=self._v4_quoter_address,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("router_v4_batched_failed", error=str(exc))
-                else:
-                    # Drop quotes whose amount_out exceeds uint128 BEFORE they
-                    # can win selection: encode-time bounds errors would abort
-                    # the whole strategy (losing the V3 trades too). With this
-                    # filter plus the amount_in guard at path build, the V4
-                    # encoder's ValueError bounds are structurally unreachable
-                    # from the solve path.
-                    all_quotes.extend(
-                        q for q in v4_quotes if q.amount_out < 1 << 128
-                    )
+        if isinstance(v4_result, BaseException):
+            log.warning("router_v4_batched_failed", error=str(v4_result))
+        else:
+            # Drop quotes whose amount_out exceeds uint128 BEFORE they can win
+            # selection: encode-time bounds errors would abort the whole
+            # strategy (losing the V3 trades too). With this filter plus the
+            # amount_in guard at path build, the V4 encoder's ValueError
+            # bounds are structurally unreachable from the solve path.
+            all_quotes.extend(q for q in v4_result if q.amount_out < 1 << 128)
         # Full-amount best quotes (exact_input sell orders use sell_amount as
         # amount_in; buy orders use buy_amount).
         best_per_order = self._select_best_quote_per_order(all_quotes)

@@ -401,8 +401,9 @@ class SolverOrchestrator:
 def load_default_strategies() -> list[SolverStrategy]:
     """Build the strategy chain. Loads edge strategies if private submodule present.
 
-    Order: naive first (always fast, anchors the response), then edge strategies
-    (specialized, selective), then router-v2 (slow on-chain quotes, shadow data).
+    Order: router-v2 FIRST (the value driver gets the fresh deadline budget —
+    see the insert(0) comment below), then naive (fast, anchors a fallback),
+    then edge strategies (specialized, selective).
     """
     from src.config import settings
     from src.routing.multicall import Multicall3
@@ -497,7 +498,14 @@ def load_default_strategies() -> list[SolverStrategy]:
     # 1451 auctions / 0 settlements over 6 days). The detector instance is
     # shared with Bipartite + Multi-Party so cache invalidation stays
     # consistent across strategies.
-    strategies.append(RouterSolver(
+    # The router runs FIRST (insert(0)): it is the value driver, and with the
+    # CoW driver's ~5s deadline the old order (naive → bipartite → multi-party
+    # → router) burned ~2s of preamble before the router even started — at
+    # router latencies of 3-5s that killed ~93% of solves mid-router (measured
+    # 2026-06-12, last_strategy forensics). Constructed after the edge block
+    # only because it shares the ghost_detector built there; list position is
+    # what the orchestrator executes by.
+    strategies.insert(0, RouterSolver(
         multicall=multicall,
         intermediates=settings.router_intermediate_tokens,
         max_orders=settings.router_max_orders,
@@ -660,7 +668,14 @@ def _load_default_strategies_with_multicall(multicall: Any) -> list[SolverStrate
     except ImportError:
         log.info("edge_strategies_not_present", reason="public_clone_or_phase0")
 
-    strategies.append(RouterSolver(
+    # The router runs FIRST (insert(0)): it is the value driver, and with the
+    # CoW driver's ~5s deadline the old order (naive → bipartite → multi-party
+    # → router) burned ~2s of preamble before the router even started — at
+    # router latencies of 3-5s that killed ~93% of solves mid-router (measured
+    # 2026-06-12, last_strategy forensics). Constructed after the edge block
+    # only because it shares the ghost_detector built there; list position is
+    # what the orchestrator executes by.
+    strategies.insert(0, RouterSolver(
         multicall=multicall,
         intermediates=settings.router_intermediate_tokens,
         max_orders=settings.router_max_orders,

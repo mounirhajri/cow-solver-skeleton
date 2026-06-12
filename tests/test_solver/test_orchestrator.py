@@ -579,3 +579,14 @@ async def test_feasibility_gate_disabled_passes_through(auction: Auction) -> Non
     result, _attempts = await orch.solve(auction)
 
     assert result is sol
+
+
+def test_default_strategies_run_router_first() -> None:
+    """The router is the value driver: with the CoW driver's ~5s deadline it
+    must get the fresh budget, not the scraps after naive/bipartite/multi-
+    party (~2s preamble killed ~93% of solves mid-router, 2026-06-12)."""
+    from src.solver.orchestrator import load_default_strategies
+
+    strategies = load_default_strategies()
+    assert strategies, "no strategies loaded"
+    assert strategies[0].name == "router-v2"

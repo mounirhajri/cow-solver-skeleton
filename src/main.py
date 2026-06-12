@@ -14,6 +14,7 @@ from src.config import settings
 from src.log import configure_logging, get_logger
 from src.metrics import SOLVE_DURATION, SOLVE_TOTAL
 from src.models.auction import Auction
+from src.models.solution import Solution
 from src.routing.rpc import gate_stats
 from src.shadow.logger import SolutionLogger
 from src.shadow.persist import persist_shadow_attempt_safe
@@ -149,10 +150,21 @@ def create_app(
                 n_tasks=len(asyncio.all_tasks()),
                 **gate_stats(),
             )
-            SOLVE_TOTAL.labels(outcome="error").inc()
             background_tasks.add_task(
                 persist_shadow_attempt_safe, auction, attempts, None, received_at
             )
+            # Best-so-far salvage: completed strategies live in `attempts`
+            # even when a later one overran the deadline. Throwing away a
+            # finished router solution because multi-party was still chewing
+            # cost ~93% of all answers on 2026-06-12 — return the best
+            # completed solution instead of an empty response.
+            salvaged = _best_completed_solution(attempts)
+            if salvaged is not None:
+                SOLVE_TOTAL.labels(outcome="solution").inc()
+                if shadow_logger:
+                    shadow_logger.record(auction_id=auction.id, our_solution=salvaged)
+                return {"solutions": [salvaged.model_dump(by_alias=True, mode="json")]}
+            SOLVE_TOTAL.labels(outcome="error").inc()
             return _empty_solutions()
         except Exception as e:  # noqa: BLE001
             log.error("solve_error", auction_id=auction.id, error=str(e))
@@ -191,6 +203,40 @@ def create_app(
         return {}
 
     return app
+
+
+# Salvage preference at deadline: the router is the scored value driver;
+# matching strategies are validated but rarer. naive is deliberately ABSENT:
+# the orchestrator never submits it (oracle prices fabricate phantom CIP-14
+# scores, verified live 2026-05-24) and the salvage path must not reintroduce
+# exactly that class of solution behind the composer's back.
+_SALVAGE_ORDER = ("router-v2", "cow-matching-bipartite", "cow-matching-multi-party")
+
+
+def _best_completed_solution(attempts: list[AttemptRecord]) -> Solution | None:
+    """Pick the best already-completed solution from a cancelled solve.
+
+    AttemptRecord.solution holds ``model_dump(mode="json", by_alias=True)``
+    (see orchestrator's record append) — re-validate through the Solution
+    model (aliases accept both forms) and return the OBJECT so the caller
+    can both log it to the shadow JSONL and dump it ``by_alias`` for the
+    wire, identical to the normal return path. Any validation hiccup falls
+    through to the next candidate (never raise on the salvage path).
+    """
+    by_strategy = {
+        a.strategy: a.solution
+        for a in attempts
+        if a.status == "solved" and a.solution is not None
+    }
+    for name in _SALVAGE_ORDER:
+        raw = by_strategy.get(name)
+        if raw is None:
+            continue
+        try:
+            return Solution.model_validate(raw)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("salvage_solution_invalid", strategy=name, error=str(exc))
+    return None
 
 
 async def _loop_diagnostics_pulse() -> None:
