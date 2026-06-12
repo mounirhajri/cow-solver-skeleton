@@ -41,6 +41,29 @@ def _rpc_gate() -> asyncio.Semaphore:
         _rpc_semaphores[loop] = sem
     return sem
 
+
+def gate_stats() -> dict[str, int]:
+    """Diagnostic snapshot of the per-loop RPC gate.
+
+    Reads Semaphore internals (``_value``/``_waiters``) — private, but this
+    is targeted observability for the 2026-06-12 degradation hunt: the
+    solver decays into all-timeouts ~1h after every restart while CPU,
+    memory and FDs stay idle — consistent with gate slots being lost over
+    time. If ``slots_free`` reads 0 with a growing waiter queue while no
+    solve is making progress, the leak is proven; if the gate looks healthy
+    during degradation, the stall lives elsewhere (httpx pool next).
+    Returns -1s when the gate was never created on this loop.
+    """
+    loop = asyncio.get_running_loop()
+    sem = _rpc_semaphores.get(loop)
+    if sem is None:
+        return {"slots_free": -1, "waiters": -1}
+    waiters = getattr(sem, "_waiters", None)
+    return {
+        "slots_free": getattr(sem, "_value", -1),
+        "waiters": len(waiters) if waiters is not None else 0,
+    }
+
 # JSON-RPC error code 3 is the EVM "execution reverted" code (EIP-1474).
 # Geth/Erigon also surface reverts under -32000 with a "revert" message, so we
 # match on the message substring too. Anything else is an infra-class failure.

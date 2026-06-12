@@ -14,6 +14,7 @@ from src.config import settings
 from src.log import configure_logging, get_logger
 from src.metrics import SOLVE_DURATION, SOLVE_TOTAL
 from src.models.auction import Auction
+from src.routing.rpc import gate_stats
 from src.shadow.logger import SolutionLogger
 from src.shadow.persist import persist_shadow_attempt_safe
 from src.solver.base import NoSolution
@@ -73,6 +74,10 @@ def create_app(
         # leaves room for future multi-solution emission (e.g. variants
         # exploring different fee tiers).
         start = time.perf_counter()
+        # Lazy-start the diagnostics pulse on the serving loop (create_app has
+        # no lifespan wiring; first request is the earliest loop-safe moment).
+        if getattr(app.state, "diag_task", None) is None:
+            app.state.diag_task = asyncio.create_task(_loop_diagnostics_pulse())
         # Epoch timestamp of request arrival — persisted alongside the attempt
         # so the feasibility validation can reconstruct the auction-time block
         # for driver auctions (which carry no simulationBlock).
@@ -132,10 +137,17 @@ def create_app(
                 timeout=timeout,
             )
         except TimeoutError:
+            # Degradation forensics (2026-06-12): WHERE did the budget die
+            # (last strategy that got to run), and is the RPC gate starved
+            # (slots_free 0 + waiters piling = lost-slot leak) or healthy
+            # (stall lives elsewhere)? n_tasks catches background-task pileup.
             log.warning(
                 "solve_timeout",
                 auction_id=auction.id,
                 timeout=round(timeout, 3),
+                last_strategy=attempts[-1].strategy if attempts else None,
+                n_tasks=len(asyncio.all_tasks()),
+                **gate_stats(),
             )
             SOLVE_TOTAL.labels(outcome="error").inc()
             background_tasks.add_task(
@@ -179,6 +191,25 @@ def create_app(
         return {}
 
     return app
+
+
+async def _loop_diagnostics_pulse() -> None:
+    """Minute heartbeat: RPC-gate slots + waiter queue + asyncio task count.
+
+    Observability for the 2026-06-12 degradation (all-timeouts ~1h after
+    every restart, idle CPU/memory/FDs). The pulse gives the decay a time
+    series: slots_free trending to 0 → gate-slot leak; n_tasks climbing →
+    background-task pileup; both flat while solves still time out → the
+    stall lives below (httpx pool / DNS). Remove once the hunt is over.
+    """
+    while True:
+        with _suppress(Exception):
+            log.info(
+                "loop_diagnostics",
+                n_tasks=len(asyncio.all_tasks()),
+                **gate_stats(),
+            )
+        await asyncio.sleep(60)
 
 
 def _empty_solutions() -> dict[str, Any]:
