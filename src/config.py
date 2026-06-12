@@ -113,6 +113,19 @@ class Settings(BaseSettings):
     # Permit2). Fail-open: any V4 quoting error leaves the V3 result intact.
     # Addresses verified against developers.uniswap.org/contracts/v4/deployments.
     router_v4_enabled: bool = True
+    # Native-pool measurement probe: V4's deep liquidity sits in NATIVE-ETH
+    # pools (currency0 = 0x0), not the WETH pools we trade. The probe quotes
+    # the native variant for WETH-paired sell orders IN THE SAME batch but
+    # never lets it win selection — it only logs `v4_native_would_win` with
+    # the bps gain. 48h of that log decides whether the native ENCODER
+    # (UR WRAP/UNWRAP commands) is worth building. Measurement before code.
+    v4_native_probe_enabled: bool = True
+
+    # Curve stable-pool quoting alongside V3/V4. Justified by the 2026-06-12
+    # loss decomposition (7/30 winning settlements swap on Curve; two of our
+    # worst losses were single Curve swaps). Hardcoded top pools — see
+    # src/routing/curve_quoter.CURVE_POOLS.
+    router_curve_enabled: bool = True
     v4_quoter_address: str = "0x3972C00F7ed4885e145823eb7C655375D275A1C5"
     v4_universal_router: str = "0xA51afAFe0263b40EdaEf0Df8781eA9aa03E381a3"
     v4_permit2: str = "0x000000000022D473030F116dDEE9F6B43aC78BA3"

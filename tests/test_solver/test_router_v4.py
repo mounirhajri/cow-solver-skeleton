@@ -278,3 +278,98 @@ async def test_v4_declared_output_is_promised_executed_buy(
     assert outputs is not None
     (out,) = outputs  # type: ignore[misc]
     assert int(out["amount"]) == 980  # the promise — NOT 980 minus slippage
+
+
+@pytest.mark.asyncio
+async def test_native_probe_quotes_but_never_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Native-pool probe paths (no encoder exists!) must be quoted for the
+    measurement log but can NEVER win selection — even when their quote is
+    the best of all."""
+    WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+
+    async def mock_v4(_mc: object, paths: list[V4Path], **_: object) -> list[V4BatchedQuote]:
+        out = []
+        for p in paths:
+            # Native variant quotes BETTER than everything else.
+            amount = 2000 if p.native_side else 960
+            out.append(V4BatchedQuote(path=p, amount_out=amount, gas_estimate=21_000))
+        return out
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", _mock_v3({1000: 950}))
+    monkeypatch.setattr("src.solver.router.batched_v4_quote", mock_v4)
+
+    router = RouterSolver(
+        multicall=AsyncMock(), intermediates=[],
+        v3_only_batched=True, order_validity_filter=False,
+        v4_enabled=True, v4_native_probe=True,
+    )
+    order = _make_order(sellToken=WETH)
+    result = await router.solve(_make_auction([order]))
+
+    assert isinstance(result, Solution)
+    # Vanilla V4 (960) beats V3 (950) → UR encoding; the native 2000 was
+    # measurement-only and must NOT have been selected (it would also be
+    # un-encodable). 3 interactions = vanilla V4 won, not native.
+    assert len(_ur_interactions(result)) == 1
+    assert len(result.interactions) == 3
+
+
+@pytest.mark.asyncio
+async def test_native_probe_disabled_builds_no_native_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+    seen_paths: list[V4Path] = []
+
+    async def mock_v4(_mc: object, paths: list[V4Path], **_: object) -> list[V4BatchedQuote]:
+        seen_paths.extend(paths)
+        return [V4BatchedQuote(path=p, amount_out=0, gas_estimate=0) for p in paths]
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", _mock_v3({1000: 950}))
+    monkeypatch.setattr("src.solver.router.batched_v4_quote", mock_v4)
+
+    router = RouterSolver(
+        multicall=AsyncMock(), intermediates=[],
+        v3_only_batched=True, order_validity_filter=False,
+        v4_enabled=True, v4_native_probe=False,
+    )
+    await router.solve(_make_auction([_make_order(sellToken=WETH)]))
+    assert all(not p.native_side for p in seen_paths)
+
+
+@pytest.mark.asyncio
+async def test_native_probe_emits_would_win_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The probe's entire deliverable IS the log line — pin its emission and
+    the gain_bps math (reviewer-requested)."""
+    from unittest.mock import MagicMock
+
+    WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+
+    async def mock_v4(_mc: object, paths: list[V4Path], **_: object) -> list[V4BatchedQuote]:
+        return [
+            V4BatchedQuote(
+                path=p, amount_out=2000 if p.native_side else 0, gas_estimate=0
+            )
+            for p in paths
+        ]
+
+    monkeypatch.setattr("src.solver.router.batched_v3_quote", _mock_v3({1000: 950}))
+    monkeypatch.setattr("src.solver.router.batched_v4_quote", mock_v4)
+    log_mock = MagicMock()
+    monkeypatch.setattr("src.solver.router.log", log_mock)
+
+    router = RouterSolver(
+        multicall=AsyncMock(), intermediates=[],
+        v3_only_batched=True, order_validity_filter=False,
+        v4_enabled=True, v4_native_probe=True,
+    )
+    await router.solve(_make_auction([_make_order(sellToken=WETH)]))
+
+    would_win = [
+        c for c in log_mock.info.call_args_list if c.args and c.args[0] == "v4_native_would_win"
+    ]
+    assert len(would_win) == 1
+    kwargs = would_win[0].kwargs
+    assert kwargs["native_out"] == 2000
+    assert kwargs["selected_out"] == 950
+    assert kwargs["gain_bps"] == (2000 - 950) * 10_000 // 950

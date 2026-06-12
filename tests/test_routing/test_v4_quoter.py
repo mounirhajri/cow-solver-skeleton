@@ -8,9 +8,11 @@ from eth_utils import keccak
 from src.routing.multicall import Call, CallResult, Multicall3
 from src.routing.v4_quoter import (
     HOOKS_NONE,
+    NATIVE_CURRENCY,
     QUOTE_EXACT_INPUT_SINGLE_V4_SELECTOR,
     QUOTE_EXACT_OUTPUT_SINGLE_V4_SELECTOR,
     STANDARD_V4_TIERS,
+    WETH_ARBITRUM,
     V4BatchedQuote,
     V4Path,
     _build_call,
@@ -18,8 +20,12 @@ from src.routing.v4_quoter import (
     _encode_quote_exact_input_single,
     _encode_quote_exact_output_single,
     batched_v4_quote,
+    make_v4_native_paths,
     make_v4_paths,
 )
+
+# Canonical Arbitrum USDC — a realistic "other side" for native-pool tests.
+USDC_ARBITRUM = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
 
 
 def test_v4_selectors_match_keccak() -> None:
@@ -329,3 +335,174 @@ def test_v4batched_quote_default_values() -> None:
     assert q.amount_out == 0
     assert q.gas_estimate == 0
     assert q.path.exact_output is False
+    assert q.path.native_side is False  # new field defaults off
+
+
+def test_make_v4_native_paths_weth_in() -> None:
+    """Selling WETH: one native path per standard tier, original addresses kept."""
+    paths = make_v4_native_paths("o1", WETH_ARBITRUM, USDC_ARBITRUM, 10**18)
+    assert [(p.fee, p.tick_spacing) for p in paths] == list(STANDARD_V4_TIERS)
+    assert all(p.native_side for p in paths)
+    assert all(not p.exact_output for p in paths)
+    # token_in/token_out keep the ORIGINAL WETH address for order mapping...
+    assert all(p.token_in == WETH_ARBITRUM for p in paths)
+    assert all(p.token_out == USDC_ARBITRUM for p in paths)
+    # ...only the derived PoolKey currencies see the substitution.
+    assert all(p.currency_in == NATIVE_CURRENCY for p in paths)
+    assert all(p.currency_out == USDC_ARBITRUM for p in paths)
+
+
+def test_make_v4_native_paths_weth_out() -> None:
+    """Buying WETH (WETH as token_out) substitutes the OUTPUT side."""
+    paths = make_v4_native_paths("o1", USDC_ARBITRUM, WETH_ARBITRUM, 5000, exact_output=True)
+    assert len(paths) == len(STANDARD_V4_TIERS)
+    assert all(p.native_side for p in paths)
+    assert all(p.exact_output for p in paths)
+    assert all(p.token_out == WETH_ARBITRUM for p in paths)
+    assert all(p.currency_in == USDC_ARBITRUM for p in paths)
+    assert all(p.currency_out == NATIVE_CURRENCY for p in paths)
+
+
+def test_make_v4_native_paths_requires_exactly_one_weth_side() -> None:
+    """Non-WETH pair has no native variant; WETH/WETH is nonsensical → []."""
+    assert make_v4_native_paths("o1", "0x" + "11" * 20, "0x" + "22" * 20, 1) == []
+    assert make_v4_native_paths("o1", WETH_ARBITRUM, WETH_ARBITRUM, 1) == []
+
+
+def test_make_v4_native_paths_weth_match_is_case_insensitive() -> None:
+    """A lowercased (non-checksummed) WETH address must still gate AND
+    substitute — addresses compare as integers, not strings."""
+    paths = make_v4_native_paths("o1", WETH_ARBITRUM.lower(), USDC_ARBITRUM, 1)
+    assert len(paths) == len(STANDARD_V4_TIERS)
+    assert all(p.currency_in == NATIVE_CURRENCY for p in paths)
+
+
+def test_native_encode_golden_weth_in_zero_for_one_true() -> None:
+    """Selling WETH→TOKEN via the native pool: the substituted input is the
+    zero address, which always sorts first → currency0=native, zeroForOne=True."""
+    path = V4Path(
+        order_uid="o1",
+        token_in=WETH_ARBITRUM,
+        token_out=USDC_ARBITRUM,
+        fee=500,
+        tick_spacing=10,
+        amount_in=10**18,
+        native_side=True,
+    )
+    cd = _encode_quote_exact_input_single(path)
+    assert cd.startswith("0x" + QUOTE_EXACT_INPUT_SINGLE_V4_SELECTOR)
+
+    args = bytes.fromhex(cd[2 + 8 :])
+    ((pool_key, zero_for_one, exact_amount, hook_data),) = decode(
+        ["((address,address,uint24,int24,address),bool,uint128,bytes)"], args
+    )
+    currency0, currency1, fee, tick_spacing, hooks = pool_key
+    assert currency0 == NATIVE_CURRENCY  # native side replaces WETH, sorts first
+    assert currency1 == USDC_ARBITRUM.lower()  # decode returns lowercase hex
+    assert zero_for_one is True  # input IS the native side → 0-for-1
+    assert fee == 500
+    assert tick_spacing == 10
+    assert hooks == HOOKS_NONE  # native pools quoted vanilla-only too
+    assert exact_amount == 10**18
+    assert hook_data == b""
+
+
+def test_native_encode_golden_weth_out_zero_for_one_false() -> None:
+    """Selling TOKEN→WETH via the native pool: the substituted OUTPUT is the
+    zero address → currency0=native is the output side, zeroForOne=False."""
+    path = V4Path(
+        order_uid="o1",
+        token_in=USDC_ARBITRUM,
+        token_out=WETH_ARBITRUM,
+        fee=3000,
+        tick_spacing=60,
+        amount_in=5000,
+        native_side=True,
+    )
+    args = bytes.fromhex(_encode_quote_exact_input_single(path)[2 + 8 :])
+    ((pool_key, zero_for_one, _exact_amount, _hook_data),) = decode(
+        ["((address,address,uint24,int24,address),bool,uint128,bytes)"], args
+    )
+    currency0, currency1, _fee, _tick_spacing, _hooks = pool_key
+    assert currency0 == NATIVE_CURRENCY
+    assert currency1 == USDC_ARBITRUM.lower()
+    assert zero_for_one is False  # input is the TOKEN (currency1) → 1-for-0
+
+
+def test_native_side_false_keeps_vanilla_encoding_byte_identical() -> None:
+    """Regression pin: the new field must not change non-native encodings —
+    a default-constructed path and an explicit native_side=False path encode
+    byte-identically, and a WETH-paired path WITHOUT native_side keeps the
+    real WETH address in the PoolKey (no accidental substitution)."""
+    kwargs = dict(
+        order_uid="o1",
+        token_in=WETH_ARBITRUM,
+        token_out=USDC_ARBITRUM,
+        fee=500,
+        tick_spacing=10,
+        amount_in=10**18,
+    )
+    default_path = V4Path(**kwargs)  # type: ignore[arg-type]
+    explicit_path = V4Path(**kwargs, native_side=False)  # type: ignore[arg-type]
+    cd = _encode_quote_exact_input_single(default_path)
+    assert cd == _encode_quote_exact_input_single(explicit_path)
+
+    args = bytes.fromhex(cd[2 + 8 :])
+    ((pool_key, zero_for_one, _amount, _hd),) = decode(
+        ["((address,address,uint24,int24,address),bool,uint128,bytes)"], args
+    )
+    currency0, currency1, _f, _ts, _h = pool_key
+    # WETH (0x82af...) < USDC (0xaf88...) as integers → WETH is currency0.
+    assert currency0 == WETH_ARBITRUM.lower()
+    assert currency1 == USDC_ARBITRUM.lower()
+    assert zero_for_one is True
+
+
+@pytest.mark.asyncio
+async def test_batched_v4_quote_mixed_native_and_vanilla_alignment() -> None:
+    """A mixed batch (native + vanilla paths) flows through _build_call with
+    no special-casing in batched_v4_quote: per-path calldata reflects each
+    path's native_side and results stay positionally aligned."""
+    rpc = AsyncMock()
+    mc = Multicall3(rpc)
+    seen_calls: list[Call] = []
+
+    async def fake_aggregate(calls: list[Call], block: str = "latest") -> list[CallResult]:
+        seen_calls.extend(calls)
+        return [
+            CallResult(success=True, return_data=encode(["uint256", "uint256"], [i + 1, 10]))
+            for i in range(len(calls))
+        ]
+
+    mc.aggregate = fake_aggregate  # type: ignore[assignment]
+
+    native = V4Path(
+        order_uid="o1",
+        token_in=WETH_ARBITRUM,
+        token_out=USDC_ARBITRUM,
+        fee=500,
+        tick_spacing=10,
+        amount_in=10**18,
+        native_side=True,
+    )
+    vanilla = V4Path(
+        order_uid="o2",
+        token_in="0x" + "11" * 20,
+        token_out="0x" + "22" * 20,
+        fee=500,
+        tick_spacing=10,
+        amount_in=10**18,
+    )
+    quotes = await batched_v4_quote(mc, [native, vanilla])
+    assert [q.path for q in quotes] == [native, vanilla]
+    assert [q.amount_out for q in quotes] == [1, 2]
+
+    def decoded_currency0(call: Call) -> str:
+        args = bytes.fromhex(call.call_data[2 + 8 :])
+        ((pool_key, *_rest),) = decode(
+            ["((address,address,uint24,int24,address),bool,uint128,bytes)"], args
+        )
+        return str(pool_key[0])
+
+    assert decoded_currency0(seen_calls[0]) == NATIVE_CURRENCY  # native path substituted
+    assert decoded_currency0(seen_calls[1]) == "0x" + "11" * 20  # vanilla untouched

@@ -27,6 +27,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from src.config import settings
+from src.encoder.curve_calldata import encode_curve_swap_interactions
 from src.encoder.erc20 import encode_approve
 from src.encoder.interactions import Interaction
 from src.encoder.v3 import apply_slippage_down, apply_slippage_up, encode_v3_swap
@@ -42,16 +43,33 @@ from src.solver.order_validity import filter_valid_orders
 
 if TYPE_CHECKING:
     from edge.matching.ghost_detector import GhostDetector
+from src.routing.curve_quoter import (
+    CURVE_POOLS,
+    CurvePath,
+    CurveQuote,
+    batched_curve_quote,
+    make_curve_paths,
+)
 from src.routing.multihop import HopQuote, quote_best_path
 from src.routing.v3_batched import V3BatchedQuote, V3Path, batched_v3_quote
-from src.routing.v4_quoter import V4BatchedQuote, V4Path, batched_v4_quote, make_v4_paths
+from src.routing.v4_quoter import (
+    V4BatchedQuote,
+    V4Path,
+    batched_v4_quote,
+    make_v4_native_paths,
+    make_v4_paths,
+)
 from src.solver.base import NoSolution
+
+# Settlement interactions that target one of these addresses are Curve
+# exchange calls — used only for venue observability in router_solved.
+_CURVE_POOL_ADDRESSES = frozenset(p.address.lower() for p in CURVE_POOLS)
 
 # Union of the two batched-quote shapes. Selection only touches the shared
 # surface (``amount_out`` + ``path.order_uid``/``amount_in``/``exact_output``),
 # so V3 and V4 quotes compete in one pool; the winning path's type picks the
 # encoder in _encode_path_interaction.
-RouteQuote = V3BatchedQuote | V4BatchedQuote
+RouteQuote = V3BatchedQuote | V4BatchedQuote | CurveQuote
 
 # Deadline grace window encoded into the swap call.
 _SWAP_DEADLINE_SECONDS = 60
@@ -180,6 +198,10 @@ class RouterSolver:
         # defers to settings (kill-switch: router_v4_enabled); explicit values
         # for tests. Addresses default from settings the same way.
         v4_enabled: bool | None = None,
+        v4_native_probe: bool | None = None,
+        # Curve stable pools (2026-06-12 loss decomposition: 7/30 winner
+        # settlements swap on Curve; V3 is the wrong venue for stable pairs).
+        curve_enabled: bool | None = None,
         v4_quoter_address: str | None = None,
         v4_universal_router: str | None = None,
         v4_permit2: str | None = None,
@@ -214,6 +236,12 @@ class RouterSolver:
             else order_validity_filter
         )
         self._v4_enabled = settings.router_v4_enabled if v4_enabled is None else v4_enabled
+        self._v4_native_probe = (
+            settings.v4_native_probe_enabled if v4_native_probe is None else v4_native_probe
+        )
+        self._curve_enabled = (
+            settings.router_curve_enabled if curve_enabled is None else curve_enabled
+        )
         self._v4_quoter_address = (
             settings.v4_quoter_address if v4_quoter_address is None else v4_quoter_address
         )
@@ -448,6 +476,28 @@ class RouterSolver:
                 )
         return paths
 
+    def _build_curve_candidate_paths(self, orders: list[Order]) -> list[CurvePath]:
+        """Per sell order whose pair lives in a configured Curve pool: one
+        path per pool, mirroring the V4 fraction scheme for partials. Buys
+        are skipped (get_dy is exact-input only)."""
+        paths: list[CurvePath] = []
+        for order in orders:
+            if order.kind != "sell":
+                continue
+            if order.partially_fillable:
+                amounts = [
+                    order.sell_amount,
+                    3 * order.sell_amount // 4,
+                    order.sell_amount // 2,
+                ]
+            else:
+                amounts = [order.sell_amount]
+            for amt in amounts:
+                paths.extend(
+                    make_curve_paths(order.uid, order.sell_token, order.buy_token, amt)
+                )
+        return paths
+
     @staticmethod
     def _select_best_quote_per_order(
         quotes: Sequence[RouteQuote],
@@ -505,20 +555,35 @@ class RouterSolver:
         # RPC gate (rpc_max_concurrent) already bounds the combined in-flight
         # load, so gather adds no node pressure — only removes dead wait time.
         v4_paths = self._build_v4_candidate_paths(orders) if self._v4_enabled else []
-        if v4_paths:
-            v3_result, v4_result = await asyncio.gather(
-                batched_v3_quote(self._multicall, paths),
-                batched_v4_quote(
-                    self._multicall, v4_paths, quoter_address=self._v4_quoter_address
-                ),
-                return_exceptions=True,
-            )
-        else:
-            try:
-                v3_result = await batched_v3_quote(self._multicall, paths)
-            except Exception as exc:  # noqa: BLE001
-                v3_result = exc
-            v4_result = []
+        # Native-pool probe: quote the native variant for WETH-paired sells in
+        # the SAME V4 batch (zero extra round-trips). Probe paths are split
+        # out after quoting and can never win selection — they only feed the
+        # `v4_native_would_win` measurement log (see config flag docstring).
+        if self._v4_enabled and self._v4_native_probe:
+            v4_paths = v4_paths + [
+                p
+                for o in orders
+                if o.kind == "sell" and o.sell_amount < 1 << 128
+                for p in make_v4_native_paths(
+                    o.uid, o.sell_token, o.buy_token, o.sell_amount
+                )
+            ]
+        curve_paths = self._build_curve_candidate_paths(orders) if self._curve_enabled else []
+
+        async def _no_quotes() -> list[V4BatchedQuote]:
+            return []
+
+        async def _no_curve() -> list[CurveQuote]:
+            return []
+
+        v3_result, v4_result, curve_result = await asyncio.gather(
+            batched_v3_quote(self._multicall, paths),
+            batched_v4_quote(self._multicall, v4_paths, quoter_address=self._v4_quoter_address)
+            if v4_paths
+            else _no_quotes(),
+            batched_curve_quote(self._multicall, curve_paths) if curve_paths else _no_curve(),
+            return_exceptions=True,
+        )
         if isinstance(v3_result, BaseException):
             log.warning("router_v3_batched_failed", error=str(v3_result))
             return NoSolution()
@@ -528,18 +593,58 @@ class RouterSolver:
         # encoder. Fail-open: a V4 quoting error must never cost us the V3
         # result (V4 is additive, the 2026-06-12 loss-decomposition lever).
         all_quotes: list[RouteQuote] = list(quotes)
+        native_quotes: list[V4BatchedQuote] = []
         if isinstance(v4_result, BaseException):
             log.warning("router_v4_batched_failed", error=str(v4_result))
         else:
+            # Split the probe out FIRST: native paths must never reach the
+            # selection pool (no encoder exists for them yet).
+            native_quotes = [q for q in v4_result if q.path.native_side]
             # Drop quotes whose amount_out exceeds uint128 BEFORE they can win
             # selection: encode-time bounds errors would abort the whole
             # strategy (losing the V3 trades too). With this filter plus the
             # amount_in guard at path build, the V4 encoder's ValueError
             # bounds are structurally unreachable from the solve path.
-            all_quotes.extend(q for q in v4_result if q.amount_out < 1 << 128)
+            all_quotes.extend(
+                q for q in v4_result if not q.path.native_side and q.amount_out < 1 << 128
+            )
+        if isinstance(curve_result, BaseException):
+            log.warning("router_curve_batched_failed", error=str(curve_result))
+        else:
+            all_quotes.extend(curve_result)
         # Full-amount best quotes (exact_input sell orders use sell_amount as
         # amount_in; buy orders use buy_amount).
         best_per_order = self._select_best_quote_per_order(all_quotes)
+
+        # Native-probe verdict: would the native V4 pool have beaten whatever
+        # actually won selection? Pure measurement — decides whether the
+        # native encoder is worth building (48h of gain_bps tells the price).
+        if native_quotes:
+            best_native: dict[str, int] = {}
+            for q in native_quotes:
+                if q.amount_out > best_native.get(q.path.order_uid, 0):
+                    best_native[q.path.order_uid] = q.amount_out
+            for uid, native_out in best_native.items():
+                selected = best_per_order.get(uid)
+                selected_out = selected.amount_out if selected is not None else 0
+                if selected_out > 0 and native_out > selected_out:
+                    log.info(
+                        "v4_native_would_win",
+                        auction_id=auction.id,
+                        order_uid=uid,
+                        native_out=native_out,
+                        selected_out=selected_out,
+                        gain_bps=(native_out - selected_out) * 10_000 // selected_out,
+                    )
+                elif selected_out == 0 and native_out > 0:
+                    # No venue could fill this order at all — but the native
+                    # pool could. The strongest possible probe signal.
+                    log.info(
+                        "v4_native_only_route",
+                        auction_id=auction.id,
+                        order_uid=uid,
+                        native_out=native_out,
+                    )
 
         # Partial-fraction best quotes — only computed once over all quotes;
         # only meaningful for partially_fillable sell orders (buy-side deferred).
@@ -824,6 +929,11 @@ class RouterSolver:
             for ix in intra_interactions
             if str(ix.get("target", "")).lower() == self._v4_universal_router.lower()
         )
+        n_curve_fills = sum(
+            1
+            for ix in intra_interactions
+            if str(ix.get("target", "")).lower() in _CURVE_POOL_ADDRESSES
+        )
         log.info(
             "router_solved",
             auction_id=auction.id,
@@ -831,6 +941,7 @@ class RouterSolver:
             n_paths=len(paths),
             n_filled=len(trades),
             n_v4_fills=n_v4_fills,
+            n_curve_fills=n_curve_fills,
             n_interactions=len(intra_interactions),
             mode="v3_batched",
         )
@@ -1063,7 +1174,7 @@ class RouterSolver:
 
     def _encode_path_interaction(
         self,
-        path: V3Path | V4Path,
+        path: V3Path | V4Path | CurvePath,
         *,
         executed_sell: int,
         executed_buy: int,
@@ -1086,6 +1197,20 @@ class RouterSolver:
         ``src.encoder.v3.encode_v3_swap`` dispatch — slippage math and the
         single/multi/sell/buy table are defined once.
         """
+        if isinstance(path, CurvePath):
+            # Curve exact-input swap: [approve(pool), exchange(i,j,dx,min_dy)].
+            # Same slippage discipline as V3/V4: the promise (executed_buy)
+            # equals the quote; the on-chain min guard sits slippage below.
+            return encode_curve_swap_interactions(
+                pool_address=path.pool.address,
+                i=path.i,
+                j=path.j,
+                amount_in=executed_sell,
+                min_amount_out=apply_slippage_down(executed_buy, self._slippage_bps),
+                sell_token=path.token_in,
+                buy_token=path.token_out,
+                executed_buy=executed_buy,
+            )
         if isinstance(path, V4Path):
             # V4 paths are quoted exact-input for sell orders only (see
             # _build_v4_candidate_paths). The Universal-Router encoder emits

@@ -37,9 +37,11 @@ services:
       REWARDS_ADDRESS: ${REWARDS_ADDRESS:-0x0000000000000000000000000000000000000000}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       SHADOW_LOG_PATH: /data/shadow.jsonl
-      # Uniswap-V4 kill-switch: set ROUTER_V4_ENABLED=false in /opt/.../.env
-      # + `docker compose up -d` to disable V4 quoting without a code deploy.
+      # Venue kill-switches: set =false in /opt/.../.env + `docker compose
+      # up -d` to disable without a code deploy.
       ROUTER_V4_ENABLED: ${ROUTER_V4_ENABLED:-true}
+      ROUTER_CURVE_ENABLED: ${ROUTER_CURVE_ENABLED:-true}
+      V4_NATIVE_PROBE_ENABLED: ${V4_NATIVE_PROBE_ENABLED:-true}
     volumes:
       - ./data:/data
     depends_on:

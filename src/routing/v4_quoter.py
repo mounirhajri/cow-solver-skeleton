@@ -7,6 +7,12 @@ We quote ONLY vanilla pools (hooks = zero address) at the four standard
 fee/tick-spacing tiers — hooked pools can re-price arbitrarily and are out
 of scope for the router.
 
+V4 additionally treats native ETH as a first-class currency (the zero
+address). For WETH-paired orders ``make_v4_native_paths`` builds quote-only
+candidates against the NATIVE pool variant (PoolKey substitutes the zero
+address for the WETH side) — measurement input for the router, no encoder
+support yet.
+
 Same shape as ``v3_batched``: every candidate (order, tier) pair is encoded
 up front and submitted via chunked ``Multicall3.aggregate_resilient`` calls.
 The V4Quoter *simulates* the swap (PoolManager unlock + revert-with-quote),
@@ -55,6 +61,14 @@ _QUOTE_EXACT_SINGLE_PARAMS_TYPE = "((address,address,uint24,int24,address),bool,
 # Vanilla pools only: hooks = zero address.
 HOOKS_NONE = "0x" + "00" * 20
 
+# V4 treats native ETH as a first-class currency: the zero address. Most V4
+# liquidity on Arbitrum sits in NATIVE pools rather than WETH pools, so for
+# WETH-paired orders we additionally quote the native-pool variant.
+NATIVE_CURRENCY = "0x0000000000000000000000000000000000000000"
+# Canonical Arbitrum One WETH.
+# Source: https://arbiscan.io/token/0x82af49447d8a07e3bd95bd0d56f35241523fbab1
+WETH_ARBITRUM = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+
 # The four standard (fee, tickSpacing) tiers V4 pools are deployed at when
 # created without hooks; mirrors V3's FEE_TIERS but tick spacing is part of
 # the pool identity in V4 so it must be carried explicitly.
@@ -73,6 +87,14 @@ class V4Path:
     exact input — passed to ``quoteExactInputSingle``. When
     ``exact_output=True`` (buy orders), ``amount_in`` is the exact OUTPUT —
     passed to ``quoteExactOutputSingle``; the quoter returns ``amountIn``.
+
+    When ``native_side=True`` the path targets the NATIVE-ETH pool variant:
+    the PoolKey substitutes ``NATIVE_CURRENCY`` for whichever of
+    ``token_in`` / ``token_out`` equals ``WETH_ARBITRUM`` (case-insensitive).
+    ``token_in`` / ``token_out`` keep the ORIGINAL (WETH) addresses so the
+    router can map quotes back to the order; only the derived PoolKey
+    currencies and ``zero_for_one`` see the substitution. The zero address
+    compares lower than any token, so the native side is always currency0.
     """
 
     order_uid: str
@@ -82,21 +104,39 @@ class V4Path:
     tick_spacing: int
     amount_in: int
     exact_output: bool = False
+    native_side: bool = False
+
+    def _currency(self, token: str) -> str:
+        """``token`` as the PoolKey sees it: NATIVE_CURRENCY in place of WETH
+        when this is a native-pool path, the token itself otherwise."""
+        if self.native_side and _strip_0x(token).lower() == _strip_0x(WETH_ARBITRUM).lower():
+            return NATIVE_CURRENCY
+        return token
+
+    @property
+    def currency_in(self) -> str:
+        """The PoolKey currency on the input side (post native substitution)."""
+        return self._currency(self.token_in)
+
+    @property
+    def currency_out(self) -> str:
+        """The PoolKey currency on the output side (post native substitution)."""
+        return self._currency(self.token_out)
 
     @property
     def currency0(self) -> str:
-        """The lower of the two token addresses (PoolKey.currency0)."""
-        return min(self.token_in, self.token_out, key=lambda a: int(_strip_0x(a), 16))
+        """The lower of the two pool currencies (PoolKey.currency0)."""
+        return min(self.currency_in, self.currency_out, key=lambda a: int(_strip_0x(a), 16))
 
     @property
     def currency1(self) -> str:
-        """The higher of the two token addresses (PoolKey.currency1)."""
-        return max(self.token_in, self.token_out, key=lambda a: int(_strip_0x(a), 16))
+        """The higher of the two pool currencies (PoolKey.currency1)."""
+        return max(self.currency_in, self.currency_out, key=lambda a: int(_strip_0x(a), 16))
 
     @property
     def zero_for_one(self) -> bool:
-        """True when ``token_in`` is currency0, i.e. the swap goes 0 → 1."""
-        return int(_strip_0x(self.token_in), 16) < int(_strip_0x(self.token_out), 16)
+        """True when ``currency_in`` is currency0, i.e. the swap goes 0 → 1."""
+        return int(_strip_0x(self.currency_in), 16) < int(_strip_0x(self.currency_out), 16)
 
 
 @dataclass(frozen=True)
@@ -114,7 +154,12 @@ def _strip_0x(addr: str) -> str:
 
 
 def _encode_quote_params(path: V4Path) -> bytes:
-    """ABI-encode QuoteExactSingleParams for ``path`` (vanilla pool, no hookData)."""
+    """ABI-encode QuoteExactSingleParams for ``path`` (vanilla pool, no hookData).
+
+    ``currency0`` / ``currency1`` / ``zero_for_one`` are derived properties,
+    so native-pool paths (``native_side=True``) get the WETH → NATIVE_CURRENCY
+    substitution here without any extra branching.
+    """
     pool_key = (path.currency0, path.currency1, path.fee, path.tick_spacing, HOOKS_NONE)
     return encode(
         [_QUOTE_EXACT_SINGLE_PARAMS_TYPE],
@@ -190,6 +235,43 @@ def make_v4_paths(
             tick_spacing=tick_spacing,
             amount_in=amount_in,
             exact_output=exact_output,
+        )
+        for fee, tick_spacing in STANDARD_V4_TIERS
+    ]
+
+
+def make_v4_native_paths(
+    order_uid: str,
+    token_in: str,
+    token_out: str,
+    amount_in: int,
+    *,
+    weth: str = WETH_ARBITRUM,
+    exact_output: bool = False,
+) -> list[V4Path]:
+    """Native-pool variants for a WETH-paired hop: one V4Path per standard tier.
+
+    Returns ``[]`` unless EXACTLY one of ``token_in`` / ``token_out`` equals
+    ``weth`` (case-insensitive) — a non-WETH pair has no native variant, and
+    WETH/WETH is nonsensical. The returned paths keep the original token
+    addresses and carry ``native_side=True``; the WETH → NATIVE_CURRENCY
+    substitution happens at encode time (note: against ``WETH_ARBITRUM``, so
+    overriding ``weth`` only changes the gate, not the substitution).
+    """
+    in_is_weth = _strip_0x(token_in).lower() == _strip_0x(weth).lower()
+    out_is_weth = _strip_0x(token_out).lower() == _strip_0x(weth).lower()
+    if in_is_weth == out_is_weth:  # neither side or both sides — no native variant
+        return []
+    return [
+        V4Path(
+            order_uid=order_uid,
+            token_in=token_in,
+            token_out=token_out,
+            fee=fee,
+            tick_spacing=tick_spacing,
+            amount_in=amount_in,
+            exact_output=exact_output,
+            native_side=True,
         )
         for fee, tick_spacing in STANDARD_V4_TIERS
     ]
