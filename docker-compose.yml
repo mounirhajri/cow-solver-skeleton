@@ -42,6 +42,8 @@ services:
       ROUTER_V4_ENABLED: ${ROUTER_V4_ENABLED:-true}
       ROUTER_CURVE_ENABLED: ${ROUTER_CURVE_ENABLED:-true}
       V4_NATIVE_PROBE_ENABLED: ${V4_NATIVE_PROBE_ENABLED:-true}
+      # Liveness watchdog kill-switch (restarts the process on silent death).
+      WATCHDOG_ENABLED: ${WATCHDOG_ENABLED:-true}
     volumes:
       - ./data:/data
     depends_on:

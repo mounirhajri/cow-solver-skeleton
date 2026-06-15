@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -219,3 +220,117 @@ def test_solve_timeout_without_completed_solutions_stays_empty(
     resp = client.post("/solve", json=auction_payload)
     assert resp.status_code == 200
     assert resp.json() == {"solutions": []}
+
+
+# ── Liveness watchdog (2026-06-15) ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_watchdog_restarts_when_traffic_but_no_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Receiving traffic + no solve progress past the stall window → os._exit."""
+    import time as _time
+    from types import SimpleNamespace
+
+    from src import main as main_mod
+
+    monkeypatch.setattr(main_mod.settings, "watchdog_enabled", True)
+    monkeypatch.setattr(main_mod.settings, "watchdog_poll_seconds", 0.01)
+    monkeypatch.setattr(main_mod.settings, "watchdog_traffic_window_seconds", 100.0)
+    monkeypatch.setattr(main_mod.settings, "watchdog_stall_seconds", 50.0)
+
+    now = _time.monotonic()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            # Traffic 1s ago (within window), progress 999s ago (past stall).
+            last_request_ts=now - 1.0,
+            last_progress_ts=now - 999.0,
+        )
+    )
+    exited: list[int] = []
+    monkeypatch.setattr(main_mod.os, "_exit", lambda code: exited.append(code))
+
+    # The watchdog seeds last_progress/last_request to `now` at startup; force
+    # them stale again right after so the first poll trips.
+    task = asyncio.create_task(main_mod._liveness_watchdog(app))  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    app.state.last_request_ts = now - 1.0
+    app.state.last_progress_ts = now - 999.0
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if exited:
+            break
+    task.cancel()
+    assert exited == [1]
+
+
+@pytest.mark.asyncio
+async def test_watchdog_no_restart_without_traffic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No recent traffic → a stalled solver is just idle, never restarted."""
+    import time as _time
+    from types import SimpleNamespace
+
+    from src import main as main_mod
+
+    monkeypatch.setattr(main_mod.settings, "watchdog_enabled", True)
+    monkeypatch.setattr(main_mod.settings, "watchdog_poll_seconds", 0.01)
+    monkeypatch.setattr(main_mod.settings, "watchdog_traffic_window_seconds", 100.0)
+    monkeypatch.setattr(main_mod.settings, "watchdog_stall_seconds", 50.0)
+
+    now = _time.monotonic()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            last_request_ts=now - 999.0,  # no traffic for ages
+            last_progress_ts=now - 999.0,
+        )
+    )
+    exited: list[int] = []
+    monkeypatch.setattr(main_mod.os, "_exit", lambda code: exited.append(code))
+
+    task = asyncio.create_task(main_mod._liveness_watchdog(app))  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    app.state.last_request_ts = now - 999.0
+    app.state.last_progress_ts = now - 999.0
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    task.cancel()
+    assert exited == []
+
+
+@pytest.mark.asyncio
+async def test_watchdog_disabled_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from src import main as main_mod
+
+    monkeypatch.setattr(main_mod.settings, "watchdog_enabled", False)
+    exited: list[int] = []
+    monkeypatch.setattr(main_mod.os, "_exit", lambda code: exited.append(code))
+    app = SimpleNamespace(state=SimpleNamespace())
+    await main_mod._liveness_watchdog(app)  # type: ignore[arg-type]  # returns immediately
+    assert exited == []
+
+
+def test_solve_progress_wiring(auction_payload: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The watchdog's correctness rests on this: a completed solve (incl.
+    NoSolution) advances last_progress_ts; a TimeoutError does NOT."""
+    # 1) NoSolution → progress advances.
+    orch = AsyncMock()
+    orch.solve.return_value = (NoSolution(), None)
+    app = create_app(orchestrator=orch)
+    client = TestClient(app)
+    client.post("/solve", json=auction_payload)
+    ts_after_nosol = app.state.last_progress_ts
+    assert ts_after_nosol is not None
+
+    # 2) TimeoutError → progress must NOT advance past the no_solution value.
+    async def hang(_a: object, _b: object) -> object:
+        raise TimeoutError
+
+    orch.solve.side_effect = hang
+    monkeypatch.setattr("src.main.settings.solve_timeout_seconds", 0.05)
+    client.post("/solve", json=auction_payload)
+    assert app.state.last_progress_ts == ts_after_nosol  # unchanged by the timeout

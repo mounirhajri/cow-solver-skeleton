@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 import time
 from contextlib import asynccontextmanager
@@ -75,10 +76,15 @@ def create_app(
         # leaves room for future multi-solution emission (e.g. variants
         # exploring different fee tiers).
         start = time.perf_counter()
-        # Lazy-start the diagnostics pulse on the serving loop (create_app has
-        # no lifespan wiring; first request is the earliest loop-safe moment).
+        # Liveness watchdog: record that traffic is arriving. The watchdog task
+        # (below) restarts the process if traffic keeps coming but no solve
+        # makes progress — bounding the 2026-06-13 silent-death degradation to
+        # minutes instead of days. Lazy-start it on the serving loop (create_app
+        # has no lifespan wiring; first request is the earliest loop-safe point).
+        app.state.last_request_ts = time.monotonic()
         if getattr(app.state, "diag_task", None) is None:
             app.state.diag_task = asyncio.create_task(_loop_diagnostics_pulse())
+            app.state.watchdog_task = asyncio.create_task(_liveness_watchdog(app))
         # Epoch timestamp of request arrival — persisted alongside the attempt
         # so the feasibility validation can reconstruct the auction-time block
         # for driver auctions (which carry no simulationBlock).
@@ -137,6 +143,12 @@ def create_app(
                 orchestrator.solve(auction, attempts),
                 timeout=timeout,
             )
+            # Progress signal for the liveness watchdog: the orchestrator
+            # completed within budget (solution OR no_solution — both mean the
+            # solve machinery works). Only the TimeoutError path below is
+            # NON-progress; sustained non-progress under traffic = the dead
+            # state the watchdog restarts on.
+            app.state.last_progress_ts = time.monotonic()
         except TimeoutError:
             # Degradation forensics (2026-06-12): WHERE did the budget die
             # (last strategy that got to run), and is the RPC gate starved
@@ -237,6 +249,54 @@ def _best_completed_solution(attempts: list[AttemptRecord]) -> Solution | None:
         except Exception as exc:  # noqa: BLE001
             log.warning("salvage_solution_invalid", strategy=name, error=str(exc))
     return None
+
+
+async def _liveness_watchdog(app: FastAPI) -> None:
+    """Restart the process if it stops solving while traffic keeps arriving.
+
+    The 2026-06-13 degradation killed the solver SILENTLY for ~2 days: every
+    /solve hit the deadline and returned empty, while /health stayed "ok"
+    (it only proves the loop runs, not that solves complete). A 3-day-old
+    process accumulates some state — gate-, DB-pool- and Redis-clean in every
+    check we ran — that hangs each solve before any strategy finishes; a
+    fresh process solves the same auction in ~2 s. We could not pin the leak,
+    so this bounds it: if requests are still arriving (last_request within the
+    traffic window) but NO solve has made progress for longer than the stall
+    window, exit non-zero. ``restart: unless-stopped`` then brings the process
+    back fresh — turning "dead for days" into "down for the restart".
+
+    Runs on the serving loop. During the degradation the loop itself stays
+    healthy (the diagnostics pulse fired throughout), so this task keeps
+    ticking and can act. Disabled when ``watchdog_enabled`` is False.
+    """
+    if not settings.watchdog_enabled:
+        return
+    traffic_window = settings.watchdog_traffic_window_seconds
+    stall_window = settings.watchdog_stall_seconds
+    # Seed progress at startup so a quiet boot period is never mistaken for a
+    # stall (no traffic → no restart regardless).
+    now = time.monotonic()
+    app.state.last_progress_ts = now
+    app.state.last_request_ts = now
+    while True:
+        await asyncio.sleep(settings.watchdog_poll_seconds)
+        now = time.monotonic()
+        secs_since_request = now - getattr(app.state, "last_request_ts", now)
+        secs_since_progress = now - getattr(app.state, "last_progress_ts", now)
+        receiving_traffic = secs_since_request <= traffic_window
+        stalled = secs_since_progress >= stall_window
+        if receiving_traffic and stalled:
+            log.error(
+                "liveness_watchdog_restart",
+                secs_since_progress=round(secs_since_progress, 1),
+                secs_since_request=round(secs_since_request, 1),
+                stall_window=stall_window,
+                reason="receiving traffic but no solve progressed — restarting",
+            )
+            # os._exit bypasses the asyncio/uvicorn shutdown path on purpose:
+            # the process is wedged, a graceful shutdown could hang too. The
+            # container restart policy gives us a clean process.
+            os._exit(1)
 
 
 async def _loop_diagnostics_pulse() -> None:

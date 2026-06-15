@@ -114,6 +114,14 @@ class SolverOrchestrator:
                 if isinstance(_strat_timeout_attr, (int, float))
                 else self._timeout
             )
+            # Phase marker for the degradation hunt: a strategy whose
+            # ``strategy_start`` appears with no following solved/no_solution/
+            # timeout/error record is the one that hung past the OUTER /solve
+            # budget (which is shorter than a strategy's own timeout, so the
+            # strategy's wait_for never fires — the 2026-06-13 router hang left
+            # last_strategy=null for exactly this reason). One line per strategy
+            # per auction; remove once the hang is pinned.
+            log.info("strategy_start", strategy=strat.name, auction_id=auction.id)
             try:
                 result = await asyncio.wait_for(strat.solve(auction), timeout=strat_timeout)
             except TimeoutError:

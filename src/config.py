@@ -126,6 +126,17 @@ class Settings(BaseSettings):
     # worst losses were single Curve swaps). Hardcoded top pools — see
     # src/routing/curve_quoter.CURVE_POOLS.
     router_curve_enabled: bool = True
+
+    # Liveness watchdog: restart the process when it stops solving while
+    # traffic still arrives (the 2026-06-13 silent-death degradation ran for
+    # ~2 days because /health only proves the loop runs, not that solves
+    # complete). If a request arrived within traffic_window but no solve has
+    # progressed for stall_seconds, the process exits non-zero and the
+    # container restart policy brings it back fresh. Tunable live via env.
+    watchdog_enabled: bool = True
+    watchdog_poll_seconds: float = 30.0
+    watchdog_traffic_window_seconds: float = 120.0
+    watchdog_stall_seconds: float = 600.0
     v4_quoter_address: str = "0x3972C00F7ed4885e145823eb7C655375D275A1C5"
     v4_universal_router: str = "0xA51afAFe0263b40EdaEf0Df8781eA9aa03E381a3"
     v4_permit2: str = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
